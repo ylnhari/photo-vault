@@ -71,10 +71,19 @@ def _lm_model_id() -> str:
         return "lm_studio"
 
 
-def _call_lm_studio(base64_image: str) -> str:
+def list_lm_studio_models() -> list[str]:
+    """All model ids currently loaded in LM Studio (vision + embedding mixed)."""
+    try:
+        client = _get_lm_client()
+        return [m.id for m in client.models.list().data]
+    except Exception:
+        return []
+
+
+def _call_lm_studio(base64_image: str, model: str = "vision-model") -> str:
     client = _get_lm_client()
     response = client.chat.completions.create(
-        model="vision-model",
+        model=model or "vision-model",
         messages=[{
             "role": "user",
             "content": [
@@ -87,7 +96,7 @@ def _call_lm_studio(base64_image: str) -> str:
     return _strip_markdown(response.choices[0].message.content.strip())
 
 
-def _call_gemini(base64_image: str) -> str:
+def _call_gemini(base64_image: str, model: str = None) -> str:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set — LM Studio is offline and no fallback available")
 
@@ -99,8 +108,10 @@ def _call_gemini(base64_image: str) -> str:
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 800},
     }).encode("utf-8")
 
+    # If a specific model is requested, use only that; else walk the fallback chain.
+    candidates = [model] if model else GEMINI_VISION_MODELS
     last_err = None
-    for model in GEMINI_VISION_MODELS:
+    for model in candidates:
         url = f"{GEMINI_BASE}/models/{model}:generateContent?key={GEMINI_API_KEY}"
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
         try:
@@ -117,12 +128,13 @@ def _call_gemini(base64_image: str) -> str:
     raise RuntimeError(f"All Gemini vision models exhausted. Last: {last_err}")
 
 
-def get_image_caption(image_path: str, force_provider: str = "auto", with_model: bool = False):
+def get_image_caption(image_path: str, force_provider: str = "auto",
+                      with_model: bool = False, model: str = None):
     """
     force_provider: "auto" (LM Studio → Gemini fallback), "lm_studio", or "gemini"
+    model: explicit model id to use (only honored when force_provider is lm_studio/gemini).
     with_model=False → returns caption text (str, backward compatible).
-    with_model=True  → returns (caption_text, model_label) where model_label identifies
-                       which vision model produced it (e.g. "lm_studio:qwen2-vl", "gemini").
+    with_model=True  → returns (caption_text, model_label) identifying which model produced it.
     """
     def _ret(text, label):
         return (text, label) if with_model else text
@@ -133,18 +145,21 @@ def get_image_caption(image_path: str, force_provider: str = "auto", with_model:
 
     if force_provider == "gemini":
         try:
-            return _ret(_call_gemini(base64_image), "gemini")
+            label = f"gemini:{model}" if model else "gemini"
+            return _ret(_call_gemini(base64_image, model), label)
         except Exception as ge:
             return _ret(json.dumps({"error": f"Gemini failed: {ge}"}), "error")
 
     if force_provider == "lm_studio":
         try:
-            return _ret(_call_lm_studio(base64_image), _lm_model_id())
+            label = f"lm_studio:{model}" if model else _lm_model_id()
+            return _ret(_call_lm_studio(base64_image, model), label)
         except Exception as e:
             return _ret(json.dumps({"error": f"LM Studio failed: {e}"}), "error")
 
     try:
-        return _ret(_call_lm_studio(base64_image), _lm_model_id())
+        label = f"lm_studio:{model}" if model else _lm_model_id()
+        return _ret(_call_lm_studio(base64_image, model), label)
     except Exception as e:
         if _is_connection_error(e):
             print(f"[vision] LM Studio offline, falling back to Gemini")

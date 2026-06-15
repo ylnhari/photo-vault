@@ -75,18 +75,19 @@ def _is_connection_error(e: Exception) -> bool:
 
 # ── Provider implementations ──────────────────────────────────────────────────
 
-def _lm_studio_embed(text: str) -> tuple[list, str]:
-    """Embed via LM Studio /v1/embeddings. Auto-detects loaded model name."""
-    model_name = "lm_studio_embed"
-    try:
-        req = urllib.request.Request(f"{LM_STUDIO_URL}/models")
-        with urllib.request.urlopen(req, timeout=3) as r:
-            data = json.loads(r.read())
-            models = data.get("data", [])
-            if models:
-                model_name = models[0].get("id", model_name)
-    except Exception:
-        pass
+def _lm_studio_embed(text: str, model: str = None) -> tuple[list, str]:
+    """Embed via LM Studio /v1/embeddings. Uses `model` if given, else auto-detects."""
+    model_name = model or "lm_studio_embed"
+    if not model:
+        try:
+            req = urllib.request.Request(f"{LM_STUDIO_URL}/models")
+            with urllib.request.urlopen(req, timeout=3) as r:
+                data = json.loads(r.read())
+                models = data.get("data", [])
+                if models:
+                    model_name = models[0].get("id", model_name)
+        except Exception:
+            pass
 
     payload = json.dumps({"model": model_name, "input": text}).encode("utf-8")
     req = urllib.request.Request(
@@ -117,10 +118,21 @@ def _gemini_embed(text: str) -> tuple[list, str]:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def get_embedding(text: str) -> tuple[list | None, str, str]:
-    """Returns (vector, model_name, source). Tries LM Studio then Gemini.
+def get_embedding(text: str, force_provider: str = "auto", model: str = None) -> tuple[list | None, str, str]:
+    """Returns (vector, model_name, source).
+    force_provider: "auto" (LM Studio → Gemini), "lm_studio", or "gemini".
+    model: explicit LM Studio embedding model id (ignored for Gemini, which is fixed).
     Registers the model on success. Returns (None, '', 'error') on full failure."""
-    for source, fn in [("lm_studio", _lm_studio_embed), ("gemini", _gemini_embed)]:
+    lm = ("lm_studio", lambda t: _lm_studio_embed(t, model))
+    gem = ("gemini", _gemini_embed)
+    if force_provider == "lm_studio":
+        chain = [lm]
+    elif force_provider == "gemini":
+        chain = [gem]
+    else:
+        chain = [lm, gem]
+
+    for source, fn in chain:
         try:
             vector, model_name = fn(text)
             register_model(source, model_name, len(vector))

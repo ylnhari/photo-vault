@@ -239,6 +239,49 @@ def test_get_image_caption_with_model_error_label():
     assert label == "error"
 
 
+def test_get_image_caption_lm_studio_explicit_model(tmp_path):
+    from vision import get_image_caption
+    img_path = tmp_path / "t.jpg"
+    img_path.write_bytes(_make_tiny_image_bytes())
+    with patch("vision._call_lm_studio", return_value=VALID_JSON) as call:
+        text, label = get_image_caption(str(img_path), force_provider="lm_studio",
+                                        with_model=True, model="qwen-vl")
+    assert label == "lm_studio:qwen-vl"
+    assert call.call_args[0][1] == "qwen-vl"  # model forwarded
+
+
+def test_get_image_caption_gemini_explicit_model(tmp_path):
+    from vision import get_image_caption
+    img_path = tmp_path / "t.jpg"
+    img_path.write_bytes(_make_tiny_image_bytes())
+    with patch("vision._call_gemini", return_value=VALID_JSON) as call:
+        text, label = get_image_caption(str(img_path), force_provider="gemini",
+                                        with_model=True, model="gemini-2.0-flash")
+    assert label == "gemini:gemini-2.0-flash"
+    assert call.call_args[0][1] == "gemini-2.0-flash"
+
+
+def test_call_gemini_single_model_when_specified():
+    from vision import _call_gemini
+    calls = []
+    def fake_urlopen(req, timeout=None):
+        calls.append(req.full_url.split("/models/")[1].split(":")[0])
+        return _gemini_response(VALID_JSON)
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("vision.GEMINI_API_KEY", "fake-key"):
+        _call_gemini("b64", model="gemini-2.5-flash")
+    assert calls == ["gemini-2.5-flash"]  # only the requested model, no cascade
+
+
+def test_list_lm_studio_models():
+    from vision import list_lm_studio_models
+    from unittest.mock import MagicMock
+    client = MagicMock()
+    client.models.list.return_value.data = [MagicMock(id="a"), MagicMock(id="b")]
+    with patch("vision._get_lm_client", return_value=client):
+        assert list_lm_studio_models() == ["a", "b"]
+
+
 # ── parse_vision_attributes ───────────────────────────────────────────────────
 
 def test_parse_valid_json():

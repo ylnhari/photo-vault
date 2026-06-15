@@ -6,13 +6,17 @@
   import JobPanel from "./JobPanel.svelte";
   const dispatch = createEventDispatcher();
 
-  let provider = "auto";
+  let provider = "auto";        // vision provider
+  let visionModel = "";
+  let embedProvider = "auto";
+  let embedModel = "";
   let maxFail = 5;
   let scanDirs = "";
   let busy = "";
   let err = "";
   let job = null;
   let poll = null;
+  let pmodels = { lm_studio: [], gemini_vision: [], gemini_embed: [] };
 
   const PROVIDERS = [
     ["auto", "Auto (LM Studio → Gemini)"],
@@ -24,9 +28,27 @@
     if (!$health.loaded) refreshHealth();
     if (!$status.loaded) refreshStatus();
     if (!$models.loaded) refreshModels();
+    try { pmodels = await api.providerModels(); } catch {}
     job = await api.indexProgress();
     if (job.active) startPolling();
   });
+
+  // Which model list applies to a provider, for vision vs embed.
+  $: visionModelOpts = provider === "lm_studio" ? pmodels.lm_studio
+                      : provider === "gemini" ? pmodels.gemini_vision : [];
+  $: embedModelOpts = embedProvider === "lm_studio" ? pmodels.lm_studio
+                     : embedProvider === "gemini" ? pmodels.gemini_embed : [];
+
+  function buildCfg(type) {
+    return {
+      type,
+      vision_provider: provider,
+      vision_model: provider === "auto" ? null : (visionModel || null),
+      embed_provider: embedProvider,
+      embed_model: embedProvider === "auto" ? null : (embedModel || null),
+      max_fail: maxFail,
+    };
+  }
   onDestroy(() => clearInterval(poll));
 
   function startPolling() {
@@ -48,18 +70,18 @@
   async function start(type) {
     err = "";
     try {
-      job = await api.indexStart(type, provider, maxFail);
+      job = await api.indexStart(buildCfg(type));
       if (job.active) startPolling();
       else { await refreshStatus(); dispatch("indexed"); }
     } catch (e) { err = e.message; }
   }
   async function stop() { job = await api.indexStop(); }
   async function retry() {
-    const failed = job.failed_ids, type = job.type;
+    const type = job.type;
     await api.indexReset();
     err = "";
     try {
-      job = await api.indexStart(type, provider, maxFail);  // backend recomputes pending
+      job = await api.indexStart(buildCfg(type));  // backend recomputes pending
       if (job.active) startPolling();
     } catch (e) { err = e.message; }
   }
@@ -137,17 +159,58 @@
   {/if}
 </div>
 
-<!-- Vision provider -->
+<!-- Run config: provider + exact model for vision and embedding -->
 <div class="card">
-  <div class="section-label">Vision provider</div>
-  <div class="row" style="flex-wrap:wrap; gap:16px">
-    {#each PROVIDERS as [val, label]}
-      <label class="radio"><input type="radio" bind:group={provider} value={val} /> {label}</label>
-    {/each}
+  <div class="section-label">Run configuration</div>
+
+  <div class="cfg-grid">
+    <div class="col">
+      <span class="hint">Vision (captioning)</span>
+      <div class="row" style="flex-wrap:wrap; gap:12px">
+        {#each PROVIDERS as [val, label]}
+          <label class="radio"><input type="radio" bind:group={provider} value={val} /> {label}</label>
+        {/each}
+      </div>
+      {#if provider !== "auto"}
+        {#if visionModelOpts.length}
+          <select bind:value={visionModel}>
+            <option value="">— pick {provider === "gemini" ? "Gemini" : "LM Studio"} model —</option>
+            {#each visionModelOpts as m}<option value={m}>{m}</option>{/each}
+          </select>
+        {:else}
+          <span class="warn-text">No {provider} models found (is it running / loaded?).</span>
+        {/if}
+      {:else}
+        <span class="hint">Auto picks the loaded LM Studio model, falls back to Gemini.</span>
+      {/if}
+    </div>
+
+    <div class="col">
+      <span class="hint">Embedding (search vectors)</span>
+      <div class="row" style="flex-wrap:wrap; gap:12px">
+        {#each PROVIDERS as [val, label]}
+          <label class="radio"><input type="radio" bind:group={embedProvider} value={val} /> {label}</label>
+        {/each}
+      </div>
+      {#if embedProvider !== "auto"}
+        {#if embedModelOpts.length}
+          <select bind:value={embedModel}>
+            <option value="">— pick {embedProvider === "gemini" ? "Gemini" : "LM Studio"} model —</option>
+            {#each embedModelOpts as m}<option value={m}>{m}</option>{/each}
+          </select>
+        {:else}
+          <span class="warn-text">No {embedProvider} models found.</span>
+        {/if}
+      {:else}
+        <span class="hint">Auto picks the loaded LM Studio embed model, falls back to Gemini.</span>
+      {/if}
+    </div>
   </div>
-  <label class="row" style="gap:8px; font-size:13px; margin-top:6px">
+
+  <label class="row" style="gap:8px; font-size:13px; margin-top:12px">
     Stop after <input type="number" bind:value={maxFail} min="1" max="20" style="width:60px" /> consecutive failures
   </label>
+  <p class="hint" style="margin-top:6px">Each photo records exactly which vision + embedding model produced it, so you can switch models later without re-doing work.</p>
 </div>
 
 <!-- A: Scan -->
@@ -259,6 +322,9 @@
   .sm { padding: 5px 10px; font-size: 13px; }
   .radio { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; }
   .radio input { width: auto; }
+  .cfg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .cfg-grid .col { gap: 8px; }
+  @media (max-width: 720px) { .cfg-grid { grid-template-columns: 1fr; } }
   textarea { margin-bottom: 10px; }
 
   .pipeline { display: flex; align-items: center; gap: 8px; margin-top: 6px; }

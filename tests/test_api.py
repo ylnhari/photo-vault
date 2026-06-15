@@ -96,6 +96,31 @@ def test_delete_image(client):
     assert r.json()["ok"] is True
 
 
+def test_provider_models(client):
+    with patch("api.list_lm_studio_models", return_value=["qwen-vl", "nomic-embed"]):
+        r = client.get("/api/provider-models")
+    assert r.status_code == 200
+    b = r.json()
+    assert b["lm_studio"] == ["qwen-vl", "nomic-embed"]
+    assert "text-embedding-004" in b["gemini_embed"]
+    assert len(b["gemini_vision"]) > 0
+
+
+def test_index_start_passes_model_config(client):
+    captured = {}
+    def fake_start(jtype, **kw):
+        captured.update(kw); captured["jtype"] = jtype
+        return {"active": False, "finished": True}
+    with patch("api.manager.start", side_effect=fake_start):
+        r = client.post("/api/index/start", json={
+            "type": "vision", "vision_provider": "gemini", "vision_model": "gemini-2.0-flash",
+        })
+    assert r.status_code == 200
+    assert captured["jtype"] == "vision"
+    assert captured["vision_provider"] == "gemini"
+    assert captured["vision_model"] == "gemini-2.0-flash"
+
+
 def test_cleanup_missing(client):
     fake = MagicMock()
     fake.get_missing_files.return_value = [("a", {}), ("b", {})]

@@ -140,11 +140,11 @@ class Indexer:
 
     # ── Single-item ops (driven by the background job manager) ─────────────────
 
-    def vision_one(self, img_id: str, force_provider: str = "auto") -> str:
+    def vision_one(self, img_id: str, force_provider: str = "auto", model: str = None) -> str:
         """Vision-only for one image. Stores caption + model, saves catalog. Raises on failure."""
         img_data = self.image_catalog["images"][img_id]
         text, vmodel = get_image_caption(
-            img_data["path"], force_provider=force_provider, with_model=True
+            img_data["path"], force_provider=force_provider, with_model=True, model=model
         )
         if _caption_has_error(text):
             raise RuntimeError(json.loads(text).get("error", "vision failed"))
@@ -152,17 +152,21 @@ class Indexer:
         self._save_catalog()
         return f"vision:{vmodel}"
 
-    def embed_one(self, img_id: str, upsert: bool = False) -> str:
-        """Embed one already-captioned image into the active model's collection."""
+    def embed_one(self, img_id: str, upsert: bool = False,
+                  embed_provider: str = "auto", embed_model: str = None) -> str:
+        """Embed one already-captioned image into the chosen model's collection."""
         img_data = self.image_catalog["images"][img_id]
-        return _embed_one(img_id, img_data, upsert=upsert)
+        return _embed_one(img_id, img_data, upsert=upsert,
+                          embed_provider=embed_provider, embed_model=embed_model)
 
     def index_one_full(self, img_id: str, use_cached: bool = True, upsert: bool = False,
-                       force_provider: str = "auto") -> str:
+                       vision_provider: str = "auto", vision_model: str = None,
+                       embed_provider: str = "auto", embed_model: str = None) -> str:
         """Vision (unless cached) + embed for one image. Saves catalog."""
         img_data = self.image_catalog["images"][img_id]
         note = _index_one(img_id, img_data, upsert=upsert, use_cached=use_cached,
-                          force_provider=force_provider)
+                          vision_provider=vision_provider, vision_model=vision_model,
+                          embed_provider=embed_provider, embed_model=embed_model)
         self._save_catalog()
         return note
 
@@ -203,7 +207,8 @@ class Indexer:
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
 
-def _embed_one(img_id: str, img_data: dict, upsert: bool = False) -> str:
+def _embed_one(img_id: str, img_data: dict, upsert: bool = False,
+               embed_provider: str = "auto", embed_model: str = None) -> str:
     """Embedding + face detection + ChromaDB store from cached caption_json."""
     caption_json = img_data["caption_json"]
     attrs = parse_vision_attributes(caption_json)
@@ -215,7 +220,9 @@ def _embed_one(img_id: str, img_data: dict, upsert: bool = False) -> str:
     except json.JSONDecodeError:
         pass
 
-    embedding, model_name, embed_source = get_embedding(caption_json)
+    embedding, model_name, embed_source = get_embedding(
+        caption_json, force_provider=embed_provider, model=embed_model
+    )
     if embedding is None:
         raise RuntimeError("embedding failed (LM Studio and Gemini both unavailable)")
 
@@ -257,11 +264,13 @@ def _embed_one(img_id: str, img_data: dict, upsert: bool = False) -> str:
 
 
 def _index_one(img_id: str, img_data: dict, upsert: bool = False, use_cached: bool = True,
-               force_provider: str = "auto") -> str:
+               vision_provider: str = "auto", vision_model: str = None,
+               embed_provider: str = "auto", embed_model: str = None) -> str:
     """Vision + embed in one shot. use_cached=True reuses stored caption_json."""
     if not (use_cached and img_data.get("caption_json")):
         text, vmodel = get_image_caption(
-            img_data["path"], force_provider=force_provider, with_model=True
+            img_data["path"], force_provider=vision_provider, with_model=True, model=vision_model
         )
         _record_caption_history(img_data, vmodel, text)
-    return _embed_one(img_id, img_data, upsert=upsert)
+    return _embed_one(img_id, img_data, upsert=upsert,
+                      embed_provider=embed_provider, embed_model=embed_model)

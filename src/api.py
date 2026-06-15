@@ -15,10 +15,11 @@ from pydantic import BaseModel
 from PIL import Image
 
 from constants import (
-    CHROMA_DB_PATH, THUMB_DIR, PROJECT_ROOT, SERVER_PORT,
+    CHROMA_DB_PATH, THUMB_DIR, PROJECT_ROOT, SERVER_PORT, GEMINI_VISION_MODELS,
 )
 from indexer import Indexer
 from search import search_images, get_available_filter_values
+from vision import list_lm_studio_models
 from embeddings import (
     get_registry, get_active_model, set_active_model, collection_name_for,
 )
@@ -48,7 +49,10 @@ class ScanReq(BaseModel):
 
 class IndexReq(BaseModel):
     type: str
-    force_provider: str = "auto"
+    vision_provider: str = "auto"
+    vision_model: str | None = None
+    embed_provider: str = "auto"
+    embed_model: str | None = None
     max_fail: int = 5
 
 
@@ -118,9 +122,24 @@ def index_start(req: IndexReq):
     if req.type not in JOB_TYPES:
         raise HTTPException(400, f"unknown job type: {req.type}")
     try:
-        return manager.start(req.type, req.force_provider, req.max_fail)
+        return manager.start(
+            req.type, vision_provider=req.vision_provider, max_fail=req.max_fail,
+            vision_model=req.vision_model, embed_provider=req.embed_provider,
+            embed_model=req.embed_model,
+        )
     except RuntimeError as e:
         raise HTTPException(409, str(e))
+
+
+@app.get("/api/provider-models")
+def provider_models():
+    """Models available per provider, for the run-config dropdowns.
+    LM Studio lists whatever is loaded (vision + embed mixed)."""
+    return {
+        "lm_studio": list_lm_studio_models(),
+        "gemini_vision": GEMINI_VISION_MODELS,
+        "gemini_embed": ["text-embedding-004"],
+    }
 
 
 @app.post("/api/index/stop")

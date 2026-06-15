@@ -181,6 +181,28 @@ def test_get_embedding_calls_register_model():
     mock_reg.assert_called_once_with("lm_studio", "my-model", 2)
 
 
+def test_get_embedding_forced_gemini_skips_lm_studio():
+    from embeddings import get_embedding
+    with patch("embeddings._lm_studio_embed") as lm, \
+         patch("embeddings._gemini_embed", return_value=([0.1], "text-embedding-004")), \
+         patch("embeddings.register_model"):
+        _, _, source = get_embedding("text", force_provider="gemini")
+    lm.assert_not_called()
+    assert source == "gemini"
+
+
+def test_get_embedding_forwards_model_to_lm_studio():
+    from embeddings import get_embedding
+    captured = {}
+    def fake_lm(t, model=None):
+        captured["model"] = model
+        return ([0.1], model or "auto")
+    with patch("embeddings._lm_studio_embed", side_effect=fake_lm), \
+         patch("embeddings.register_model"):
+        get_embedding("text", force_provider="lm_studio", model="nomic-embed")
+    assert captured["model"] == "nomic-embed"
+
+
 # ── registry functions ────────────────────────────────────────────────────────
 
 def test_register_model_sets_active_if_first(tmp_path):

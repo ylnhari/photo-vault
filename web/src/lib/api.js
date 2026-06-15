@@ -19,11 +19,11 @@ export const api = {
   status: () => j("GET", "/api/status"),
   scan: (dirs) => j("POST", "/api/scan", { dirs }),
 
-  indexStart: (type, force_provider, max_fail) =>
-    j("POST", "/api/index/start", { type, force_provider, max_fail }),
+  indexStart: (cfg) => j("POST", "/api/index/start", cfg),
   indexStop: () => j("POST", "/api/index/stop"),
   indexProgress: () => j("GET", "/api/index/progress"),
   indexReset: () => j("POST", "/api/index/reset"),
+  providerModels: () => j("GET", "/api/provider-models"),
 
   filters: () => j("GET", "/api/filters"),
   search: (q, filters, person, top_k = 200) =>

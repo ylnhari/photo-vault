@@ -26,7 +26,9 @@ class JobManager:
             "active": False, "type": None, "total": 0, "done": 0,
             "ok": 0, "fail": 0, "failed_ids": [], "log": [],
             "aborted": False, "stopped": False, "finished": False,
-            "started_at": None, "force_provider": "auto", "max_fail": 5,
+            "started_at": None, "max_fail": 5,
+            "vision_provider": "auto", "vision_model": None,
+            "embed_provider": "auto", "embed_model": None,
         }
 
     # ── public API ──────────────────────────────────────────────────────────
@@ -45,7 +47,9 @@ class JobManager:
             raise ValueError(f"unknown job type: {jtype}")
         return [img_id for img_id, _ in items]
 
-    def start(self, jtype: str, force_provider: str = "auto", max_fail: int = 5) -> dict:
+    def start(self, jtype: str, vision_provider: str = "auto", max_fail: int = 5,
+              vision_model: str = None, embed_provider: str = "auto",
+              embed_model: str = None) -> dict:
         if jtype not in JOB_TYPES:
             raise ValueError(f"unknown job type: {jtype}")
         with self._lock:
@@ -53,17 +57,21 @@ class JobManager:
                 raise RuntimeError("a job is already running")
             ids = self._pending_ids(jtype)
             self._stop.clear()
+            cfg = {
+                "vision_provider": vision_provider, "vision_model": vision_model,
+                "embed_provider": embed_provider, "embed_model": embed_model,
+                "max_fail": max_fail,
+            }
             self._state = self._idle_state()
             self._state.update({
                 "active": True, "type": jtype, "total": len(ids),
-                "force_provider": force_provider, "max_fail": max_fail,
-                "started_at": time.time(),
+                "started_at": time.time(), **cfg,
             })
             if not ids:
                 self._state.update({"active": False, "finished": True})
                 return self.status()
             self._thread = threading.Thread(
-                target=self._run, args=(jtype, ids, force_provider, max_fail), daemon=True
+                target=self._run, args=(jtype, ids, cfg), daemon=True
             )
             self._thread.start()
         return self.status()
@@ -86,8 +94,11 @@ class JobManager:
 
     # ── worker ────────────────────────────────────────────────────────────────
 
-    def _run(self, jtype, ids, force_provider, max_fail):
+    def _run(self, jtype, ids, cfg):
         idx = Indexer()
+        max_fail = cfg["max_fail"]
+        vp, vm = cfg["vision_provider"], cfg["vision_model"]
+        ep, em = cfg["embed_provider"], cfg["embed_model"]
         consecutive = 0
         for i, img_id in enumerate(ids):
             if self._stop.is_set():
@@ -95,15 +106,17 @@ class JobManager:
                 break
             try:
                 if jtype == "vision":
-                    note = idx.vision_one(img_id, force_provider=force_provider)
+                    note = idx.vision_one(img_id, force_provider=vp, model=vm)
                 elif jtype == "embed":
-                    note = idx.embed_one(img_id)
+                    note = idx.embed_one(img_id, embed_provider=ep, embed_model=em)
                 elif jtype == "full":
                     note = idx.index_one_full(img_id, use_cached=True, upsert=False,
-                                              force_provider=force_provider)
+                                              vision_provider=vp, vision_model=vm,
+                                              embed_provider=ep, embed_model=em)
                 else:  # reanalyze
                     note = idx.index_one_full(img_id, use_cached=False, upsert=True,
-                                              force_provider=force_provider)
+                                              vision_provider=vp, vision_model=vm,
+                                              embed_provider=ep, embed_model=em)
                 consecutive = 0
                 icon = "cloud" if "gemini" in note.lower() else "ok"
                 self._update(ok=1, done=1, log=(icon, img_id, note))
