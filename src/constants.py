@@ -26,7 +26,6 @@ SERVER_PORT = _load_port()
 
 # API Endpoints
 LM_STUDIO_URL = "http://localhost:1234/v1"
-OLLAMA_URL = "http://localhost:11434"
 
 # Gemini fallback — loaded from .env in project root
 def _load_env():

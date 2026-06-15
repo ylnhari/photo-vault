@@ -1,7 +1,5 @@
 import chromadb
 import numpy as np
-import json
-import os
 from embeddings import get_embedding, get_active_model, collection_name_for
 from tagger import get_person_embedding
 from faces import load_face_data
@@ -91,13 +89,3 @@ def get_available_filter_values() -> dict:
     except Exception:
         return {}
 
-def get_all_images(filters: dict = None) -> dict:
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-    collection = _active_collection(client)
-    if collection.count() == 0:
-        return {"ids": [], "metadatas": []}
-    where_clause = build_where_clause(filters or {})
-    try:
-        return collection.get(where=where_clause, include=["metadatas"])
-    except Exception:
-        return collection.get(include=["metadatas"])

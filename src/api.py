@@ -5,12 +5,11 @@ embeddings / vision / faces / tagger). Serves the built Svelte SPA from web/dist
 in production. Run:  uv run uvicorn api:app --app-dir src --port <port>
 """
 import hashlib
-import io
 import os
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from PIL import Image
