@@ -117,9 +117,10 @@ def test_call_gemini_skips_429_tries_next():
         return _gemini_response(VALID_JSON)
     with patch("urllib.request.urlopen", side_effect=fake_urlopen), \
          patch("vision.GEMINI_API_KEY", "fake-key"):
-        result = _call_gemini("b64data")
+        text, model_used = _call_gemini("b64data")
     assert call_count[0] == 2
-    assert "caption" in result or result == VALID_JSON
+    assert "caption" in text or text == VALID_JSON
+    assert model_used == GEMINI_VISION_MODELS[1]  # second model after the 429
 
 
 def test_call_gemini_all_429_raises():
@@ -173,7 +174,7 @@ def test_get_image_caption_falls_back_on_connection_error(tmp_path):
     mock_client.chat.completions.create.side_effect = ConnectionRefusedError("refused")
 
     with patch("vision._get_lm_client", return_value=mock_client), \
-         patch("vision._call_gemini", return_value=VALID_JSON) as mock_gemini:
+         patch("vision._call_gemini", return_value=(VALID_JSON, "gemini-2.0-flash-lite")) as mock_gemini:
         result = get_image_caption(str(img_path))
 
     mock_gemini.assert_called_once()
@@ -225,11 +226,11 @@ def test_get_image_caption_with_model_gemini_label(tmp_path):
     img_path = tmp_path / "test.jpg"
     img_path.write_bytes(_make_tiny_image_bytes())
 
-    with patch("vision._call_gemini", return_value=VALID_JSON):
+    with patch("vision._call_gemini", return_value=(VALID_JSON, "gemini-2.0-flash-lite")):
         text, label = get_image_caption(str(img_path), force_provider="gemini", with_model=True)
 
     assert text == VALID_JSON
-    assert label == "gemini"
+    assert label == "gemini:gemini-2.0-flash-lite"
 
 
 def test_get_image_caption_with_model_error_label():
@@ -254,7 +255,7 @@ def test_get_image_caption_gemini_explicit_model(tmp_path):
     from vision import get_image_caption
     img_path = tmp_path / "t.jpg"
     img_path.write_bytes(_make_tiny_image_bytes())
-    with patch("vision._call_gemini", return_value=VALID_JSON) as call:
+    with patch("vision._call_gemini", return_value=(VALID_JSON, "gemini-2.0-flash")) as call:
         text, label = get_image_caption(str(img_path), force_provider="gemini",
                                         with_model=True, model="gemini-2.0-flash")
     assert label == "gemini:gemini-2.0-flash"

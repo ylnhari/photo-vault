@@ -3,13 +3,17 @@
   import { health, status, refreshHealth, refreshStatus } from "./lib/stores.js";
   import SearchTab from "./lib/SearchTab.svelte";
   import TimelineTab from "./lib/TimelineTab.svelte";
+  import MapTab from "./lib/MapTab.svelte";
+  import AlbumsTab from "./lib/AlbumsTab.svelte";
   import PeopleTab from "./lib/PeopleTab.svelte";
   import IndexTab from "./lib/IndexTab.svelte";
   import Lightbox from "./lib/Lightbox.svelte";
 
-  const TABS = ["Search", "Timeline", "People", "Index & Manage"];
+  const TABS = ["Search", "Timeline", "Map", "Albums", "People", "Index & Manage"];
   let tab = "Search";
   let selectedId = null;
+  let selectedIds = null;
+  let selectedIndex = 0;
 
   // Single health/status fetch for the whole app — fixes the old contradiction
   // where two tabs fetched health separately and disagreed.
@@ -18,8 +22,20 @@
   $: indexedCount = $status.stage.active_model_embedded || 0;
   $: noServices = $health.loaded && !$health.lm_studio && !$health.gemini;
 
-  function onSelect(e) { selectedId = e.detail; }
-  function onDeleted() { selectedId = null; refreshStatus(); }
+  function onSelect(e) {
+    const d = e.detail;
+    if (d && typeof d === "object") {
+      selectedIds = d.ids || [d.id];
+      selectedId = d.id;
+      selectedIndex = selectedIds.indexOf(d.id);
+    } else {
+      selectedId = d;
+      selectedIds = [d];
+      selectedIndex = 0;
+    }
+  }
+  function onClose() { selectedId = null; selectedIds = null; }
+  function onDeleted() { refreshStatus(); }
 </script>
 
 <header>
@@ -40,9 +56,13 @@
 
 <main>
   {#if tab === "Search"}
-    <SearchTab {indexedCount} on:select={onSelect} />
+    <SearchTab {indexedCount} on:select={onSelect} on:deleted={onDeleted} />
   {:else if tab === "Timeline"}
     <TimelineTab on:select={onSelect} />
+  {:else if tab === "Map"}
+    <MapTab {indexedCount} on:select={onSelect} />
+  {:else if tab === "Albums"}
+    <AlbumsTab on:select={onSelect} />
   {:else if tab === "People"}
     <PeopleTab {indexedCount} on:select={onSelect} />
   {:else}
@@ -51,7 +71,8 @@
 </main>
 
 {#if selectedId}
-  <Lightbox id={selectedId} on:close={() => (selectedId = null)} on:deleted={onDeleted} />
+  <Lightbox id={selectedId} ids={selectedIds} index={selectedIndex}
+            on:close={onClose} on:deleted={onDeleted} />
 {/if}
 
 <style>

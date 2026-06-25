@@ -1,0 +1,13 @@
+{
+  "name": "Photo Vault",
+  "short_name": "Photo Vault",
+  "description": "Local photo search by face, scene, occasion, place, and time.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#15171c",
+  "theme_color": "#15171c",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

@@ -1,4 +1,4 @@
-.PHONY: install build run serve web test clean
+.PHONY: install build run serve web test clean docker-build docker-up docker-down
 
 install:
 	uv sync --extra dev
@@ -25,3 +25,13 @@ test:
 clean:
 	rm -rf web/dist web/node_modules
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+# Docker (see DOCKER.md). Set PHOTOS_DIR to the folder you want indexed.
+docker-build:
+	docker compose build
+
+docker-up:
+	docker compose up --build
+
+docker-down:
+	docker compose down

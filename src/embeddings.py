@@ -7,6 +7,33 @@ from datetime import datetime
 from constants import LM_STUDIO_URL, GEMINI_API_KEY, GEMINI_BASE, EMBEDDING_REGISTRY_PATH
 
 _GEMINI_EMBED_MODEL = "text-embedding-004"
+import time as _time
+_gemini_embed_cache: tuple[float, list[str]] | None = None
+
+
+def list_gemini_embed_models() -> list[str]:
+    """Fetch Gemini embedding models from the API, cached 5 min."""
+    global _gemini_embed_cache
+    if _gemini_embed_cache and _time.time() - _gemini_embed_cache[0] < 300:
+        return _gemini_embed_cache[1]
+    if not GEMINI_API_KEY:
+        return [_GEMINI_EMBED_MODEL]
+    try:
+        url = f"{GEMINI_BASE}/models?key={GEMINI_API_KEY}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        models = [
+            m["name"].replace("models/", "")
+            for m in data.get("models", [])
+            if "embedContent" in m.get("supportedGenerationMethods", [])
+        ]
+        result = models if models else [_GEMINI_EMBED_MODEL]
+        _gemini_embed_cache = (_time.time(), result)
+        return result
+    except Exception as e:
+        print(f"[embeddings] Gemini model list failed: {e}")
+        return [_GEMINI_EMBED_MODEL]
 
 
 # ── Collection naming ─────────────────────────────────────────────────────────

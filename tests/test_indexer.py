@@ -36,7 +36,7 @@ def test_get_missing_all_new(tmp_path):
 
     mock_client, _ = _mock_chromadb(existing_ids=[])
 
-    with patch("indexer.chromadb.PersistentClient", return_value=mock_client), \
+    with patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.IMAGE_CATALOG_PATH", str(catalog_path)), \
          patch("indexer.get_active_model", return_value="test-model"):
         idx = Indexer()
@@ -54,7 +54,7 @@ def test_get_missing_none_when_all_indexed(tmp_path):
 
     mock_client, _ = _mock_chromadb(existing_ids=["a", "b"])
 
-    with patch("indexer.chromadb.PersistentClient", return_value=mock_client), \
+    with patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.IMAGE_CATALOG_PATH", str(catalog_path)), \
          patch("indexer.get_active_model", return_value="test-model"):
         idx = Indexer()
@@ -71,7 +71,7 @@ def test_get_missing_partial(tmp_path):
 
     mock_client, _ = _mock_chromadb(existing_ids=["a"])
 
-    with patch("indexer.chromadb.PersistentClient", return_value=mock_client), \
+    with patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.IMAGE_CATALOG_PATH", str(catalog_path)), \
          patch("indexer.get_active_model", return_value="test-model"):
         idx = Indexer()
@@ -112,7 +112,7 @@ def test_get_missing_attributes_all_stale(tmp_path):
                    "scene": "unknown", "mood": "unknown"}] * 2
     mock_client, _ = _mock_chromadb(existing_ids=["a", "b"], metadata_rows=stale_meta)
 
-    with patch("indexer.chromadb.PersistentClient", return_value=mock_client), \
+    with patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.IMAGE_CATALOG_PATH", str(catalog_path)), \
          patch("indexer.get_active_model", return_value="test-model"):
         idx = Indexer()
@@ -131,7 +131,7 @@ def test_get_missing_attributes_none_when_rich(tmp_path):
                   "scene": "outdoor", "mood": "happy"}]
     mock_client, _ = _mock_chromadb(existing_ids=["a"], metadata_rows=rich_meta)
 
-    with patch("indexer.chromadb.PersistentClient", return_value=mock_client), \
+    with patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.IMAGE_CATALOG_PATH", str(catalog_path)), \
          patch("indexer.get_active_model", return_value="test-model"):
         idx = Indexer()
@@ -160,7 +160,7 @@ def test_index_one_raises_on_vision_error():
                "time_of_day": "unknown", "occasion": "unknown", "group_size": "unknown",
                "clothing_style": "unknown", "mood": "unknown", "objects": "", "people_description": ""}), \
          patch("indexer.get_embedding", return_value=([0.1], "test-model", "lm_studio")), \
-         patch("indexer.chromadb.PersistentClient", return_value=mock_client), \
+         patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.detect_and_embed_faces", return_value=[]), \
          patch("indexer.save_face_data"):
         with pytest.raises(RuntimeError, match="vision error"):
@@ -195,7 +195,7 @@ def test_index_one_success_returns_note():
     with patch("indexer.get_image_caption", return_value=('{"caption":"beach"}', "gemini")), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
          patch("indexer.get_embedding", return_value=([0.1, 0.2], "text-embedding-004", "gemini")), \
-         patch("indexer.chromadb.PersistentClient", return_value=mock_client), \
+         patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.detect_and_embed_faces", return_value=[]), \
          patch("indexer.save_face_data"):
         note = _index_one("img1", img_data, upsert=False)
@@ -217,7 +217,7 @@ def test_index_one_upsert_path():
     with patch("indexer.get_image_caption", return_value=('{"caption":"x"}', "lm_studio:m")), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
          patch("indexer.get_embedding", return_value=([0.1], "lm-embed-model", "lm_studio")), \
-         patch("indexer.chromadb.PersistentClient", return_value=mock_client), \
+         patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.detect_and_embed_faces", return_value=[]), \
          patch("indexer.save_face_data"):
         _index_one("img1", img_data, upsert=True)
@@ -236,7 +236,7 @@ def test_index_one_stores_embedding_model_in_metadata():
     with patch("indexer.get_image_caption", return_value=('{"caption":"x"}', "lm_studio:m")), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
          patch("indexer.get_embedding", return_value=([0.1], "my-embed-model", "lm_studio")), \
-         patch("indexer.chromadb.PersistentClient", return_value=mock_client), \
+         patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.detect_and_embed_faces", return_value=[]), \
          patch("indexer.save_face_data"):
         _index_one("img1", img_data, upsert=False)
@@ -256,7 +256,7 @@ def test_index_one_stores_caption_in_img_data():
     with patch("indexer.get_image_caption", return_value=('{"caption":"beach photo"}', "lm_studio:m")), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
          patch("indexer.get_embedding", return_value=([0.1], "my-model", "lm_studio")), \
-         patch("indexer.chromadb.PersistentClient", return_value=mock_client), \
+         patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.detect_and_embed_faces", return_value=[]), \
          patch("indexer.save_face_data"):
         _index_one("img1", img_data, upsert=False)
@@ -276,7 +276,7 @@ def test_index_one_reuses_cached_caption():
     with patch("indexer.get_image_caption", mock_vision), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
          patch("indexer.get_embedding", return_value=([0.1], "my-model", "lm_studio")), \
-         patch("indexer.chromadb.PersistentClient", return_value=mock_client), \
+         patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.detect_and_embed_faces", return_value=[]), \
          patch("indexer.save_face_data"):
         _index_one("img1", img_data, upsert=False, use_cached=True)
@@ -296,7 +296,7 @@ def test_index_one_skips_cache_when_use_cached_false():
     with patch("indexer.get_image_caption", mock_vision), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
          patch("indexer.get_embedding", return_value=([0.1], "my-model", "lm_studio")), \
-         patch("indexer.chromadb.PersistentClient", return_value=mock_client), \
+         patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.detect_and_embed_faces", return_value=[]), \
          patch("indexer.save_face_data"):
         _index_one("img1", img_data, upsert=False, use_cached=False)
@@ -321,7 +321,7 @@ def test_get_stage_stats_counts_captioned(tmp_path):
     reg = {"active_model": "m", "models": {"m": {"source": "lm_studio", "dimension": 3}}}
 
     with patch("indexer.IMAGE_CATALOG_PATH", str(catalog_path)), \
-         patch("indexer.chromadb.PersistentClient", return_value=mock_client), \
+         patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.get_registry", return_value=reg), \
          patch("indexer.get_active_model", return_value="m"):
         idx = Indexer()

@@ -14,6 +14,11 @@ export const status = writable({
   stage: { total_scanned: 0, vision_done: 0, vision_pending: 0,
            active_model: null, active_model_embedded: 0, embed_pending: 0, models: {} },
   vision_pending: 0, embed_pending: 0, missing_attrs: 0, missing_full: 0, missing_files: 0,
+  model_status: {
+    vision: { selected_label: null, done: 0, pending: 0, any_done: 0, model_summary: {} },
+    embed:  { selected_model: null, caption_source: null, eligible: 0, done: 0, pending: 0 },
+  },
+  settings: {},
 });
 
 export const models = writable({ loaded: false, active: null, models: {} });

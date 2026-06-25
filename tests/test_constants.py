@@ -22,6 +22,19 @@ def test_all_data_paths_under_data_dir():
         assert path.startswith(constants.DATA_DIR), f"{path} not under DATA_DIR"
 
 
+def test_load_port_env_override(monkeypatch):
+    import constants
+    monkeypatch.setenv("PHOTO_VAULT_PORT", "9999")
+    assert constants._load_port() == 9999
+
+
+def test_load_port_ignores_bad_env(monkeypatch):
+    import constants
+    monkeypatch.setenv("PHOTO_VAULT_PORT", "not-a-number")
+    # Falls through to ports.json / default without raising
+    assert isinstance(constants._load_port(), int)
+
+
 def test_gemini_models_ordered_lite_first():
     import constants
     first = constants.GEMINI_VISION_MODELS[0]

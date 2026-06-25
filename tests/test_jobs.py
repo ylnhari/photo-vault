@@ -1,7 +1,16 @@
 import time
+import pytest
 from unittest.mock import patch, MagicMock
 
 from jobs import JobManager
+
+
+@pytest.fixture(autouse=True)
+def _serial_vision(monkeypatch):
+    # Pin vision concurrency to 1 so parallel-batch tests are deterministic while
+    # still exercising the batched worker code path.
+    monkeypatch.setattr("jobs.settings_mod.load", lambda: {"vision_concurrency": 1})
+    yield
 
 
 def _wait_idle(mgr, timeout=5.0):
@@ -19,6 +28,13 @@ def _fake_indexer(pending_ids, dispatch):
     fake.get_embed_pending.return_value = [(i, {}) for i in pending_ids]
     fake.get_missing.return_value = [(i, {}) for i in pending_ids]
     fake.get_missing_attributes.return_value = [(i, {}) for i in pending_ids]
+
+    # Vision now goes through compute_caption (parallel) + record_caption.
+    def _compute(img_id, *a, **k):
+        dispatch(img_id)  # raises for the failure-path tests
+        return ("m", '{"caption":"ok"}')
+    fake.compute_caption.side_effect = _compute
+    fake.record_caption = MagicMock()
     fake.vision_one.side_effect = dispatch
     fake.embed_one.side_effect = dispatch
     fake.index_one_full.side_effect = dispatch

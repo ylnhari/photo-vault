@@ -12,7 +12,60 @@
   let results = null;
   let recent = [];
   let loading = false;
+  let initialLoading = false;
   let err = "";
+
+  // Multi-select / batch state
+  let selectMode = false;
+  let selectedIds = [];
+  let resetToken = 0;
+  let deleteFiles = false;
+  let batchBusy = false;
+
+  function onSelectionChange(e) { selectedIds = e.detail; }
+  function clearSelection() { resetToken += 1; selectedIds = []; }
+  function toggleSelectMode() { selectMode = !selectMode; if (!selectMode) clearSelection(); }
+
+  // Add-to-album
+  let albums = [];
+  let albumMsg = "";
+  onMount(async () => { try { albums = (await api.albums()).albums; } catch {} });
+
+  async function addToAlbum(e) {
+    const val = e.target.value;
+    e.target.value = "";
+    if (!val || !selectedIds.length) return;
+    albumMsg = "";
+    try {
+      let albumId = val;
+      if (val === "__new__") {
+        const name = prompt("New album name");
+        if (!name || !name.trim()) return;
+        albumId = (await api.createAlbum(name.trim())).id;
+        albums = (await api.albums()).albums;
+      }
+      const r = await api.albumAdd(albumId, selectedIds);
+      const a = albums.find((x) => x.id === albumId);
+      albumMsg = `Added ${selectedIds.length} to “${a ? a.name : "album"}” (${r.count} total).`;
+      clearSelection();
+    } catch (e) { albumMsg = e.message; }
+  }
+
+  async function deleteSelected() {
+    if (!selectedIds.length) return;
+    batchBusy = true; err = "";
+    try {
+      const idset = new Set(selectedIds);
+      await api.batchDelete(selectedIds, deleteFiles);
+      if (results) results = results.filter((p) => !idset.has(p.id));
+      recent = recent.filter((p) => !idset.has(p.id));
+      clearSelection();
+      selectMode = false;
+      deleteFiles = false;
+      dispatch("deleted");
+    } catch (e) { err = e.message; }
+    batchBusy = false;
+  }
 
   const FILTER_ORDER = [
     ["year", "Year"], ["weather", "Weather"], ["occasion", "Occasion"],
@@ -22,10 +75,11 @@
 
   onMount(async () => {
     if (indexedCount > 0) {
+      initialLoading = true;
       try {
-        filterVals = await api.filters();
-        recent = (await api.recent(60)).results;
+        [filterVals, { results: recent }] = await Promise.all([api.filters(), api.recent(60)]);
       } catch (e) { err = e.message; }
+      initialLoading = false;
     }
   });
 
@@ -78,12 +132,44 @@
 
     <section style="flex:1; min-width:0">
       {#if err}<p style="color:var(--danger)">{err}</p>{/if}
+
+      <!-- selection toolbar -->
+      <div class="toolbar">
+        <button class="ghost sm" class:active={selectMode} on:click={toggleSelectMode}>
+          {selectMode ? "✓ Selecting" : "Select"}
+        </button>
+        {#if selectedIds.length}
+          <span class="muted" style="font-size:13px">{selectedIds.length} selected</span>
+          <select class="sm" on:change={addToAlbum} title="Add selection to album">
+            <option value="">Add to album…</option>
+            {#each albums as a}<option value={a.id}>{a.name}</option>{/each}
+            <option value="__new__">＋ New album…</option>
+          </select>
+          <label class="row" style="gap:4px; font-size:12px">
+            <input type="checkbox" bind:checked={deleteFiles} style="width:auto" /> delete files too
+          </label>
+          <button class="danger sm" on:click={deleteSelected} disabled={batchBusy}>
+            {batchBusy ? "Removing…" : `Remove ${selectedIds.length}`}
+          </button>
+          <button class="ghost sm" on:click={clearSelection}>Clear</button>
+        {:else if selectMode}
+          <span class="muted" style="font-size:12px">Click photos to select · Shift-click for a range</span>
+        {/if}
+      </div>
+      {#if albumMsg}<p class="muted" style="font-size:12px; margin:-4px 0 8px">{albumMsg}</p>{/if}
+
       {#if results !== null}
         <div class="section-label">{results.length} results</div>
-        <PhotoGrid photos={results} on:select={(e) => dispatch("select", e.detail)} />
+        <PhotoGrid photos={results} {selectMode} {resetToken}
+                   on:select={(e) => dispatch("select", e.detail)}
+                   on:selectionchange={onSelectionChange} />
+      {:else if initialLoading}
+        <p class="muted">Loading…</p>
       {:else}
         <div class="section-label">Recently indexed</div>
-        <PhotoGrid photos={recent} on:select={(e) => dispatch("select", e.detail)} />
+        <PhotoGrid photos={recent} {selectMode} {resetToken}
+                   on:select={(e) => dispatch("select", e.detail)}
+                   on:selectionchange={onSelectionChange} />
       {/if}
     </section>
   </div>
@@ -93,4 +179,8 @@
   .layout { display: flex; gap: 16px; align-items: flex-start; }
   aside { width: 240px; flex-shrink: 0; position: sticky; top: 12px; }
   @media (max-width: 800px) { .layout { flex-direction: column; } aside { width: 100%; position: static; } }
+  .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; min-height: 30px; flex-wrap: wrap; }
+  .sm { padding: 5px 10px; font-size: 13px; }
+  .ghost.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .danger { background: var(--danger); color: #fff; border-color: var(--danger); }
 </style>

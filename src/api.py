@@ -6,45 +6,106 @@ in production. Run:  uv run uvicorn api:app --app-dir src --port <port>
 """
 import hashlib
 import os
+import threading
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from PIL import Image
+
+import imaging  # noqa: F401 — registers HEIF opener + pixel-bomb cap on import
+from imaging import safe_open
 
 from constants import (
-    CHROMA_DB_PATH, THUMB_DIR, PROJECT_ROOT, SERVER_PORT, GEMINI_VISION_MODELS,
+    THUMB_DIR, PROJECT_ROOT, SERVER_PORT, GEMINI_VISION_MODELS,
 )
-from indexer import Indexer
+import db
+import security
+from indexer import Indexer, catalog_path_for, load_catalog_cached
+
+# id is a content hash, so a given id's bytes never change → cache forever.
+_IMMUTABLE_CACHE = {"Cache-Control": "private, max-age=31536000, immutable"}
+# Pixel sizes for the two generated derivative tiers.
+_THUMB_PX = 400
+_MEDIUM_PX = 1600
 from search import search_images, get_available_filter_values
-from vision import list_lm_studio_models
+from vision import (
+    list_lm_studio_models, classify_lm_studio_model,
+    list_gemini_vision_models, validate_vision_output,
+)
 from embeddings import (
     get_registry, get_active_model, set_active_model, collection_name_for,
+    list_gemini_embed_models,
 )
-from tagger import add_person_reference, get_all_persons
+from tagger import add_person_reference, add_person_embedding, get_all_persons
+from faces import load_face_data, face_index_count, rebuild_face_index
 from validator import service_status
 from jobs import manager, JOB_TYPES
-import chromadb
+import clustering
+import albums as albums_mgr
+import folders as folder_mgr
+import settings as settings_mgr
 
 os.makedirs(THUMB_DIR, exist_ok=True)
 
 app = FastAPI(title="Photo Vault", version="1.0")
 
-# Dev convenience: Vite dev server runs on a different port. In production the
-# SPA is served same-origin from web/dist so CORS is a no-op.
+# Mutual exclusion between a (synchronous) scan and the background index job:
+# both rewrite the whole images.json, so they must never run concurrently.
+_scan_active = threading.Event()
+
+# Reject requests whose Host header isn't a loopback name. This is the primary
+# defense against DNS-rebinding: a malicious page can point its domain at
+# 127.0.0.1, but the browser still sends that domain in the Host header.
+# PV_ALLOWED_HOSTS (comma-separated) lets a deployment add its own hostname/IP
+# (e.g. a LAN address when self-hosting beyond localhost).
+_BASE_HOSTS = ["localhost", "127.0.0.1", "[::1]", "testserver"]
+_EXTRA_HOSTS = [h.strip() for h in os.environ.get("PV_ALLOWED_HOSTS", "").split(",") if h.strip()]
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=_BASE_HOSTS + _EXTRA_HOSTS,
+)
+
+# Restrict CORS to the loopback origins the SPA actually runs on (prod port +
+# Vite dev port). No wildcard — a random website can no longer read API
+# responses cross-origin.
+_ALLOWED_ORIGINS = [
+    f"http://localhost:{SERVER_PORT}", f"http://127.0.0.1:{SERVER_PORT}",
+    "http://localhost:5173", "http://127.0.0.1:5173",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Compress JSON / JS / CSS responses. (Already-compressed JPEGs barely change,
+# but the API's JSON payloads — search results, status — shrink substantially.)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+
+@app.middleware("http")
+async def _require_token(request: Request, call_next):
+    """Enforce the bearer token on /api/* when PV_REQUIRE_AUTH=1 (set by serve.py)."""
+    if security.auth_enabled():
+        path = request.url.path
+        if path.startswith("/api/") and path not in security.EXEMPT_API_PATHS:
+            authorized = security.request_authorized(
+                request.headers.get("authorization"),
+                request.query_params.get("_t"),
+            )
+            if not authorized:
+                return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
 
 # ── models ──────────────────────────────────────────────────────────────────
 class ScanReq(BaseModel):
-    dirs: list[str]
+    dirs: list[str] = []   # empty → use folder registry
 
 
 class IndexReq(BaseModel):
@@ -53,6 +114,7 @@ class IndexReq(BaseModel):
     vision_model: str | None = None
     embed_provider: str = "auto"
     embed_model: str | None = None
+    caption_source_model: str | None = None
     max_fail: int = 5
 
 
@@ -65,6 +127,58 @@ class ActiveModelReq(BaseModel):
     model: str
 
 
+class FolderReq(BaseModel):
+    path: str
+
+
+class OrphanedCleanupReq(BaseModel):
+    ids: list[str] = []   # empty → remove all orphaned
+
+
+class BatchDeleteReq(BaseModel):
+    ids: list[str]
+    delete_file: bool = False
+
+
+class SettingsReq(BaseModel):
+    vision_provider: str | None = None
+    vision_model: str | None = None
+    embed_provider: str | None = None
+    embed_model: str | None = None
+    caption_source_model: str | None = None
+    max_fail: int | None = None
+    vision_concurrency: int | None = None
+    faces_during_embed: bool | None = None
+    face_cluster_eps: float | None = None
+    face_cluster_min_samples: int | None = None
+
+
+class ClusterReq(BaseModel):
+    eps: float | None = None
+    min_samples: int | None = None
+
+
+class NameClusterReq(BaseModel):
+    cluster_id: int
+    name: str
+
+
+class IgnoreClusterReq(BaseModel):
+    cluster_id: int
+
+
+class AlbumCreateReq(BaseModel):
+    name: str
+
+
+class AlbumRenameReq(BaseModel):
+    name: str
+
+
+class AlbumItemsReq(BaseModel):
+    ids: list[str]
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 def _thumb_path(img_id: str) -> str:
     h = hashlib.sha1(img_id.encode("utf-8")).hexdigest()
@@ -73,9 +187,7 @@ def _thumb_path(img_id: str) -> str:
 
 def _chroma_meta(img_id: str) -> dict:
     try:
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-        active = get_active_model()
-        col = client.get_or_create_collection(collection_name_for(active) if active else "images")
+        col = db.collection()
         res = col.get(ids=[img_id], include=["metadatas"])
         if res["ids"]:
             return res["metadatas"][0]
@@ -92,7 +204,128 @@ def health():
 
 @app.get("/api/status")
 def status():
-    idx = Indexer()
+    s = settings_mgr.load()
+    idx = Indexer(use_cache=True)  # read-only; share the cached catalog snapshot
+    stage = idx.get_stage_stats()
+
+    # Model-aware counts based on current settings
+    vm_label = settings_mgr.vision_model_label(s)   # e.g. "lm_studio:qwen2-vl-7b" or None
+    csm = s.get("caption_source_model")              # caption source for embed
+    em = s.get("embed_model")                        # embed model (raw name, no provider prefix)
+
+    total = stage.get("total_scanned", 0)
+
+    # Legacy pending counts (used by backward-compat code paths)
+    legacy_vision_pending = len(idx.get_vision_pending())
+    legacy_embed_pending = len(idx.get_embed_pending())
+
+    # Model-specific vision counts
+    if vm_label:
+        model_vision_pending_list = idx.get_vision_pending_for_model(vm_label)
+        vision_done = total - len(model_vision_pending_list)
+        vision_pending = len(model_vision_pending_list)
+    else:
+        vision_done = stage.get("vision_done", 0)
+        vision_pending = legacy_vision_pending
+
+    # Embed counts
+    eligible_ids = idx.get_embed_eligible_ids(csm)
+    eligible = len(eligible_ids)
+    if em:
+        embed_done = stage.get("models", {}).get(em, {}).get("indexed_count", 0)
+    else:
+        embed_done = stage.get("active_model_embedded", 0)
+    embed_pending = max(0, eligible - embed_done)
+
+    faces = idx.get_faces_stats()
+
+    return {
+        # Legacy fields kept for backward compat
+        "stage": stage,
+        "vision_pending": vision_pending,
+        "embed_pending": embed_pending if csm or em else legacy_embed_pending,
+        "missing_attrs": len(idx.get_missing_attributes()),
+        "missing_full": len(idx.get_missing()),
+        "missing_files": len(idx.get_missing_files()),
+        # New model-aware fields
+        "model_status": {
+            "vision": {
+                "selected_label": vm_label,
+                "done": vision_done,
+                "pending": vision_pending,
+                "any_done": stage.get("vision_done", 0),
+                "model_summary": idx.get_vision_model_summary(),
+            },
+            "embed": {
+                "selected_model": em or stage.get("active_model"),
+                "caption_source": csm,
+                "eligible": eligible,
+                "done": embed_done,
+                "pending": embed_pending,
+            },
+            "faces": faces,  # {total, detected, pending}
+        },
+        "faces_pending": faces["pending"],
+        "faces_done": faces["detected"],
+        "settings": s,
+    }
+
+
+@app.get("/api/settings")
+def get_settings():
+    return settings_mgr.load()
+
+
+@app.put("/api/settings")
+def put_settings(req: SettingsReq):
+    patch = {k: v for k, v in req.model_dump().items() if v is not None}
+    return settings_mgr.update(patch)
+
+
+@app.delete("/api/settings")
+def reset_settings():
+    """Reset to factory defaults."""
+    settings_mgr.save(settings_mgr.DEFAULTS)
+    return settings_mgr.load()
+
+
+# ── scanning ────────────────────────────────────────────────────────────────
+@app.post("/api/scan")
+def scan(req: ScanReq):
+    # A scan and the background index job both rewrite images.json — never let
+    # them overlap or one will clobber the other's writes.
+    if manager.status().get("active"):
+        raise HTTPException(409, "an indexing job is running; stop it before scanning")
+    if _scan_active.is_set():
+        raise HTTPException(409, "a scan is already in progress")
+
+    dirs = [d.strip() for d in req.dirs if d.strip()]
+
+    if dirs:
+        # Explicit dirs: validate they exist on disk
+        invalid = [d for d in dirs if not os.path.isdir(d)]
+        if invalid:
+            raise HTTPException(400, f"directories not found: {', '.join(invalid)}")
+        idx = Indexer(target_directories=dirs)
+    else:
+        # No dirs provided → use folder registry
+        cfg = folder_mgr.ensure_defaults()
+        if not cfg.get("included"):
+            raise HTTPException(400, "No folders configured. Add a folder first.")
+        idx = Indexer()
+
+    _scan_active.set()
+    try:
+        summary = idx.scan_only()
+        st = _status_dict(idx)
+    finally:
+        _scan_active.clear()
+    return {"summary": summary, **st}
+
+
+def _status_dict(idx: Indexer = None) -> dict:
+    if idx is None:
+        idx = Indexer(use_cache=True)
     stage = idx.get_stage_stats()
     return {
         "stage": stage,
@@ -104,16 +337,120 @@ def status():
     }
 
 
-# ── scanning ────────────────────────────────────────────────────────────────
-@app.post("/api/scan")
-def scan(req: ScanReq):
-    invalid = [d for d in req.dirs if not os.path.isdir(d)]
-    if invalid:
-        raise HTTPException(400, f"paths not found: {', '.join(invalid)}")
-    if not req.dirs:
-        raise HTTPException(400, "no directories given")
-    Indexer(target_directories=req.dirs).scan_only()
-    return status()
+# ── folder management ─────────────────────────────────────────────────────────
+@app.get("/api/folders")
+def get_folders():
+    """Return full folder config (included + excluded) seeded with OS defaults if empty."""
+    return folder_mgr.ensure_defaults()
+
+
+@app.get("/api/folders/defaults")
+def get_folder_defaults():
+    """Suggest OS-appropriate default photo directories that exist on this machine."""
+    return {"defaults": folder_mgr.get_defaults()}
+
+
+@app.post("/api/folders/include")
+def add_folder(req: FolderReq):
+    path = req.path.strip()
+    if not path:
+        raise HTTPException(400, "path is required")
+    if not os.path.isdir(path):
+        raise HTTPException(400, f"directory not found: {path}")
+    result = folder_mgr.add_included(path)
+    if result["status"] == "not_found":
+        raise HTTPException(400, f"directory not found: {path}")
+    return result
+
+
+@app.delete("/api/folders/include")
+def remove_folder(path: str = Query(...), purge: bool = True):
+    """
+    Remove a folder from the included list.
+    When purge=true (default), also deletes all indexed data for images under that path.
+    Returns {images_purged, config}.
+    """
+    path = path.strip()
+    if not path:
+        raise HTTPException(400, "path is required")
+
+    images_purged = 0
+    if purge:
+        idx = Indexer()
+        images_purged = idx.purge_folder(path)
+
+    result = folder_mgr.remove_included(path)
+    return {"images_purged": images_purged, **result}
+
+
+@app.get("/api/folders/include/count")
+def count_folder_images(path: str = Query(...)):
+    """Return how many indexed images are under the given folder path (for purge warnings)."""
+    idx = Indexer(use_cache=True)
+    return {"path": path, "count": idx.count_images_under(path)}
+
+
+@app.post("/api/folders/exclude")
+def add_exclusion(req: FolderReq):
+    path = req.path.strip()
+    if not path:
+        raise HTTPException(400, "path is required")
+    if not os.path.isdir(path):
+        raise HTTPException(400, f"directory not found: {path}")
+    result = folder_mgr.add_excluded(path)
+    if result.get("status") == "not_found":
+        raise HTTPException(400, f"directory not found: {path}")
+    return result
+
+
+@app.delete("/api/folders/exclude")
+def remove_exclusion(path: str = Query(...)):
+    """Remove an exclusion (the folder will be scanned again on next scan)."""
+    path = path.strip()
+    if not path:
+        raise HTTPException(400, "path is required")
+    return folder_mgr.remove_excluded(path)
+
+
+# ── orphaned image management ─────────────────────────────────────────────────
+@app.get("/api/orphaned")
+def get_orphaned():
+    """List catalog entries whose file no longer exists on disk."""
+    idx = Indexer(use_cache=True)
+    missing = idx.get_missing_files()
+    return {
+        "orphaned": [
+            {
+                "id": img_id,
+                "path": data.get("path", ""),
+                "filename": data.get("filename", os.path.basename(data.get("path", ""))),
+            }
+            for img_id, data in missing
+        ],
+        "total": len(missing),
+    }
+
+
+@app.delete("/api/orphaned")
+def cleanup_orphaned(req: OrphanedCleanupReq = None):
+    """
+    Remove orphaned images from the library. If req.ids is empty, removes all orphaned.
+    Returns {removed: count}.
+    """
+    idx = Indexer()
+    if req and req.ids:
+        target_ids = set(req.ids)
+        to_delete = [
+            img_id for img_id, _ in idx.get_missing_files()
+            if img_id in target_ids
+        ]
+    else:
+        to_delete = [img_id for img_id, _ in idx.get_missing_files()]
+
+    for img_id in to_delete:
+        idx.delete_image(img_id)
+
+    return {"removed": len(to_delete)}
 
 
 # ── indexing jobs ─────────────────────────────────────────────────────────────
@@ -121,11 +458,19 @@ def scan(req: ScanReq):
 def index_start(req: IndexReq):
     if req.type not in JOB_TYPES:
         raise HTTPException(400, f"unknown job type: {req.type}")
+    if _scan_active.is_set():
+        raise HTTPException(409, "a scan is in progress; wait for it to finish")
+    # Compute the vision model label used in caption_history (for model-aware pending queries)
+    vml = None
+    if req.vision_provider not in ("auto", None) and req.vision_model:
+        vml = f"{req.vision_provider}:{req.vision_model}"
     try:
         return manager.start(
             req.type, vision_provider=req.vision_provider, max_fail=req.max_fail,
             vision_model=req.vision_model, embed_provider=req.embed_provider,
             embed_model=req.embed_model,
+            caption_source_model=req.caption_source_model,
+            vision_model_label=vml,
         )
     except RuntimeError as e:
         raise HTTPException(409, str(e))
@@ -133,12 +478,13 @@ def index_start(req: IndexReq):
 
 @app.get("/api/provider-models")
 def provider_models():
-    """Models available per provider, for the run-config dropdowns.
-    LM Studio lists whatever is loaded (vision + embed mixed)."""
+    """Models available per provider for the run-config dropdowns."""
+    lm_models = list_lm_studio_models()
     return {
-        "lm_studio": list_lm_studio_models(),
-        "gemini_vision": GEMINI_VISION_MODELS,
-        "gemini_embed": ["text-embedding-004"],
+        "lm_studio": lm_models,
+        "lm_studio_types": {m: classify_lm_studio_model(m) for m in lm_models},
+        "gemini_vision": list_gemini_vision_models() or GEMINI_VISION_MODELS,
+        "gemini_embed": list_gemini_embed_models(),
     }
 
 
@@ -199,24 +545,143 @@ def _card(img_id: str, meta: dict) -> dict:
     }
 
 
+def _cards_for_ids(ids: list[str]) -> list[dict]:
+    """Build grid cards for an explicit id list (e.g. an album), pulling captions
+    from the active embedding collection and falling back to the catalog."""
+    if not ids:
+        return []
+    meta_by_id = {}
+    try:
+        active = get_active_model()
+        if active:
+            res = db.collection(active).get(ids=ids, include=["metadatas"])
+            meta_by_id = dict(zip(res["ids"], res["metadatas"]))
+    except Exception:
+        pass
+    catalog = load_catalog_cached().get("images", {})
+    cards = []
+    for iid in ids:
+        m = meta_by_id.get(iid, {})
+        c = catalog.get(iid, {})
+        path = m.get("path") or c.get("path", "")
+        cards.append({
+            "id": iid,
+            "filename": m.get("filename") or c.get("filename") or os.path.basename(path),
+            "caption": m.get("caption", ""),
+            "year": m.get("year", ""),
+            "occasion": m.get("occasion", ""),
+            "exists": os.path.exists(path),
+        })
+    return cards
+
+
+# ── albums ────────────────────────────────────────────────────────────────────
+@app.get("/api/albums")
+def albums_list():
+    return {"albums": albums_mgr.list_albums()}
+
+
+@app.post("/api/albums")
+def albums_create(req: AlbumCreateReq):
+    try:
+        return albums_mgr.create_album(req.name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/albums/{album_id}")
+def albums_get(album_id: str):
+    a = albums_mgr.get_album(album_id)
+    if not a:
+        raise HTTPException(404, "album not found")
+    return {"id": album_id, "name": a["name"], "photos": _cards_for_ids(a.get("image_ids", []))}
+
+
+@app.put("/api/albums/{album_id}")
+def albums_rename(album_id: str, req: AlbumRenameReq):
+    try:
+        albums_mgr.rename_album(album_id, req.name)
+    except KeyError:
+        raise HTTPException(404, "album not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.delete("/api/albums/{album_id}")
+def albums_delete(album_id: str):
+    albums_mgr.delete_album(album_id)
+    return {"ok": True}
+
+
+@app.post("/api/albums/{album_id}/add")
+def albums_add(album_id: str, req: AlbumItemsReq):
+    try:
+        count = albums_mgr.add_to_album(album_id, req.ids)
+    except KeyError:
+        raise HTTPException(404, "album not found")
+    return {"count": count}
+
+
+@app.post("/api/albums/{album_id}/remove")
+def albums_remove(album_id: str, req: AlbumItemsReq):
+    try:
+        count = albums_mgr.remove_from_album(album_id, req.ids)
+    except KeyError:
+        raise HTTPException(404, "album not found")
+    return {"count": count}
+
+
 # ── recent / timeline ─────────────────────────────────────────────────────────
 @app.get("/api/recent")
 def recent(limit: int = 60):
     active = get_active_model()
     if not active:
         return {"results": []}
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-    col = client.get_or_create_collection(collection_name_for(active))
-    data = col.get(include=["metadatas"])
-    items = list(zip(data["ids"], data["metadatas"]))
-    return {"results": [_card(i, m) for i, m in reversed(items[-limit:])]}
+    # True recency from the (cached, in-memory) catalog by created_at, then fetch
+    # metadata for just those ids — no full-collection scan. Over-fetch a little
+    # because some recent photos may not be embedded into the active model yet.
+    cat = load_catalog_cached().get("images", {})
+    ordered = sorted(cat.items(), key=lambda kv: kv[1].get("created_at", 0), reverse=True)
+    candidate_ids = [img_id for img_id, _ in ordered[: max(limit * 3, limit)]]
+    if not candidate_ids:
+        return {"results": []}
+    res = db.collection(active).get(ids=candidate_ids, include=["metadatas"])
+    meta_by_id = dict(zip(res["ids"], res["metadatas"]))
+    out = []
+    for img_id, _ in ordered:
+        m = meta_by_id.get(img_id)
+        if m is not None:
+            out.append(_card(img_id, m))
+            if len(out) >= limit:
+                break
+    return {"results": out}
+
+
+@app.get("/api/map")
+def map_photos():
+    """Geotagged photos (from EXIF GPS) for the Map tab."""
+    catalog = load_catalog_cached().get("images", {})
+    points = []
+    for img_id, data in list(catalog.items()):
+        meta = data.get("metadata", {})
+        lat, lon = meta.get("gps_lat"), meta.get("gps_lon")
+        if lat is not None and lon is not None:
+            points.append({
+                "id": img_id,
+                "lat": lat,
+                "lon": lon,
+                "filename": data.get("filename", ""),
+                "exists": os.path.exists(data.get("path", "")),
+            })
+    return {"points": points}
 
 
 @app.get("/api/timeline")
 def timeline():
-    idx = Indexer()
+    catalog = load_catalog_cached().get("images", {})
     by_year: dict[str, list] = {}
-    for img_id, data in idx.image_catalog.get("images", {}).items():
+    for img_id, data in list(catalog.items()):
         date = data.get("metadata", {}).get("date", "")
         year = date[:4] if date and len(date) >= 4 else "Unknown"
         by_year.setdefault(year, []).append({
@@ -247,6 +712,112 @@ def add_person(req: PersonReq):
     return {"ok": True, "name": req.name}
 
 
+# ── face clustering / tagging ─────────────────────────────────────────────────
+@app.get("/api/faces/status")
+def faces_status():
+    """Setup info for the Faces UI: detection progress + current clusters."""
+    idx = Indexer(use_cache=True)
+    stats = idx.get_faces_stats()
+    clusters = clustering.load_clusters()
+    cl = clusters.get("clusters", [])
+    return {
+        **stats,
+        "clusters_count": len(cl),
+        "clustered_at_faces": clusters.get("total_faces", 0),
+        "named": sum(1 for c in cl if c.get("status") == "named"),
+        "params": clusters.get("params", {}),
+        "ann_index_count": face_index_count(),
+    }
+
+
+@app.post("/api/faces/reindex")
+def faces_reindex():
+    """Rebuild the ANN face index from on-disk face JSON (for libraries indexed
+    before the index existed, or to repair it)."""
+    if _scan_active.is_set() or manager.status().get("active"):
+        raise HTTPException(409, "a scan or indexing job is running; wait for it to finish")
+    return {"indexed": rebuild_face_index()}
+
+
+@app.post("/api/faces/cluster")
+def faces_cluster(req: ClusterReq):
+    """Run DBSCAN clustering over all detected faces. User-triggered."""
+    if _scan_active.is_set() or manager.status().get("active"):
+        raise HTTPException(409, "a scan or indexing job is running; wait for it to finish")
+    s = settings_mgr.load()
+    eps = req.eps if req.eps is not None else s.get("face_cluster_eps", 0.5)
+    min_samples = req.min_samples if req.min_samples is not None else s.get("face_cluster_min_samples", 3)
+    summary = clustering.cluster_faces(eps=eps, min_samples=min_samples)
+    return summary
+
+
+@app.get("/api/faces/clusters")
+def faces_clusters(samples: int = 6):
+    """List clusters (excluding ignored) with a few sample faces each for review."""
+    data = clustering.load_clusters()
+    out = []
+    for c in data.get("clusters", []):
+        if c.get("status") == "ignored":
+            continue
+        out.append({
+            "cluster_id": c["cluster_id"],
+            "size": c["size"],
+            "status": c.get("status", "new"),
+            "name": c.get("name"),
+            "samples": c["members"][:samples],
+        })
+    return {"clusters": out}
+
+
+@app.post("/api/faces/name")
+def faces_name(req: NameClusterReq):
+    """Name a cluster → register it as a person from its mean face embedding."""
+    if not req.name.strip():
+        raise HTTPException(400, "name required")
+    emb = clustering.cluster_mean_embedding(req.cluster_id)
+    if emb is None:
+        raise HTTPException(404, "cluster not found or has no faces")
+    add_person_embedding(req.name.strip(), emb)
+    clustering.set_cluster_status(req.cluster_id, "named", name=req.name.strip())
+    return {"ok": True, "name": req.name.strip()}
+
+
+@app.post("/api/faces/ignore")
+def faces_ignore(req: IgnoreClusterReq):
+    clustering.set_cluster_status(req.cluster_id, "ignored")
+    return {"ok": True}
+
+
+@app.get("/api/faces/crop")
+def face_crop(image_id: str = Query(...), face_index: int = 0):
+    """Serve a cropped, cached JPEG of one detected face for cluster review."""
+    out = _derivative_path(f"{image_id}:{face_index}", "_face")
+    if not os.path.exists(out):
+        path = _resolve_indexed_path(image_id)
+        if not path:
+            raise HTTPException(404, "source image not found")
+        faces = load_face_data(image_id)
+        if face_index < 0 or face_index >= len(faces):
+            raise HTTPException(404, "face index out of range")
+        bbox = faces[face_index].get("bbox") or []
+        try:
+            with safe_open(path) as im:
+                im = im.convert("RGB")
+                w, h = im.size
+                x1, y1, x2, y2 = bbox if len(bbox) == 4 else (0, 0, w, h)
+                # pad ~30% around the face box, clamped to image bounds
+                pw, ph = (x2 - x1) * 0.3, (y2 - y1) * 0.3
+                box = (max(0, int(x1 - pw)), max(0, int(y1 - ph)),
+                       min(w, int(x2 + pw)), min(h, int(y2 + ph)))
+                crop = im.crop(box)
+                crop.thumbnail((200, 200))
+                crop.save(out, "JPEG", quality=80)
+        except Exception as e:
+            print(f"[api] face crop failed {image_id}:{face_index}: {e}")
+            return _placeholder_thumb()
+    return FileResponse(out, media_type="image/jpeg", headers=_IMMUTABLE_CACHE)
+
+
 # ── models ──────────────────────────────────────────────────────────────────
 @app.get("/api/models")
 def models():
@@ -261,24 +832,80 @@ def set_model(req: ActiveModelReq):
 
 
 # ── image / thumbnail / delete ─────────────────────────────────────────────────
-@app.get("/api/image")
-def image(id: str = Query(...), thumb: bool = False):
-    meta = _chroma_meta(id)
-    path = meta.get("path") or id
-    if not os.path.exists(path):
-        raise HTTPException(404, "file not found on disk")
-    if not thumb:
-        return FileResponse(path)
-    tp = _thumb_path(id)
-    if not os.path.exists(tp):
+def _resolve_indexed_path(img_id: str) -> str | None:
+    """
+    Map a client-supplied id to an on-disk path ONLY via the catalog / vector
+    metadata. The id is never used as a path itself — this is what prevents
+    arbitrary-file-read (e.g. id=C:\\Windows\\win.ini). Returns a confined,
+    canonical path to an existing file, or None.
+    """
+    path = _chroma_meta(img_id).get("path") or catalog_path_for(img_id)
+    if not path:
+        return None
+    return security.is_safe_real_path(path)
+
+
+def _derivative_path(img_id: str, suffix: str) -> str:
+    h = hashlib.sha1(img_id.encode("utf-8")).hexdigest()
+    return os.path.join(THUMB_DIR, f"{h}{suffix}.jpg")
+
+
+def _placeholder_thumb() -> Response:
+    """A neutral gray JPEG returned when a real thumbnail can't be produced
+    (corrupt / unsupported / oversized file), so the grid doesn't show a broken
+    image and we don't leak a 500."""
+    ph = os.path.join(THUMB_DIR, "_placeholder.jpg")
+    if not os.path.exists(ph):
         try:
-            with Image.open(path) as im:
-                im = im.convert("RGB")
-                im.thumbnail((400, 400))
-                im.save(tp, "JPEG", quality=80)
+            from PIL import Image as _Img
+            _Img.new("RGB", (_THUMB_PX, _THUMB_PX), (40, 44, 52)).save(ph, "JPEG", quality=70)
         except Exception:
-            raise HTTPException(500, "thumbnail generation failed")
-    return FileResponse(tp, media_type="image/jpeg")
+            return Response(status_code=204)
+    return FileResponse(ph, media_type="image/jpeg")
+
+
+def _ensure_derivative(src_path: str, out_path: str, max_px: int) -> bool:
+    """Generate a downscaled JPEG derivative if missing. Returns False on failure."""
+    if os.path.exists(out_path):
+        return True
+    try:
+        with safe_open(src_path) as im:
+            im = im.convert("RGB")
+            im.thumbnail((max_px, max_px))
+            im.save(out_path, "JPEG", quality=82)
+        return True
+    except Exception as e:
+        print(f"[api] derivative ({max_px}px) failed for {src_path}: {e}")
+        return False
+
+
+@app.get("/api/image")
+def image(id: str = Query(...), thumb: bool = False, size: str = "full"):
+    """
+    size: "thumb" (400px grid), "medium" (1600px lightbox), or "full" (original).
+    The legacy `thumb=true` flag maps to size=thumb. All tiers are immutable
+    (id is a content hash) so they cache forever in the browser.
+    """
+    if thumb:
+        size = "thumb"
+    path = _resolve_indexed_path(id)
+    if not path:
+        raise HTTPException(404, "not an indexed photo, or file missing on disk")
+
+    if size == "full":
+        return FileResponse(path, headers=_IMMUTABLE_CACHE)
+
+    if size == "medium":
+        out = _derivative_path(id, "_m")
+        if not _ensure_derivative(path, out, _MEDIUM_PX):
+            return FileResponse(path, headers=_IMMUTABLE_CACHE)  # fall back to original
+        return FileResponse(out, media_type="image/jpeg", headers=_IMMUTABLE_CACHE)
+
+    # default: thumb
+    out = _thumb_path(id)
+    if not _ensure_derivative(path, out, _THUMB_PX):
+        return _placeholder_thumb()
+    return FileResponse(out, media_type="image/jpeg", headers=_IMMUTABLE_CACHE)
 
 
 @app.get("/api/meta")
@@ -300,17 +927,78 @@ def delete_image(id: str = Query(...), delete_file: bool = False):
             removed_file = True
         except Exception as e:
             raise HTTPException(500, f"index removed, file delete failed: {e}")
-    tp = _thumb_path(id)
-    if os.path.exists(tp):
+    return {"ok": True, "removed_file": removed_file}
+
+
+@app.post("/api/images/delete")
+def batch_delete(req: BatchDeleteReq):
+    """Remove multiple images from the index (and optionally from disk) in one call."""
+    if not req.ids:
+        return {"removed": 0, "files_removed": 0}
+    idx = Indexer()
+    removed = files_removed = 0
+    for img_id in req.ids:
+        path = idx.delete_image(img_id)
+        removed += 1
+        if req.delete_file and path and os.path.exists(path):
+            try:
+                os.remove(path)
+                files_removed += 1
+            except Exception:
+                pass
+    return {"removed": removed, "files_removed": files_removed}
+
+
+@app.get("/api/explore")
+def explore(id: str = Query(...)):
+    """Full details for one photo: caption history, embedding model memberships."""
+    catalog = load_catalog_cached().get("images", {})
+    img_data = catalog.get(id)
+    if not img_data:
+        raise HTTPException(404, "photo not in catalog")
+
+    history = img_data.get("caption_history", [])
+    if not history and img_data.get("caption_json"):
+        history = [{"model": img_data.get("caption_model", "unknown"),
+                    "caption_json": img_data["caption_json"]}]
+    history_out = []
+    for h in history:
+        cj = h.get("caption_json", "")
+        validation = validate_vision_output(cj) if cj else {"valid": False, "warning": "No output"}
+        history_out.append({**h, "validation": validation})
+
+    reg = get_registry()
+    client = db.client()
+    embed_info = []
+    for model_name, info in reg.get("models", {}).items():
         try:
-            os.remove(tp)
+            col = client.get_or_create_collection(name=collection_name_for(model_name))
+            res = col.get(ids=[id], include=["metadatas"])
+            if res["ids"]:
+                embed_info.append({
+                    "model": model_name,
+                    "source": info.get("source"),
+                    "dimension": info.get("dimension"),
+                    "is_active": model_name == reg.get("active_model"),
+                })
         except Exception:
             pass
-    return {"ok": True, "removed_file": removed_file}
+
+    return {
+        "id": id,
+        "path": img_data.get("path", ""),
+        "filename": img_data.get("filename", ""),
+        "exists": os.path.exists(img_data.get("path", "")),
+        "caption_history": history_out,
+        "embeddings": embed_info,
+        "exif": img_data.get("metadata", {}),
+        "size_bytes": img_data.get("size_bytes"),
+    }
 
 
 @app.post("/api/cleanup-missing")
 def cleanup_missing():
+    """Legacy endpoint: remove all orphaned entries at once."""
     idx = Indexer()
     missing = idx.get_missing_files()
     for img_id, _ in missing:
@@ -318,9 +1006,43 @@ def cleanup_missing():
     return {"removed": len(missing)}
 
 
+# ── auth bootstrap ────────────────────────────────────────────────────────────
+@app.get("/api/token")
+def token():
+    """
+    Hand the bearer token to the same-origin SPA. Exempt from the token check so
+    the dev SPA (served by Vite, with no HTML injection) can bootstrap. Reading
+    this cross-origin is blocked by the CORS allowlist, and DNS-rebinding by the
+    trusted-host check, so only the loopback SPA can obtain it.
+    """
+    return {"token": security.get_token() if security.auth_enabled() else None}
+
+
 # ── static SPA (production build) ─────────────────────────────────────────────
 _DIST = os.path.join(PROJECT_ROOT, "web", "dist")
+
+
+def _index_html_with_token() -> str:
+    """Read the built index.html and inject the per-install token so the SPA can
+    authenticate same-origin without an extra round-trip."""
+    with open(os.path.join(_DIST, "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    if security.auth_enabled():
+        inject = f'<script>window.__PV_TOKEN__={security.get_token()!r};</script>'
+        html = html.replace("</head>", inject + "</head>", 1)
+    return html
+
+
 if os.path.isdir(_DIST):
+    @app.get("/", response_class=HTMLResponse)
+    def _spa_index():
+        return HTMLResponse(_index_html_with_token())
+
+    @app.get("/index.html", response_class=HTMLResponse)
+    def _spa_index_html():
+        return HTMLResponse(_index_html_with_token())
+
+    # All other static assets (hashed JS/CSS) served verbatim.
     app.mount("/", StaticFiles(directory=_DIST, html=True), name="spa")
 else:
     @app.get("/")

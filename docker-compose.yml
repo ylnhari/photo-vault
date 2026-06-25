@@ -1,0 +1,27 @@
+services:
+  photo-vault:
+    build: .
+    container_name: photo-vault
+    ports:
+      - "8768:8768"
+    environment:
+      # Reach an LM Studio running on the host machine (optional — Gemini is the fallback).
+      - LM_STUDIO_URL=http://host.docker.internal:1234/v1
+      # Gemini fallback key, taken from your shell or a .env file beside this compose file.
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    extra_hosts:
+      # Lets the container resolve the host machine on Linux (no-op on Mac/Windows).
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Index, thumbnails, faces, settings — persisted across restarts.
+      - ./data:/app/data
+      # Cache the ~300MB InsightFace model so it isn't re-downloaded every run.
+      - insightface-models:/root/.insightface
+      # Your photos. Set PHOTOS_DIR to the folder you want indexed. Mounted
+      # read-only so the app can never modify or delete your originals.
+      # Inside the app, add the folder path "/photos".
+      - ${PHOTOS_DIR:-./photos}:/photos:ro
+    restart: unless-stopped
+
+volumes:
+  insightface-models:

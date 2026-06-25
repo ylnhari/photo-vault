@@ -63,7 +63,7 @@ def test_search_empty_collection():
     mock_client = MagicMock()
     mock_client.get_or_create_collection.return_value = mock_col
 
-    with patch("search.chromadb.PersistentClient", return_value=mock_client), \
+    with patch("search.db.collection", return_value=mock_col), \
          patch("search.get_active_model", return_value="test-model"), \
          patch("search.get_embedding", return_value=([0.1, 0.2], "test-model", "lm_studio")):
         result = search_images("beach")
@@ -78,7 +78,7 @@ def test_search_returns_none_when_embedding_fails():
     mock_client = MagicMock()
     mock_client.get_or_create_collection.return_value = mock_col
 
-    with patch("search.chromadb.PersistentClient", return_value=mock_client), \
+    with patch("search.db.collection", return_value=mock_col), \
          patch("search.get_active_model", return_value="test-model"), \
          patch("search.get_embedding", return_value=(None, "", "error")):
         result = search_images("beach")
@@ -92,7 +92,7 @@ def test_search_passes_where_clause():
     mock_client = MagicMock()
     mock_client.get_or_create_collection.return_value = mock_col
 
-    with patch("search.chromadb.PersistentClient", return_value=mock_client), \
+    with patch("search.db.collection", return_value=mock_col), \
          patch("search.get_active_model", return_value="test-model"), \
          patch("search.get_embedding", return_value=([0.1], "test-model", "lm_studio")):
         search_images("beach", filters={"weather": "sunny"})
@@ -107,7 +107,7 @@ def test_search_no_where_when_all_filters():
     mock_client = MagicMock()
     mock_client.get_or_create_collection.return_value = mock_col
 
-    with patch("search.chromadb.PersistentClient", return_value=mock_client), \
+    with patch("search.db.collection", return_value=mock_col), \
          patch("search.get_active_model", return_value="test-model"), \
          patch("search.get_embedding", return_value=([0.1], "test-model", "lm_studio")):
         search_images("beach", filters={"weather": "All"})
@@ -124,7 +124,7 @@ def test_search_falls_back_when_where_clause_fails():
     mock_client = MagicMock()
     mock_client.get_or_create_collection.return_value = mock_col
 
-    with patch("search.chromadb.PersistentClient", return_value=mock_client), \
+    with patch("search.db.collection", return_value=mock_col), \
          patch("search.get_active_model", return_value="test-model"), \
          patch("search.get_embedding", return_value=([0.1], "test-model", "lm_studio")):
         result = search_images("beach", filters={"weather": "sunny"})
@@ -134,26 +134,37 @@ def test_search_falls_back_when_where_clause_fails():
 
 
 def test_search_filters_by_person():
+    """With a text query + person, results are intersected with the person's ANN matches."""
     from search import search_images
     ids = ["img1", "img2"]
     metas = [{"path": "/img1.jpg"}, {"path": "/img2.jpg"}]
     mock_col = _mock_collection(count=2, query_result={"ids": [ids], "metadatas": [metas]})
-    mock_client = MagicMock()
-    mock_client.get_or_create_collection.return_value = mock_col
 
-    person_emb = [1.0, 0.0]
-    face_match = [{"embedding": [1.0, 0.0]}]
-    face_no_match = [{"embedding": [0.0, 1.0]}]
-
-    with patch("search.chromadb.PersistentClient", return_value=mock_client), \
+    with patch("search.db.collection", return_value=mock_col), \
          patch("search.get_active_model", return_value="test-model"), \
          patch("search.get_embedding", return_value=([0.1], "test-model", "lm_studio")), \
-         patch("search.get_person_embedding", return_value=person_emb), \
-         patch("search.load_face_data", side_effect=[face_match, face_no_match]):
-        result = search_images("photo", person="Alice")
+         patch("search.get_person_embedding", return_value=[1.0, 0.0]), \
+         patch("search.query_person_faces", return_value={"img1"}):
+        result = search_images("beach", person="Alice")
 
     assert result["ids"][0] == ["img1"]
     assert len(result["metadatas"][0]) == 1
+
+
+def test_search_person_only_returns_all_matches():
+    """Person + no query/filters → fetch all the person's photos from the face index."""
+    from search import search_images
+    mock_col = _mock_collection(count=5)
+    mock_col.get.return_value = {"ids": ["img1", "img3"], "metadatas": [{"path": "/1"}, {"path": "/3"}]}
+
+    with patch("search.db.collection", return_value=mock_col), \
+         patch("search.get_active_model", return_value="test-model"), \
+         patch("search.get_person_embedding", return_value=[1.0, 0.0]), \
+         patch("search.query_person_faces", return_value={"img1", "img3"}):
+        result = search_images("", person="Alice")
+
+    assert set(result["ids"][0]) == {"img1", "img3"}
+    mock_col.get.assert_called_once()
 
 
 def test_search_uses_active_model_collection():
@@ -162,8 +173,10 @@ def test_search_uses_active_model_collection():
     mock_client = MagicMock()
     mock_client.get_or_create_collection.return_value = mock_col
 
-    with patch("search.chromadb.PersistentClient", return_value=mock_client), \
-         patch("search.get_active_model", return_value="my-embed-model"), \
+    # Let the real db.collection() run so the model→collection-name derivation
+    # is exercised; only the underlying client is mocked.
+    with patch("db.client", return_value=mock_client), \
+         patch("db.get_active_model", return_value="my-embed-model"), \
          patch("search.get_embedding", return_value=([0.1], "my-embed-model", "lm_studio")):
         search_images("test")
 

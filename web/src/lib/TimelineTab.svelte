@@ -10,6 +10,8 @@
   let err = "";
   let shown = {}; // year -> count shown
 
+  import { onMount } from "svelte";
+
   async function load() {
     loading = true; err = "";
     try {
@@ -18,15 +20,12 @@
     } catch (e) { err = e.message; }
     loading = false; loaded = true;
   }
+
+  onMount(load);
 </script>
 
-{#if !loaded}
-  <div class="card col">
-    <p>Browse your photos organized by year.</p>
-    <button class="primary" on:click={load} disabled={loading} style="width:max-content">
-      {loading ? "Loading…" : "📅 Load Timeline"}
-    </button>
-  </div>
+{#if loading}
+  <p class="muted">Loading timeline…</p>
 {:else if err}
   <p style="color:var(--danger)">{err}</p>
 {:else if years.length === 0}
@@ -53,5 +52,5 @@
       {/if}
     </div>
   {/each}
-  <button class="ghost" on:click={load}>🔄 Reload</button>
+  <button class="ghost" on:click={load} disabled={loading}>Reload</button>
 {/if}

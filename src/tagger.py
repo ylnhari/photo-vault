@@ -22,6 +22,18 @@ def add_person_reference(person_name, image_dir):
     _save_map(person_map)
     print(f"Registered: {person_name}")
 
+def add_person_embedding(person_name, embedding):
+    """Register a person directly from a precomputed mean embedding (e.g. from a
+    reviewed face cluster). Returns True on success."""
+    if not person_name or embedding is None:
+        return False
+    person_map = _load_map()
+    person_map[person_name] = list(embedding)
+    _save_map(person_map)
+    print(f"Registered (from cluster): {person_name}")
+    return True
+
+
 def get_person_embedding(person_name):
     return _load_map().get(person_name)
 
