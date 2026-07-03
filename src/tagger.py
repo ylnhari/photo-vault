@@ -5,22 +5,25 @@ from faces import detect_and_embed_faces
 from constants import PERSON_MAP_PATH
 
 def add_person_reference(person_name, image_dir):
+    """Register a person from a folder of reference photos.
+    Returns the number of faces used (0 → nothing registered)."""
     embeddings = []
     for f in os.listdir(image_dir):
-        if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+        if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.heic')):
             path = os.path.join(image_dir, f)
             for face in detect_and_embed_faces(path):
                 embeddings.append(face['embedding'])
 
     if not embeddings:
         print(f"No faces found for {person_name}.")
-        return
+        return 0
 
     mean_embedding = np.mean(embeddings, axis=0).tolist()
     person_map = _load_map()
     person_map[person_name] = mean_embedding
     _save_map(person_map)
     print(f"Registered: {person_name}")
+    return len(embeddings)
 
 def add_person_embedding(person_name, embedding):
     """Register a person directly from a precomputed mean embedding (e.g. from a

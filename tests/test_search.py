@@ -183,3 +183,16 @@ def test_search_uses_active_model_collection():
     col_name_used = mock_client.get_or_create_collection.call_args[1].get("name") or \
                     mock_client.get_or_create_collection.call_args[0][0]
     assert "my_embed_model" in col_name_used
+
+
+def test_query_embedded_with_active_model():
+    """The query vector must come from the ACTIVE model's provider/model, not
+    whatever the auto chain would pick — mixed vector spaces break search."""
+    from search import search_images
+    mock_col = _mock_collection(count=2, query_result={"ids": [["a"]], "metadatas": [[{"path": "/a"}]]})
+    reg = {"active_model": "my-embed", "models": {"my-embed": {"source": "lm_studio"}}}
+    with patch("search.db.collection", return_value=mock_col), \
+         patch("search.get_registry", return_value=reg), \
+         patch("search.get_embedding", return_value=([0.1], "my-embed", "lm_studio")) as ge:
+        search_images("beach")
+    ge.assert_called_once_with("beach", force_provider="lm_studio", model="my-embed")

@@ -21,9 +21,31 @@ def _get_app():
         _face_app.prepare(ctx_id=0, det_size=(640, 640))
     return _face_app
 
+def _read_image_bgr(image_path):
+    """cv2.imread returns None for non-ASCII Windows paths and formats cv2
+    can't decode (HEIC) — fall back to byte-decode, then PIL."""
+    img = cv2.imread(image_path)
+    if img is not None:
+        return img
+    try:
+        data = np.fromfile(image_path, dtype=np.uint8)  # unicode-path safe
+        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if img is not None:
+            return img
+    except Exception:
+        pass
+    try:
+        from imaging import safe_open  # registers the HEIF opener
+        with safe_open(image_path) as im:
+            rgb = np.asarray(im.convert("RGB"))
+        return rgb[:, :, ::-1].copy()  # RGB → BGR
+    except Exception:
+        return None
+
+
 def detect_and_embed_faces(image_path):
     try:
-        img = cv2.imread(image_path)
+        img = _read_image_bgr(image_path)
         if img is None:
             return []
         faces = _get_app().get(img)

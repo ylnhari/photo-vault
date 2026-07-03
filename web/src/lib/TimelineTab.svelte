@@ -1,24 +1,31 @@
 <script>
   import { api } from "./api.js";
   import PhotoGrid from "./PhotoGrid.svelte";
-  import { createEventDispatcher } from "svelte";
+  import { createEventDispatcher, onMount } from "svelte";
   const dispatch = createEventDispatcher();
 
-  let loaded = false;
   let years = [];
   let loading = false;
   let err = "";
-  let shown = {}; // year -> count shown
-
-  import { onMount } from "svelte";
+  let moreBusy = {}; // year -> loading more
 
   async function load() {
     loading = true; err = "";
     try {
       years = (await api.timeline()).years;
-      for (const y of years) shown[y.year] = 60;
     } catch (e) { err = e.message; }
-    loading = false; loaded = true;
+    loading = false;
+  }
+
+  async function loadMore(y) {
+    moreBusy = { ...moreBusy, [y.year]: true };
+    try {
+      const page = await api.timelineYear(y.year, y.photos.length, 120);
+      y.photos = [...y.photos, ...page.photos];
+      y.count = page.count;
+      years = years; // trigger reactivity
+    } catch (e) { err = e.message; }
+    moreBusy = { ...moreBusy, [y.year]: false };
   }
 
   onMount(load);
@@ -33,21 +40,21 @@
 {:else}
   {#each years as y (y.year)}
     {@const existing = y.photos.filter((p) => p.exists !== false)}
-    {@const missing = y.count - existing.length}
+    {@const missingLoaded = y.photos.length - existing.length}
     <div class="card" style="margin-bottom:14px">
       <div class="row" style="justify-content:space-between">
-        <b>📅 {y.year} — {existing.length} photos
-          {#if missing}<span class="pill" style="color:var(--danger)">{missing} missing</span>{/if}
+        <b>📅 {y.year} — {y.count} photos
+          {#if missingLoaded}<span class="pill" style="color:var(--danger)">{missingLoaded} missing</span>{/if}
         </b>
       </div>
       <div style="margin-top:10px">
-        <PhotoGrid photos={existing.slice(0, shown[y.year])} cols={6}
+        <PhotoGrid photos={existing} cols={6}
                    on:select={(e) => dispatch("select", e.detail)} />
       </div>
-      {#if existing.length > shown[y.year]}
-        <button class="ghost" style="margin-top:10px"
-                on:click={() => (shown[y.year] += 60)}>
-          Load more ({existing.length - shown[y.year]} remaining)
+      {#if y.photos.length < y.count}
+        <button class="ghost" style="margin-top:10px" disabled={moreBusy[y.year]}
+                on:click={() => loadMore(y)}>
+          {moreBusy[y.year] ? "Loading…" : `Load more (${y.count - y.photos.length} remaining)`}
         </button>
       {/if}
     </div>

@@ -8,6 +8,7 @@ in production. Run:  uv run uvicorn api:app --app-dir src --port <port>
 import hashlib
 import os
 import threading
+from datetime import datetime as _dt
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -192,6 +193,16 @@ class AlbumItemsReq(BaseModel):
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+def _reject_if_writer_active():
+    """Deletes/purges rewrite images.json from a private Indexer copy. If a scan
+    or index job is mid-flight (each holds its own copy), whichever saves last
+    silently resurrects what the other removed — so refuse instead."""
+    if _scan_active.is_set() or manager.status().get("active"):
+        raise HTTPException(
+            409, "a scan or indexing job is running; stop it before deleting"
+        )
+
+
 def _thumb_path(img_id: str) -> str:
     h = hashlib.sha1(img_id.encode("utf-8")).hexdigest()
     return os.path.join(THUMB_DIR, f"{h}.jpg")
@@ -260,7 +271,7 @@ def status():
         "embed_pending": embed_pending if csm or em else legacy_embed_pending,
         "missing_attrs": len(idx.get_missing_attributes()),
         "missing_full": len(idx.get_missing()),
-        "missing_files": len(idx.get_missing_files()),
+        "missing_files": len(idx.get_missing_files(use_cache=True)),
         # New model-aware fields
         "model_status": {
             "vision": {
@@ -390,6 +401,7 @@ def remove_folder(path: str = Query(...), purge: bool = True):
 
     images_purged = 0
     if purge:
+        _reject_if_writer_active()
         idx = Indexer()
         images_purged = idx.purge_folder(path)
 
@@ -453,6 +465,7 @@ def cleanup_orphaned(req: OrphanedCleanupReq = None):
     Remove orphaned images from the library. If req.ids is empty, removes all orphaned.
     Returns {removed: count}.
     """
+    _reject_if_writer_active()
     idx = Indexer()
     if req and req.ids:
         target_ids = set(req.ids)
@@ -532,11 +545,13 @@ def filters():
 
 @app.get("/api/search")
 def search(
-    q: str = Query("photo"),
+    q: str = Query(""),
     person: str | None = None,
     top_k: int = 200,
 ):
-    res = search_images(q or "photo", top_k=top_k, person=person or None)
+    # Pass q through as-is: an empty q with a person set is the person-only
+    # browse path (all their photos), which coercing q to "photo" would disable.
+    res = search_images(q, top_k=top_k, person=person or None)
     metas = res.get("metadatas", [[]])[0] if res else []
     ids = res.get("ids", [[]])[0] if res else []
     return {"results": [_card(i, m) for i, m in zip(ids, metas)]}
@@ -544,7 +559,7 @@ def search(
 
 @app.post("/api/search")
 def search_post(body: dict):
-    q = body.get("q") or "photo"
+    q = body.get("q") or ""
     person = body.get("person") or None
     filters_in = {
         k: v for k, v in (body.get("filters") or {}).items() if v and v != "All"
@@ -688,6 +703,11 @@ def recent(limit: int = 60):
             out.append(_card(img_id, m))
             if len(out) >= limit:
                 break
+    if not out:
+        # Early in indexing the newest-by-date candidates may not be embedded
+        # yet — show whatever IS in the collection instead of an empty grid.
+        got = db.collection(active).get(limit=limit, include=["metadatas"])
+        out = [_card(i, m) for i, m in zip(got["ids"], got["metadatas"])]
     return {"results": out}
 
 
@@ -713,25 +733,62 @@ def map_photos():
 
 
 @app.get("/api/timeline")
-def timeline():
+def timeline(year: str | None = None, offset: int = 0, limit: int = 60):
+    """
+    Paged timeline. Without `year`: every year with its count and the first
+    `limit` photos (newest first). With `year`: one page of that year's photos.
+    Returning the whole catalog in one response was 2.4 MB / 4.4 s at 25k
+    photos (an os.path.exists per photo) — pages keep both bounded.
+    """
     catalog = load_catalog_cached().get("images", {})
     by_year: dict[str, list] = {}
     for img_id, data in list(catalog.items()):
         date = data.get("metadata", {}).get("date", "")
-        year = date[:4] if date and len(date) >= 4 else "Unknown"
-        by_year.setdefault(year, []).append(
+        if not date or len(date) < 4:
+            # No EXIF date (WhatsApp strips it, screenshots never had it) —
+            # fall back to the file timestamp so most of the library lands in
+            # a real year instead of one giant "Unknown" bucket.
+            ts = data.get("created_at")
+            if ts:
+                try:
+                    date = _dt.fromtimestamp(ts).strftime("%Y:%m:%d %H:%M:%S")
+                except (OSError, OverflowError, ValueError):
+                    date = ""
+        y = date[:4] if date and len(date) >= 4 else "Unknown"
+        by_year.setdefault(y, []).append((date, img_id, data))
+
+    def _tcard(img_id, data):
+        return {
+            "id": img_id,
+            "filename": data.get("filename", ""),
+            "exists": os.path.exists(data.get("path", "")),
+        }
+
+    limit = max(1, min(limit, 500))
+    if year is not None:
+        rows = sorted(by_year.get(year, []), key=lambda t: t[0], reverse=True)
+        page = rows[max(0, offset) : max(0, offset) + limit]
+        return {
+            "year": year,
+            "count": len(rows),
+            "photos": [_tcard(i, d) for _, i, d in page],
+        }
+
+    # Newest year first; "Unknown" (sorts above digits) belongs at the end.
+    year_order = sorted((y for y in by_year if y != "Unknown"), reverse=True)
+    if "Unknown" in by_year:
+        year_order.append("Unknown")
+    years_out = []
+    for y in year_order:
+        rows = sorted(by_year[y], key=lambda t: t[0], reverse=True)
+        years_out.append(
             {
-                "id": img_id,
-                "filename": data.get("filename", ""),
-                "exists": os.path.exists(data.get("path", "")),
+                "year": y,
+                "count": len(rows),
+                "photos": [_tcard(i, d) for _, i, d in rows[:limit]],
             }
         )
-    return {
-        "years": [
-            {"year": y, "count": len(by_year[y]), "photos": by_year[y]}
-            for y in sorted(by_year, reverse=True)
-        ]
-    }
+    return {"years": years_out}
 
 
 # ── people ────────────────────────────────────────────────────────────────────
@@ -746,8 +803,12 @@ def add_person(req: PersonReq):
         raise HTTPException(400, "name required")
     if not os.path.isdir(req.ref_dir):
         raise HTTPException(400, "reference folder not found")
-    add_person_reference(req.name, req.ref_dir)
-    return {"ok": True, "name": req.name}
+    faces_found = add_person_reference(req.name, req.ref_dir)
+    if not faces_found:
+        raise HTTPException(
+            400, "no faces detected in the reference folder — person not registered"
+        )
+    return {"ok": True, "name": req.name, "faces": faces_found}
 
 
 # ── face clustering / tagging ─────────────────────────────────────────────────
@@ -973,6 +1034,7 @@ def meta(id: str = Query(...)):
 
 @app.delete("/api/image")
 def delete_image(id: str = Query(...), delete_file: bool = False):
+    _reject_if_writer_active()
     idx = Indexer()
     path = idx.delete_image(id)
     removed_file = False
@@ -990,6 +1052,7 @@ def batch_delete(req: BatchDeleteReq):
     """Remove multiple images from the index (and optionally from disk) in one call."""
     if not req.ids:
         return {"removed": 0, "files_removed": 0}
+    _reject_if_writer_active()
     idx = Indexer()
     removed = files_removed = 0
     for img_id in req.ids:
@@ -1064,6 +1127,7 @@ def explore(id: str = Query(...)):
 @app.post("/api/cleanup-missing")
 def cleanup_missing():
     """Legacy endpoint: remove all orphaned entries at once."""
+    _reject_if_writer_active()
     idx = Indexer()
     missing = idx.get_missing_files()
     for img_id, _ in missing:

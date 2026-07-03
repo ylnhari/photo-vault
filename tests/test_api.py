@@ -448,3 +448,28 @@ def test_cleanup_missing(client):
         r = client.post("/api/cleanup-missing")
     assert r.json()["removed"] == 2
     assert fake.delete_image.call_count == 2
+
+
+def test_search_post_empty_q_preserved_for_person_browse(client):
+    """q='' with a person must stay empty so search_images takes the
+    person-only browse path (coercing to 'photo' disabled it entirely)."""
+    res = {"ids": [["i1"]], "metadatas": [[{"path": "/x.jpg"}]]}
+    with patch("api.search_images", return_value=res) as si:
+        r = client.post("/api/search", json={"q": "", "person": "Alice"})
+    assert r.status_code == 200
+    assert si.call_args[0][0] == ""
+    assert si.call_args[1]["person"] == "Alice"
+
+
+def test_add_person_no_faces_is_400(client):
+    with patch("api.os.path.isdir", return_value=True), \
+         patch("api.add_person_reference", return_value=0):
+        r = client.post("/api/people", json={"name": "Bob", "ref_dir": "C:/refs"})
+    assert r.status_code == 400
+    assert "no faces" in r.json()["detail"]
+
+
+def test_delete_image_rejected_while_job_active(client):
+    with patch("api.manager.status", return_value={"active": True}):
+        r = client.delete("/api/image?id=abc")
+    assert r.status_code == 409

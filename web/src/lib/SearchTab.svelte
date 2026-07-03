@@ -73,15 +73,21 @@
     ["mood", "Mood"], ["location_type", "Location"], ["season", "Season"],
   ];
 
-  onMount(async () => {
-    if (indexedCount > 0) {
-      initialLoading = true;
-      try {
-        [filterVals, { results: recent }] = await Promise.all([api.filters(), api.recent(60)]);
-      } catch (e) { err = e.message; }
-      initialLoading = false;
-    }
-  });
+  // React to indexedCount instead of checking it once in onMount: at first
+  // page load this component mounts before /api/status resolves (indexedCount
+  // is still 0), so an onMount-only check left Recently-indexed empty forever.
+  let bootstrapped = false;
+  $: if (indexedCount > 0 && !bootstrapped) {
+    bootstrapped = true;
+    loadInitial();
+  }
+  async function loadInitial() {
+    initialLoading = true;
+    try {
+      [filterVals, { results: recent }] = await Promise.all([api.filters(), api.recent(60)]);
+    } catch (e) { err = e.message; }
+    initialLoading = false;
+  }
 
   async function doSearch() {
     loading = true; err = "";

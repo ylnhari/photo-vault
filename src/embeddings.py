@@ -154,15 +154,14 @@ def _lm_studio_embed(text: str, model: str = None) -> tuple[list, str]:
     return result["data"][0]["embedding"], model_name
 
 
-def _gemini_embed(text: str) -> tuple[list, str]:
+def _gemini_embed(text: str, model: str = None) -> tuple[list, str]:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set")
-    url = (
-        f"{GEMINI_BASE}/models/{_GEMINI_EMBED_MODEL}:embedContent?key={GEMINI_API_KEY}"
-    )
+    model_name = model or _GEMINI_EMBED_MODEL
+    url = f"{GEMINI_BASE}/models/{model_name}:embedContent?key={GEMINI_API_KEY}"
     payload = json.dumps(
         {
-            "model": f"models/{_GEMINI_EMBED_MODEL}",
+            "model": f"models/{model_name}",
             "content": {"parts": [{"text": text}]},
         }
     ).encode("utf-8")
@@ -172,7 +171,7 @@ def _gemini_embed(text: str) -> tuple[list, str]:
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             result = json.loads(r.read())
-        return result["embedding"]["values"], _GEMINI_EMBED_MODEL
+        return result["embedding"]["values"], model_name
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"Gemini embed {e.code}: {e.read()[:200]}")
 
@@ -185,10 +184,11 @@ def get_embedding(
 ) -> tuple[list | None, str, str]:
     """Returns (vector, model_name, source).
     force_provider: "auto" (LM Studio → Gemini), "lm_studio", or "gemini".
-    model: explicit LM Studio embedding model id (ignored for Gemini, which is fixed).
+    model: explicit embedding model id for the forced provider. In "auto" mode it
+    is only passed to LM Studio (a Gemini fallback picks its own default).
     Registers the model on success. Returns (None, '', 'error') on full failure."""
     lm = ("lm_studio", lambda t: _lm_studio_embed(t, model))
-    gem = ("gemini", _gemini_embed)
+    gem = ("gemini", lambda t: _gemini_embed(t, model if force_provider == "gemini" else None))
     if force_provider == "lm_studio":
         chain = [lm]
     elif force_provider == "gemini":

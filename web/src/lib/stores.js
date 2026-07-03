@@ -23,6 +23,23 @@ export const status = writable({
 
 export const models = writable({ loaded: false, active: null, models: {} });
 
+// Id of the most recently deleted photo. PhotoGrid subscribes and hides it, so
+// every visible grid drops a photo deleted from the Lightbox without each tab
+// having to wire up its own removal handling.
+export const lastDeleted = writable(null);
+
+// Lightweight background-job status for the global header pill, so a running
+// index job is visible from every tab (the detailed panel lives in
+// Index & Manage). Polled slowly; IndexTab keeps its own faster poll.
+export const jobStatus = writable({ active: false, type: null, done: 0, total: 0 });
+
+export async function refreshJob() {
+  try {
+    const j = await api.indexProgress();
+    jobStatus.set({ active: !!j.active, type: j.type, done: j.done, total: j.total });
+  } catch {}
+}
+
 export async function refreshHealth() {
   try {
     const h = await api.health();

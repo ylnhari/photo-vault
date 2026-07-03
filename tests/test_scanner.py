@@ -38,3 +38,22 @@ def test_gps_accepts_object_with_values_attr():
 def test_gps_bad_input_returns_none():
     assert _gps_to_decimal([], "N") is None
     assert _gps_to_decimal(None, "N") is None
+
+
+def test_in_place_edit_retires_old_uid(tmp_path):
+    """Editing a file in place (same path, new bytes) must replace the old
+    catalog entry, not leave a stale duplicate that never shows as orphaned."""
+    from scanner import scan_directory
+    import json, os, time
+    root = tmp_path / "photos"
+    root.mkdir()
+    f = root / "a.jpg"
+    f.write_bytes(b"original-bytes-1")
+    out = str(tmp_path / "images.json")
+    scan_directory(str(root), out)
+    # rewrite with different content (and nudge mtime so the sig changes)
+    f.write_bytes(b"edited-bytes-22222")
+    os.utime(f, (time.time() + 5, time.time() + 5))
+    scan_directory(str(root), out)
+    images = json.load(open(out))["images"]
+    assert len(images) == 1, f"stale duplicate left behind: {list(images)}"

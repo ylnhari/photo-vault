@@ -1,7 +1,25 @@
 import db
-from embeddings import get_embedding, get_active_model, collection_name_for
+from embeddings import get_embedding, get_active_model, get_registry  # noqa: F401 — get_active_model is a test patch point
 from tagger import get_person_embedding
 from faces import query_person_faces
+
+
+def _embed_query(text: str):
+    """Embed a search query IN THE ACTIVE MODEL'S vector space. Letting the
+    auto provider chain pick (whatever LM Studio has loaded, or Gemini) can
+    produce a vector from a different model than the collection being queried —
+    wrong dimension or meaningless distances."""
+    reg = get_registry()
+    active = reg.get("active_model")
+    info = reg.get("models", {}).get(active)
+    if active and info:
+        vec, _, _ = get_embedding(
+            text, force_provider=info.get("source", "auto"), model=active
+        )
+        return vec
+    vec, _, _ = get_embedding(text)
+    return vec
+
 
 def build_where_clause(filters: dict) -> dict | None:
     clauses = []
@@ -36,13 +54,12 @@ def search_images(query: str, top_k: int = 50, filters: dict = None, person: str
     if person is not None and not q and not where_clause:
         if not person_ids:
             return {"ids": [[]], "metadatas": [[]]}
-        idlist = list(person_ids)[:top_k]
-        got = collection.get(ids=idlist, include=["metadatas"])
+        got = collection.get(ids=list(person_ids), include=["metadatas"])
         return {"ids": [got["ids"]], "metadatas": [got["metadatas"]]}
 
     if not q:
         q = "photo"  # default for pure-filter / empty searches
-    query_embedding, _, _ = get_embedding(q)
+    query_embedding = _embed_query(q)
     if query_embedding is None:
         return None
 

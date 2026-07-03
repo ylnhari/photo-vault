@@ -239,6 +239,13 @@ def scan_directory(
             print(f"  [skip] {path}: {e}")
             continue
 
+        # A file edited in place keeps its path but gets a new content uid; the
+        # old uid entry would linger pointing at the same (existing) path — a
+        # permanent duplicate that never shows up as orphaned. Retire it.
+        if existing_uid and existing_uid != uid and existing_uid in images:
+            if images[existing_uid].get("path") == str_path:
+                del images[existing_uid]
+
         if uid in images:
             entry = images[uid]
             if entry.get("path") != str_path:

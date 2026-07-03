@@ -4,7 +4,8 @@
   const dispatch = createEventDispatcher();
 
   const TITLES = { vision: "Vision analysis", embed: "Embedding",
-                   full: "Full index", reanalyze: "Re-analyze" };
+                   full: "Full index", reanalyze: "Re-analyze",
+                   faces: "Face detection" };
 
   $: running = job.active;
   $: pct = job.total ? Math.round((job.done / job.total) * 100) : (running ? 0 : 100);
@@ -44,7 +45,7 @@
       {#each job.log.slice(-12) as l}
         <div class="line {l.kind}">
           <span>{l.kind === "fail" ? "❌" : l.kind === "cloud" ? "☁️" : "✅"}</span>
-          <span class="fn">{l.id.split(/[\\/]/).pop()}</span>
+          <span class="fn" title={l.id}>{l.file || l.id.slice(0, 12)}</span>
           <span class="note">{l.note}</span>
         </div>
       {/each}

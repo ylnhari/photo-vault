@@ -43,6 +43,10 @@ def encode_image(image_path, max_size=(1024, 1024)):
     try:
         with Image.open(image_path) as img:
             img.thumbnail(max_size)
+            # JPEG can't encode alpha/palette modes (RGBA screenshots, P-mode
+            # PNGs, LA) — convert or every such file fails vision entirely.
+            if img.mode != "RGB":
+                img = img.convert("RGB")
             buf = io.BytesIO()
             img.save(buf, format="JPEG")
             return base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -106,6 +110,8 @@ _VISION_NAME_PATTERNS = (
     "vision",
     "visual",
     "multimodal",
+    "gemma-3-",  # gemma-3/4 chat models are multimodal; trailing dash keeps
+    "gemma-4-",  # "embeddinggemma-300m" (contains "gemma-3") out of the match
 )
 _EMBED_NAME_PATTERNS = (
     "embed",

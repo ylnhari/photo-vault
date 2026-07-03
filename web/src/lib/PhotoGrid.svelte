@@ -1,5 +1,6 @@
 <script>
   import { api } from "./api.js";
+  import { lastDeleted } from "./stores.js";
   import { createEventDispatcher } from "svelte";
   export let photos = [];
   export let cols = 5;
@@ -10,7 +11,15 @@
   let selected = new Set();
   let lastIndex = -1;
 
-  $: ids = photos.map((p) => p.id);
+  // Hide photos deleted elsewhere (e.g. from the Lightbox) without requiring
+  // every parent tab to prune its own list.
+  let hidden = new Set();
+  $: if ($lastDeleted && !hidden.has($lastDeleted)) {
+    hidden = new Set([...hidden, $lastDeleted]);
+  }
+  $: visible = photos.filter((p) => !hidden.has(p.id));
+
+  $: ids = visible.map((p) => p.id);
 
   // Clear selection when the parent bumps resetToken (e.g. after a batch delete).
   let _lastReset = resetToken;
@@ -29,7 +38,7 @@
     if (multi) {
       if (e.shiftKey && lastIndex >= 0) {
         const [a, b] = [Math.min(lastIndex, i), Math.max(lastIndex, i)];
-        for (let k = a; k <= b; k++) if (photos[k].exists !== false) selected.add(photos[k].id);
+        for (let k = a; k <= b; k++) if (visible[k].exists !== false) selected.add(visible[k].id);
       } else {
         if (selected.has(p.id)) selected.delete(p.id);
         else selected.add(p.id);
@@ -80,7 +89,7 @@
     const b = box();
     const next = new Set(baseSel);
     cellEls.forEach((el, i) => {
-      const p = photos[i];
+      const p = visible[i];
       if (el && p && p.exists !== false && intersects(el, b)) next.add(p.id);
     });
     selected = next; emit();
@@ -93,12 +102,12 @@
   }
 </script>
 
-{#if photos.length === 0}
+{#if visible.length === 0}
   <p class="muted">No photos to show.</p>
 {:else}
   <div class="gridwrap" class:dragging bind:this={wrapEl} on:mousedown={onDown} role="presentation">
     <div class="grid" style="--cols:{cols}">
-      {#each photos as p, i (p.id)}
+      {#each visible as p, i (p.id)}
         <div class="cell" class:missing={p.exists === false} class:selected={selected.has(p.id)}
              bind:this={cellEls[i]}
              on:click={(e) => onCellClick(e, p, i)}

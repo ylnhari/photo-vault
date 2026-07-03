@@ -73,6 +73,8 @@ export const api = {
     j("POST", "/api/search", { q, filters, person, top_k }),
   recent: (limit = 60) => j("GET", `/api/recent?limit=${limit}`),
   timeline: () => j("GET", "/api/timeline"),
+  timelineYear: (year, offset = 0, limit = 120) =>
+    j("GET", `/api/timeline?year=${encodeURIComponent(year)}&offset=${offset}&limit=${limit}`),
   mapPhotos: () => j("GET", "/api/map"),
 
   // People

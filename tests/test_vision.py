@@ -322,3 +322,17 @@ def test_parse_ignores_unknown_keys():
     data = json.dumps({"caption": "test", "unknown_key": "value"})
     attrs = parse_vision_attributes(data)
     assert "unknown_key" not in attrs
+
+
+def test_encode_image_converts_rgba_png(tmp_path):
+    """RGBA (and P/LA) images must be converted before the JPEG encode —
+    otherwise every screenshot-style PNG fails vision with 'encoding failed'."""
+    from vision import encode_image
+    import base64
+    img = Image.new("RGBA", (32, 32), color=(255, 0, 0, 128))
+    img_path = tmp_path / "shot.png"
+    img.save(img_path, format="PNG")
+    result = encode_image(str(img_path))
+    assert result is not None
+    decoded = Image.open(io.BytesIO(base64.b64decode(result)))
+    assert decoded.format == "JPEG"

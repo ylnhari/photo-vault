@@ -84,7 +84,9 @@
 
   async function find(name) {
     active = name; loadingFind = true; results = [];
-    try { results = (await api.search("person photo", {}, name)).results; }
+    // Empty query = person-only browse: the backend returns ALL of the
+    // person's photos from the face index, not a semantic top-k intersection.
+    try { results = (await api.search("", {}, name)).results; }
     catch (e) { err = e.message; }
     loadingFind = false;
   }

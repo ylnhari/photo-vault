@@ -1,6 +1,7 @@
 import os
 import json
 import hashlib
+import time
 from pathlib import Path
 import db
 from vision import get_image_caption, parse_vision_attributes
@@ -41,6 +42,9 @@ def _path_under(path: str, folder: str) -> bool:
 # so it stays correct when tests point IMAGE_CATALOG_PATH at different files.
 # This snapshot is shared read-only; mutators load their own private copy.
 _catalog_cache: dict = {"key": None, "data": None}
+
+# Short-TTL cache for the orphaned-file scan (see get_missing_files).
+_missing_files_cache: dict = {"key": None, "at": 0.0, "data": []}
 
 
 def load_catalog_cached() -> dict:
@@ -216,31 +220,54 @@ class Indexer:
                 stale.append((img_id, catalog[img_id]))
         return stale
 
-    def get_missing_files(self) -> list[tuple]:
-        """Catalog entries whose file path no longer exists on disk (orphaned)."""
-        return [
+    def get_missing_files(self, use_cache: bool = False) -> list[tuple]:
+        """Catalog entries whose file path no longer exists on disk (orphaned).
+        Inherently one os.path.exists per image (~1s / 25k photos), so hot
+        read-only callers (the status poll) pass use_cache=True for a short-TTL
+        snapshot; mutating callers keep the exact live check."""
+        global _missing_files_cache
+        key = _catalog_cache["key"]
+        if use_cache and _missing_files_cache["key"] == key and (
+            time.time() - _missing_files_cache["at"] < 30
+        ):
+            return _missing_files_cache["data"]
+        missing = [
             (img_id, data)
             for img_id, data in self.image_catalog.get("images", {}).items()
             if not os.path.exists(data.get("path", ""))
         ]
+        if use_cache:
+            _missing_files_cache = {"key": key, "at": time.time(), "data": missing}
+        return missing
 
     # ── Faces ──────────────────────────────────────────────────────────────────
+
+    def _face_data_ids(self) -> set[str]:
+        """One directory listing instead of an os.path.exists per image —
+        the status endpoint calls this on every poll, and per-file stats cost
+        ~1s per 25k images."""
+        try:
+            return {f[:-5] for f in os.listdir(FACE_DIR) if f.endswith(".json")}
+        except OSError:
+            return set()
 
     def _has_face_data(self, img_id: str) -> bool:
         return os.path.exists(os.path.join(FACE_DIR, f"{img_id}.json"))
 
     def get_faces_pending(self) -> list[tuple]:
         """Images that have not yet had face detection run (no face JSON file)."""
+        have = self._face_data_ids()
         return [
             (img_id, data)
             for img_id, data in self.image_catalog.get("images", {}).items()
-            if not self._has_face_data(img_id)
+            if img_id not in have
         ]
 
     def get_faces_stats(self) -> dict:
         catalog = self.image_catalog.get("images", {})
         total = len(catalog)
-        detected = sum(1 for img_id in catalog if self._has_face_data(img_id))
+        have = self._face_data_ids()
+        detected = sum(1 for img_id in catalog if img_id in have)
         return {"total": total, "detected": detected, "pending": total - detected}
 
     def detect_faces_one(self, img_id: str) -> str:

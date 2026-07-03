@@ -50,14 +50,17 @@
     if (!$health.loaded) refreshHealth();
     if (!$status.loaded) refreshStatus();
     if (!$models.loaded) refreshModels();
+    // Job status first: when a job is running, the panel (with Stop) must
+    // appear immediately — providerModels can take seconds while LM Studio
+    // is busy doing inference, and everything below can arrive later.
+    job = await api.indexProgress();
+    if (job.active) startPolling();
     await Promise.all([
       loadSettings(),
       loadFolderConfig(),
       loadOrphaned(),
       api.providerModels().then(r => { pmodels = r; }).catch(() => {}),
     ]);
-    job = await api.indexProgress();
-    if (job.active) startPolling();
   });
 
   async function loadSettings() {
@@ -260,7 +263,11 @@
     dispatch("indexed");
   }
 
-  const jobIs = (t) => job && (job.active || job.finished) && job.type === t;
+  // Takes job as an argument so template conditions reference `job` directly —
+  // Svelte only re-evaluates {#if} expressions whose identifiers change, so a
+  // hidden `job` dependency inside the helper would freeze the condition at its
+  // first value and the JobPanel (with its Stop button) would never appear.
+  const jobIs = (j, t) => j && (j.active || j.finished) && j.type === t;
   function fmtDate(iso) { return iso ? iso.slice(0, 16).replace("T", " ") : "never scanned"; }
 
   function modelTypeLabel(id, provider) {
@@ -607,7 +614,7 @@
   {:else}
     <p class="hint">{visionPending} image{visionPending === 1 ? "" : "s"} pending (any model)</p>
   {/if}
-  {#if jobIs("vision")}
+  {#if jobIs(job, "vision")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if visionPending === 0}
     {#if totalScanned > 0}
@@ -636,7 +643,7 @@
   {:else}
     <p class="hint">Source: latest caption · {embedPending} pending</p>
   {/if}
-  {#if jobIs("embed")}
+  {#if jobIs(job, "embed")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if embedPending === 0 && mEmbed.eligible > 0}
     <p class="ok-text">✓ All eligible captions are embedded.</p>
@@ -658,7 +665,7 @@
   </div>
   <p class="hint">{facesDone} done · {facesPending} pending.
     {settings.faces_during_embed ? "Also runs automatically during embedding." : "Runs only when you start it here."}</p>
-  {#if jobIs("faces")}
+  {#if jobIs(job, "faces")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if facesPending === 0}
     {#if totalScanned > 0}
@@ -678,7 +685,7 @@
 <!-- D: Full index -->
 <div class="card">
   <div class="section-label">D · Full index <span class="hint">(caption + embed in one pass)</span></div>
-  {#if jobIs("full")}
+  {#if jobIs(job, "full")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if missingFull === 0}
     {#if totalScanned > 0}
@@ -699,7 +706,7 @@
 <!-- E: Re-analyze -->
 <div class="card">
   <div class="section-label">E · Re-analyze <span class="hint">(refresh captions + re-embed)</span></div>
-  {#if jobIs("reanalyze")}
+  {#if jobIs(job, "reanalyze")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if missingAttrs === 0}
     {#if totalScanned > 0}

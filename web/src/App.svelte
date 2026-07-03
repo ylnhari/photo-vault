@@ -1,6 +1,8 @@
 <script>
   import { onMount } from "svelte";
-  import { health, status, refreshHealth, refreshStatus } from "./lib/stores.js";
+  import { health, status, refreshHealth, refreshStatus, lastDeleted,
+           jobStatus, refreshJob } from "./lib/stores.js";
+  import { onDestroy } from "svelte";
   import SearchTab from "./lib/SearchTab.svelte";
   import TimelineTab from "./lib/TimelineTab.svelte";
   import MapTab from "./lib/MapTab.svelte";
@@ -17,7 +19,15 @@
 
   // Single health/status fetch for the whole app — fixes the old contradiction
   // where two tabs fetched health separately and disagreed.
-  onMount(() => { refreshHealth(); refreshStatus(); });
+  let jobPoll;
+  onMount(() => {
+    refreshHealth(); refreshStatus(); refreshJob();
+    jobPoll = setInterval(refreshJob, 4000);
+  });
+  onDestroy(() => clearInterval(jobPoll));
+
+  $: jobPct = $jobStatus.total
+    ? Math.round(($jobStatus.done / $jobStatus.total) * 100) : 0;
 
   $: indexedCount = $status.stage.active_model_embedded || 0;
   $: noServices = $health.loaded && !$health.lm_studio && !$health.gemini;
@@ -35,7 +45,10 @@
     }
   }
   function onClose() { selectedId = null; selectedIds = null; }
-  function onDeleted() { refreshStatus(); }
+  function onDeleted(e) {
+    if (e?.detail) lastDeleted.set(e.detail);  // grids hide the photo instantly
+    refreshStatus();
+  }
 </script>
 
 <header>
@@ -45,6 +58,13 @@
       <button class:active={tab === t} class="ghost" on:click={() => (tab = t)}>{t}</button>
     {/each}
   </nav>
+  {#if $jobStatus.active}
+    <button class="jobpill" title="Open Index & Manage"
+            on:click={() => (tab = "Index & Manage")}>
+      <span class="jobspin"></span>
+      {$jobStatus.type} · {jobPct}% ({$jobStatus.done}/{$jobStatus.total})
+    </button>
+  {/if}
 </header>
 
 {#if noServices}
@@ -88,4 +108,16 @@
   .warn { background: #2a1a00; color: var(--warn); border: 1px solid var(--warn);
     padding: 10px 16px; margin: 12px 22px; border-radius: 8px; }
   code { background: var(--surface2); padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+  .jobpill {
+    margin-left: auto; display: inline-flex; align-items: center; gap: 8px;
+    font-size: 12px; padding: 5px 12px; border-radius: 99px;
+    background: color-mix(in srgb, var(--accent) 18%, var(--surface));
+    border: 1px solid var(--accent); color: var(--text);
+  }
+  .jobspin {
+    width: 11px; height: 11px; border-radius: 50%;
+    border: 2px solid var(--surface2); border-top-color: var(--accent);
+    animation: appjobspin .7s linear infinite;
+  }
+  @keyframes appjobspin { to { transform: rotate(360deg); } }
 </style>

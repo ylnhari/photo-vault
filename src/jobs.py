@@ -167,15 +167,16 @@ class JobManager:
                         done[bid] = (None, str(e))
                 for bid in batch:
                     result, errm = done[bid]
+                    fname = idx.image_catalog["images"].get(bid, {}).get("filename", "")
                     if errm is None:
                         vmodel, text = result
                         idx.record_caption(bid, vmodel, text)
                         consecutive = 0
                         icon = "cloud" if vmodel and "gemini" in vmodel.lower() else "ok"
-                        self._update(ok=1, done=1, log=(icon, bid, f"vision:{vmodel}"))
+                        self._update(ok=1, done=1, log=(icon, bid, f"vision:{vmodel}", fname))
                     else:
                         consecutive += 1
-                        self._update(fail=1, done=1, failed_id=bid, log=("fail", bid, errm))
+                        self._update(fail=1, done=1, failed_id=bid, log=("fail", bid, errm, fname))
                 idx._save_catalog()  # one write per batch, not per image
                 if consecutive >= max_fail:
                     self._update(aborted=True)
@@ -198,6 +199,7 @@ class JobManager:
             if self._stop.is_set():
                 self._update(stopped=True)
                 break
+            fname = idx.image_catalog["images"].get(img_id, {}).get("filename", "")
             try:
                 if jtype == "embed":
                     note = idx.embed_one(img_id, embed_provider=ep, embed_model=em,
@@ -220,10 +222,11 @@ class JobManager:
                     dirty = True
                 consecutive = 0
                 icon = "cloud" if "gemini" in note.lower() else "ok"
-                self._update(ok=1, done=1, log=(icon, img_id, note))
+                self._update(ok=1, done=1, log=(icon, img_id, note, fname))
             except Exception as e:
                 consecutive += 1
-                self._update(fail=1, done=1, failed_id=img_id, log=("fail", img_id, str(e)))
+                self._update(fail=1, done=1, failed_id=img_id,
+                             log=("fail", img_id, str(e), fname))
                 if consecutive >= max_fail:
                     self._update(aborted=True)
                     break
@@ -242,8 +245,11 @@ class JobManager:
             if failed_id is not None:
                 self._state["failed_ids"].append(failed_id)
             if log is not None:
-                kind, img_id, note = log
-                self._state["log"].append({"kind": kind, "id": img_id, "note": note})
+                kind, img_id, note = log[:3]
+                fname = log[3] if len(log) > 3 else ""
+                self._state["log"].append(
+                    {"kind": kind, "id": img_id, "note": note, "file": fname}
+                )
             if stopped:
                 self._state["stopped"] = True
             if aborted:
