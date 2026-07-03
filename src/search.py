@@ -1,3 +1,5 @@
+import time
+
 import db
 from embeddings import get_embedding, get_active_model, get_registry  # noqa: F401 — get_active_model is a test patch point
 from tagger import get_person_embedding
@@ -86,12 +88,24 @@ def search_images(query: str, top_k: int = 50, filters: dict = None, person: str
             filtered["metadatas"][0].append(results["metadatas"][0][i])
     return filtered
 
+# Filter values require a full metadata scan of the collection; cache briefly
+# keyed on (active model, count) so Search-tab loads don't rescan every time.
+_filter_values_cache = {"key": None, "at": 0.0, "data": {}}
+
+
 def get_available_filter_values() -> dict:
     """Returns dict of attribute → sorted unique values found in the active collection."""
     try:
         collection = _active_collection()
-        if collection.count() == 0:
+        n = collection.count()
+        if n == 0:
             return {}
+        key = (get_active_model(), n)
+        if (
+            _filter_values_cache["key"] == key
+            and time.time() - _filter_values_cache["at"] < 60
+        ):
+            return _filter_values_cache["data"]
         result = collection.get(include=["metadatas"])
         attrs = ["weather", "occasion", "scene", "group_size", "clothing_style",
                  "mood", "location_type", "season", "time_of_day", "year"]
@@ -104,6 +118,7 @@ def get_available_filter_values() -> dict:
                     seen.add(str(val))
             if seen:
                 values[attr] = sorted(seen)
+        _filter_values_cache.update({"key": key, "at": time.time(), "data": values})
         return values
     except Exception:
         return {}

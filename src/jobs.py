@@ -10,9 +10,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import settings as settings_mod
-from indexer import Indexer
+from indexer import Indexer, resolve_caption_json, build_embed_payload
 
-JOB_TYPES = ("vision", "embed", "full", "reanalyze", "faces")
+JOB_TYPES = ("vision", "embed", "full", "reanalyze", "faces", "thumbs")
+
+# Captions per /v1/embeddings request during embed jobs. LM Studio accepts a
+# list, so one round-trip embeds the whole chunk.
+EMBED_BATCH = 16
 
 # Persist the catalog every N images during sequential jobs instead of once per
 # image — turns the old O(n^2) full-file rewrite into O(n).
@@ -61,6 +65,8 @@ class JobManager:
             items = idx.get_missing_attributes()
         elif jtype == "faces":
             items = idx.get_faces_pending()
+        elif jtype == "thumbs":
+            items = idx.get_thumbs_pending()
         else:
             raise ValueError(f"unknown job type: {jtype}")
         return [img_id for img_id, _ in items]
@@ -124,6 +130,8 @@ class JobManager:
         try:
             if jtype == "vision":
                 self._run_vision_parallel(idx, ids, cfg)
+            elif jtype == "embed":
+                self._run_embed_batched(idx, ids, cfg)
             else:
                 self._run_sequential(idx, jtype, ids, cfg)
         finally:
@@ -182,6 +190,108 @@ class JobManager:
                     self._update(aborted=True)
                     break
 
+    def _run_embed_batched(self, idx, ids, cfg):
+        """
+        Embed jobs: one /v1/embeddings request per EMBED_BATCH captions instead
+        of per image. Face detection (when enabled) and ChromaDB writes remain
+        per-batch on this thread. The dedicated 'embed' job path — 'full' and
+        'reanalyze' still run item-by-item via _run_sequential.
+        """
+        from embeddings import get_embeddings_batch, collection_name_for
+        import db
+
+        ep, em = cfg["embed_provider"], cfg["embed_model"]
+        csm = cfg.get("caption_source_model")
+        max_fail = cfg["max_fail"]
+        try:
+            faces_during = bool(settings_mod.load().get("faces_during_embed", True))
+        except Exception:
+            faces_during = True
+
+        consecutive = 0
+        i, n = 0, len(ids)
+        while i < n:
+            if self._stop.is_set():
+                self._update(stopped=True)
+                break
+            chunk = ids[i:i + EMBED_BATCH]
+            i += len(chunk)
+
+            # Resolve captions; per-image failures don't sink the chunk.
+            texts, members = [], []   # members: (img_id, img_data, caption_json)
+            for iid in chunk:
+                img_data = idx.image_catalog["images"].get(iid)
+                fname = (img_data or {}).get("filename", "")
+                try:
+                    if img_data is None:
+                        raise RuntimeError("not in catalog")
+                    cj = resolve_caption_json(img_data, csm)
+                    texts.append(cj)
+                    members.append((iid, img_data, cj))
+                except Exception as e:
+                    consecutive += 1
+                    self._update(fail=1, done=1, failed_id=iid,
+                                 log=("fail", iid, str(e), fname))
+            if not members:
+                if consecutive >= max_fail:
+                    self._update(aborted=True)
+                    break
+                continue
+
+            vectors, model_name, source = get_embeddings_batch(
+                texts, force_provider=ep, model=em
+            )
+            if vectors is None:
+                for iid, img_data, _ in members:
+                    consecutive += 1
+                    self._update(fail=1, done=1, failed_id=iid,
+                                 log=("fail", iid,
+                                      "embedding failed (LM Studio and Gemini both unavailable)",
+                                      img_data.get("filename", "")))
+                if consecutive >= max_fail:
+                    self._update(aborted=True)
+                    break
+                continue
+
+            # Faces (optional, per image) then one batched ChromaDB add.
+            if faces_during:
+                from faces import detect_and_embed_faces, save_face_data, index_faces
+                for iid, img_data, _ in members:
+                    try:
+                        fd = detect_and_embed_faces(img_data["path"])
+                        save_face_data(iid, fd)
+                        index_faces(iid, fd)
+                    except Exception as e:
+                        print(f"[jobs] face detection failed for {iid}: {e}")
+
+            col = db.client().get_or_create_collection(
+                name=collection_name_for(model_name)
+            )
+            b_ids = [iid for iid, _, _ in members]
+            b_payloads = [
+                build_embed_payload(img_data, cj, source, model_name)
+                for _, img_data, cj in members
+            ]
+            try:
+                col.upsert(ids=b_ids, embeddings=vectors, metadatas=b_payloads)
+            except Exception as e:
+                for iid, img_data, _ in members:
+                    consecutive += 1
+                    self._update(fail=1, done=1, failed_id=iid,
+                                 log=("fail", iid, f"store failed: {e}",
+                                      img_data.get("filename", "")))
+                if consecutive >= max_fail:
+                    self._update(aborted=True)
+                    break
+                continue
+
+            consecutive = 0
+            icon = "cloud" if "gemini" in source.lower() else "ok"
+            for iid, img_data, _ in members:
+                self._update(ok=1, done=1,
+                             log=(icon, iid, f"embed:{source}",
+                                  img_data.get("filename", "")))
+
     def _run_sequential(self, idx, jtype, ids, cfg):
         """Embed / full / reanalyze: run one at a time (ChromaDB writes), but
         batch the images.json saves so full/reanalyze aren't O(n^2)."""
@@ -206,6 +316,8 @@ class JobManager:
                                          caption_source_model=csm, detect_faces=faces_during_embed)
                 elif jtype == "faces":
                     note = idx.detect_faces_one(img_id)
+                elif jtype == "thumbs":
+                    note = idx.thumb_one(img_id)
                 elif jtype == "full":
                     note = idx.index_one_full(img_id, use_cached=True, upsert=False,
                                               vision_provider=vp, vision_model=vm,

@@ -257,3 +257,42 @@ def test_is_connection_error_false():
     from embeddings import _is_connection_error
     assert not _is_connection_error(ValueError("bad input"))
     assert not _is_connection_error(KeyError("missing key"))
+
+
+def test_batch_embed_one_request_in_order():
+    """get_embeddings_batch sends all texts in ONE LM Studio request and
+    returns vectors in input order (rows may arrive index-shuffled)."""
+    from embeddings import get_embeddings_batch
+    import json as _json
+
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if url.endswith("/models"):
+            return _fake_urlopen_lm_studio_models("test-embed-model")
+        calls.append(_json.loads(req.data))
+        body = {"data": [
+            {"index": 1, "embedding": [0.2]},
+            {"index": 0, "embedding": [0.1]},
+        ]}
+
+        class _R:
+            def read(self): return _json.dumps(body).encode()
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+        return _R()
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("embeddings.register_model"):
+        vectors, model, source = get_embeddings_batch(["a", "b"])
+
+    assert vectors == [[0.1], [0.2]]          # re-sorted to input order
+    assert source == "lm_studio"
+    assert len(calls) == 1                     # one request for the whole batch
+    assert calls[0]["input"] == ["a", "b"]
+
+
+def test_batch_embed_empty_input():
+    from embeddings import get_embeddings_batch
+    assert get_embeddings_batch([]) == ([], "", "")

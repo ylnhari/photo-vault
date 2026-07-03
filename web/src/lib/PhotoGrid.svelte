@@ -25,11 +25,21 @@
   let _lastReset = resetToken;
   $: if (resetToken !== _lastReset) { _lastReset = resetToken; selected = new Set(); emit(); }
 
-  // Reset cached cell element refs whenever the photo set changes.
-  let cellEls = [];
-  $: if (photos) cellEls = [];
-
   function emit() { dispatch("selectionchange", Array.from(selected)); }
+
+  // Live cell elements, in visible order. Queried on demand — a cached
+  // bind:this array goes stale when the keyed {#each} reuses nodes.
+  function cellNodes() {
+    return wrapEl ? [...wrapEl.querySelectorAll(".cell")] : [];
+  }
+
+  function toggleSelect(p, i) {
+    if (selected.has(p.id)) selected.delete(p.id);
+    else selected.add(p.id);
+    lastIndex = i;
+    selected = selected;  // trigger reactivity
+    emit();
+  }
 
   function onCellClick(e, p, i) {
     if (suppressClick) { suppressClick = false; return; }
@@ -39,15 +49,31 @@
       if (e.shiftKey && lastIndex >= 0) {
         const [a, b] = [Math.min(lastIndex, i), Math.max(lastIndex, i)];
         for (let k = a; k <= b; k++) if (visible[k].exists !== false) selected.add(visible[k].id);
+        selected = selected;
+        emit();
       } else {
-        if (selected.has(p.id)) selected.delete(p.id);
-        else selected.add(p.id);
-        lastIndex = i;
+        toggleSelect(p, i);
       }
-      selected = selected;  // trigger reactivity
-      emit();
     } else {
       dispatch("select", { id: p.id, ids });
+    }
+  }
+
+  // Keyboard: arrows move focus through the grid, Enter opens, Space selects.
+  function onCellKey(e, p, i) {
+    if (e.key === "Enter") {
+      if (p.exists !== false) dispatch("select", { id: p.id, ids });
+    } else if (e.key === " ") {
+      e.preventDefault();
+      if (p.exists !== false) toggleSelect(p, i);
+    } else if (e.key.startsWith("Arrow")) {
+      const delta = { ArrowLeft: -1, ArrowRight: 1,
+                      ArrowUp: -cols, ArrowDown: cols }[e.key];
+      if (delta === undefined) return;
+      e.preventDefault();
+      const n = i + delta;
+      const cells = cellNodes();
+      if (n >= 0 && n < cells.length) cells[n].focus();
     }
   }
 
@@ -88,7 +114,7 @@
     if (!dragMoved) return;
     const b = box();
     const next = new Set(baseSel);
-    cellEls.forEach((el, i) => {
+    cellNodes().forEach((el, i) => {
       const p = visible[i];
       if (el && p && p.exists !== false && intersects(el, b)) next.add(p.id);
     });
@@ -109,9 +135,8 @@
     <div class="grid" style="--cols:{cols}">
       {#each visible as p, i (p.id)}
         <div class="cell" class:missing={p.exists === false} class:selected={selected.has(p.id)}
-             bind:this={cellEls[i]}
              on:click={(e) => onCellClick(e, p, i)}
-             on:keydown={(e) => e.key === "Enter" && dispatch("select", { id: p.id, ids })}
+             on:keydown={(e) => onCellKey(e, p, i)}
              role="button" tabindex="0">
           {#if p.exists === false}
             <div class="gone">🚫<br /><small>{p.filename}</small></div>

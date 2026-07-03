@@ -112,6 +112,7 @@
   $: missingAttrs = $status.missing_attrs || 0;
   $: facesPending = $status.faces_pending || 0;
   $: facesDone = $status.faces_done || 0;
+  $: thumbsPending = $status.thumbs_pending || 0;
 
   // ── settings helpers ──────────────────────────────────────────────────────────
   function markDirty() { settingsDirty = true; }
@@ -678,6 +679,30 @@
   {:else}
     <button class="primary" on:click={() => start("faces")}>
       ▶ Detect faces in {facesPending} photo{facesPending === 1 ? "" : "s"}
+    </button>
+  {/if}
+</div>
+
+<!-- Thumbnails: pregenerate grid previews -->
+<div class="card">
+  <div class="section-label">Thumbnails
+    <span class="hint">(pregenerate grid previews so browsing never waits)</span>
+  </div>
+  <p class="hint">{thumbsPending} photo{thumbsPending === 1 ? "" : "s"} without a thumbnail.
+    Missing ones are still generated on demand — this just does it ahead of time.</p>
+  {#if jobIs(job, "thumbs")}
+    <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+  {:else if thumbsPending === 0}
+    {#if totalScanned > 0}
+      <p class="ok-text">✓ Every photo has a thumbnail.</p>
+    {:else}
+      <p class="hint">No photos scanned yet — start with section A.</p>
+    {/if}
+  {:else if running}
+    <p class="hint">Another job is running — stop it first.</p>
+  {:else}
+    <button class="primary" on:click={() => start("thumbs")}>
+      ▶ Generate {thumbsPending} thumbnail{thumbsPending === 1 ? "" : "s"}
     </button>
   {/if}
 </div>

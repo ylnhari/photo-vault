@@ -5,7 +5,6 @@ embeddings / vision / faces / tagger). Serves the built Svelte SPA from web/dist
 in production. Run:  uv run uvicorn api:app --app-dir src --port <port>
 """
 
-import hashlib
 import os
 import threading
 from datetime import datetime as _dt
@@ -19,7 +18,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import imaging  # noqa: F401 — registers HEIF opener + pixel-bomb cap on import
-from imaging import safe_open
+from imaging import (
+    safe_open,
+    derivative_path,
+    legacy_derivative_path,
+    ensure_derivative,
+    THUMB_PX as _THUMB_PX,
+    MEDIUM_PX as _MEDIUM_PX,
+)
 
 from constants import (
     THUMB_DIR,
@@ -32,9 +38,6 @@ from indexer import Indexer, catalog_path_for, load_catalog_cached
 
 # id is a content hash, so a given id's bytes never change → cache forever.
 _IMMUTABLE_CACHE = {"Cache-Control": "private, max-age=31536000, immutable"}
-# Pixel sizes for the two generated derivative tiers.
-_THUMB_PX = 400
-_MEDIUM_PX = 1600
 from search import search_images, get_available_filter_values
 from vision import (
     list_lm_studio_models,
@@ -203,11 +206,6 @@ def _reject_if_writer_active():
         )
 
 
-def _thumb_path(img_id: str) -> str:
-    h = hashlib.sha1(img_id.encode("utf-8")).hexdigest()
-    return os.path.join(THUMB_DIR, f"{h}.jpg")
-
-
 def _chroma_meta(img_id: str) -> dict:
     try:
         col = db.collection()
@@ -292,6 +290,7 @@ def status():
         },
         "faces_pending": faces["pending"],
         "faces_done": faces["detected"],
+        "thumbs_pending": idx.count_thumbs_missing(),
         "settings": s,
     }
 
@@ -900,7 +899,10 @@ def faces_ignore(req: IgnoreClusterReq):
 @app.get("/api/faces/crop")
 def face_crop(image_id: str = Query(...), face_index: int = 0):
     """Serve a cropped, cached JPEG of one detected face for cluster review."""
-    out = _derivative_path(f"{image_id}:{face_index}", "_face")
+    out = derivative_path(f"{image_id}:{face_index}", "_face")
+    legacy = legacy_derivative_path(f"{image_id}:{face_index}", "_face")
+    if os.path.exists(legacy) and not os.path.exists(out):
+        return FileResponse(legacy, media_type="image/jpeg", headers=_IMMUTABLE_CACHE)
     if not os.path.exists(out):
         path = _resolve_indexed_path(image_id)
         if not path:
@@ -924,11 +926,11 @@ def face_crop(image_id: str = Query(...), face_index: int = 0):
                 )
                 crop = im.crop(box)
                 crop.thumbnail((200, 200))
-                crop.save(out, "JPEG", quality=80)
+                crop.save(out, "WEBP", quality=80)
         except Exception as e:
             print(f"[api] face crop failed {image_id}:{face_index}: {e}")
             return _placeholder_thumb()
-    return FileResponse(out, media_type="image/jpeg", headers=_IMMUTABLE_CACHE)
+    return FileResponse(out, media_type="image/webp", headers=_IMMUTABLE_CACHE)
 
 
 # ── models ──────────────────────────────────────────────────────────────────
@@ -958,9 +960,18 @@ def _resolve_indexed_path(img_id: str) -> str | None:
     return security.is_safe_real_path(path)
 
 
-def _derivative_path(img_id: str, suffix: str) -> str:
-    h = hashlib.sha1(img_id.encode("utf-8")).hexdigest()
-    return os.path.join(THUMB_DIR, f"{h}{suffix}.jpg")
+def _serve_derivative(img_id: str, suffix: str, max_px: int, src_path: str):
+    """Serve the WebP derivative, falling back to a pre-existing legacy JPEG,
+    generating the WebP on demand. Returns a FileResponse or None on failure."""
+    out = derivative_path(img_id, suffix)
+    if os.path.exists(out):
+        return FileResponse(out, media_type="image/webp", headers=_IMMUTABLE_CACHE)
+    legacy = legacy_derivative_path(img_id, suffix)
+    if os.path.exists(legacy):
+        return FileResponse(legacy, media_type="image/jpeg", headers=_IMMUTABLE_CACHE)
+    if not ensure_derivative(src_path, out, max_px):
+        return None
+    return FileResponse(out, media_type="image/webp", headers=_IMMUTABLE_CACHE)
 
 
 def _placeholder_thumb() -> Response:
@@ -980,21 +991,6 @@ def _placeholder_thumb() -> Response:
     return FileResponse(ph, media_type="image/jpeg")
 
 
-def _ensure_derivative(src_path: str, out_path: str, max_px: int) -> bool:
-    """Generate a downscaled JPEG derivative if missing. Returns False on failure."""
-    if os.path.exists(out_path):
-        return True
-    try:
-        with safe_open(src_path) as im:
-            im = im.convert("RGB")
-            im.thumbnail((max_px, max_px))
-            im.save(out_path, "JPEG", quality=82)
-        return True
-    except Exception as e:
-        print(f"[api] derivative ({max_px}px) failed for {src_path}: {e}")
-        return False
-
-
 @app.get("/api/image")
 def image(id: str = Query(...), thumb: bool = False, size: str = "full"):
     """
@@ -1012,16 +1008,36 @@ def image(id: str = Query(...), thumb: bool = False, size: str = "full"):
         return FileResponse(path, headers=_IMMUTABLE_CACHE)
 
     if size == "medium":
-        out = _derivative_path(id, "_m")
-        if not _ensure_derivative(path, out, _MEDIUM_PX):
-            return FileResponse(path, headers=_IMMUTABLE_CACHE)  # fall back to original
-        return FileResponse(out, media_type="image/jpeg", headers=_IMMUTABLE_CACHE)
+        resp = _serve_derivative(id, "_m", _MEDIUM_PX, path)
+        return resp or FileResponse(path, headers=_IMMUTABLE_CACHE)  # original fallback
 
     # default: thumb
-    out = _thumb_path(id)
-    if not _ensure_derivative(path, out, _THUMB_PX):
-        return _placeholder_thumb()
-    return FileResponse(out, media_type="image/jpeg", headers=_IMMUTABLE_CACHE)
+    resp = _serve_derivative(id, "", _THUMB_PX, path)
+    return resp or _placeholder_thumb()
+
+
+@app.get("/api/similar")
+def similar(id: str = Query(...), top_k: int = 24):
+    """Photos most similar to the given one, by its stored caption embedding
+    in the active collection ('More like this')."""
+    active = get_active_model()
+    if not active:
+        return {"results": []}
+    col = db.collection(active)
+    got = col.get(ids=[id], include=["embeddings"])
+    if not len(got["ids"]):
+        raise HTTPException(404, "photo is not in the active search index yet")
+    emb = got["embeddings"][0]
+    if hasattr(emb, "tolist"):
+        emb = emb.tolist()
+    n = min(max(1, top_k) + 1, col.count())
+    res = col.query(query_embeddings=[emb], n_results=n)
+    out = [
+        _card(i, m)
+        for i, m in zip(res["ids"][0], res["metadatas"][0])
+        if i != id
+    ]
+    return {"results": out[:top_k]}
 
 
 @app.get("/api/meta")

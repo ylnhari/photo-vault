@@ -28,11 +28,28 @@
     ["time_of_day", "Time"], ["year", "Year"], ["embedding_source", "Embedding"],
   ];
 
+  // "More like this" (vector similarity from the photo's own embedding)
+  let similar = null;
+  let simBusy = false;
+  async function loadSimilar() {
+    if (similar) { similar = null; return; }  // toggle off
+    simBusy = true; err = "";
+    try { similar = (await api.similar(currentId)).results; }
+    catch (e) { err = e.message; }
+    simBusy = false;
+  }
+  function openSimilar(s) {
+    // Navigate the lightbox through the similar set.
+    list = similar.map((x) => x.id);
+    pos = list.indexOf(s.id);
+  }
+
   // Reload metadata whenever the current photo changes.
   let lastLoaded = null;
   $: if (currentId && currentId !== lastLoaded) {
     lastLoaded = currentId;
     meta = null; detail = null; showDetail = false; confirmDelete = false; err = "";
+    similar = null;
     load(currentId);
     preloadNeighbors();
   }
@@ -126,11 +143,28 @@
           <p class="muted">Loading…</p>
         {/if}
 
-        <div style="margin-top:16px">
+        <div style="margin-top:16px" class="row">
           <button class="ghost sm" on:click={() => showDetail ? showDetail = false : loadDetail()}>
             Analysis details {showDetail ? "▴" : "▾"}
           </button>
+          <button class="ghost sm" on:click={loadSimilar} disabled={simBusy}>
+            {simBusy ? "Finding…" : similar ? "More like this ▴" : "More like this ▾"}
+          </button>
         </div>
+
+        {#if similar}
+          {#if similar.length === 0}
+            <p class="muted" style="font-size:12px">No similar photos in the index yet.</p>
+          {:else}
+            <div class="simgrid">
+              {#each similar as s (s.id)}
+                <img class="simthumb" src={api.thumbUrl(s.id)} alt={s.filename}
+                     title={s.caption || s.filename} loading="lazy" decoding="async"
+                     on:click={() => openSimilar(s)} />
+              {/each}
+            </div>
+          {/if}
+        {/if}
 
         {#if showDetail && detail}
           {#if detail.caption_history?.length}
@@ -200,6 +234,10 @@
   .muted { color: var(--muted); }
   .ok-text { color: var(--success); }
   .warn-text { color: var(--warn); }
+  .simgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 10px; }
+  .simthumb { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px;
+    cursor: pointer; border: 1px solid var(--border); }
+  .simthumb:hover { outline: 2px solid var(--accent); }
   .history-entry { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
   .history-model { font-size: 11px; color: var(--muted); font-family: monospace; margin-bottom: 4px; }
   .history-caption { font-size: 13px; line-height: 1.5; }

@@ -76,11 +76,10 @@ def _remove_derived_files(img_id: str):
     """Delete the face JSON, ANN face entries, and every thumbnail tier for one id."""
     face_file = os.path.join(FACE_DIR, f"{img_id}.json")
     thumb_h = hashlib.sha1(img_id.encode("utf-8")).hexdigest()
-    paths = [
-        face_file,
-        os.path.join(THUMB_DIR, f"{thumb_h}.jpg"),     # thumb tier
-        os.path.join(THUMB_DIR, f"{thumb_h}_m.jpg"),   # medium tier
-    ]
+    paths = [face_file]
+    for ext in ("webp", "jpg"):  # current WebP tiers + pre-WebP legacy JPEGs
+        paths.append(os.path.join(THUMB_DIR, f"{thumb_h}.{ext}"))     # thumb
+        paths.append(os.path.join(THUMB_DIR, f"{thumb_h}_m.{ext}"))   # medium
     for p in paths:
         if os.path.exists(p):
             try:
@@ -280,6 +279,47 @@ class Indexer:
         save_face_data(img_id, data)
         index_faces(img_id, data)
         return f"faces:{len(data)}"
+
+    # ── Thumbnails (pregeneration job) ────────────────────────────────────────
+
+    @staticmethod
+    def _existing_thumb_hashes() -> set[str]:
+        """Hash part of every existing thumb file (either format), one listdir."""
+        try:
+            names = os.listdir(THUMB_DIR)
+        except OSError:
+            return set()
+        return {
+            n[:-5] for n in names if n.endswith(".webp") and len(n) == 45
+        } | {
+            n[:-4] for n in names if n.endswith(".jpg") and len(n) == 44
+        }
+
+    def get_thumbs_pending(self) -> list[tuple]:
+        """Images with no grid thumbnail yet (WebP or legacy JPEG)."""
+        have = self._existing_thumb_hashes()
+        return [
+            (img_id, data)
+            for img_id, data in self.image_catalog.get("images", {}).items()
+            if hashlib.sha1(img_id.encode("utf-8")).hexdigest() not in have
+        ]
+
+    def count_thumbs_missing(self) -> int:
+        """Cheap approximation for the status endpoint: catalog size minus
+        existing thumb files (no per-file stat calls)."""
+        return max(0, len(self.image_catalog.get("images", {})) -
+                   len(self._existing_thumb_hashes()))
+
+    def thumb_one(self, img_id: str) -> str:
+        """Generate the 400px grid thumbnail for one image."""
+        from imaging import derivative_path, ensure_derivative, THUMB_PX
+        data = self.image_catalog["images"][img_id]
+        path = data.get("path", "")
+        if not os.path.exists(path):
+            return "thumb:skipped (file missing)"
+        if not ensure_derivative(path, derivative_path(img_id), THUMB_PX):
+            raise RuntimeError("thumbnail generation failed (corrupt/unreadable file)")
+        return "thumb:ok"
 
     def get_vision_pending(self) -> list[tuple]:
         """Images that have not yet been through any vision analysis."""
@@ -519,15 +559,9 @@ class Indexer:
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
 
-def _embed_one(img_id: str, img_data: dict, upsert: bool = False,
-               embed_provider: str = "auto", embed_model: str = None,
-               caption_source_model: str = None, detect_faces: bool = True) -> str:
-    """
-    Embedding + (optional) face detection + ChromaDB store.
-    caption_source_model: if set, use the caption from that specific model in
-    caption_history; otherwise use the latest caption_json.
-    detect_faces: when True, also run + persist face detection inline.
-    """
+def resolve_caption_json(img_data: dict, caption_source_model: str = None) -> str:
+    """The caption text to embed for one image. Raises when the image has no
+    (matching) caption or the stored caption is a vision error record."""
     if caption_source_model:
         hist = img_data.get("caption_history", [])
         entry = next(
@@ -542,32 +576,22 @@ def _embed_one(img_id: str, img_data: dict, upsert: bool = False,
         caption_json = img_data.get("caption_json", "")
     if not caption_json:
         raise RuntimeError("No caption available — run vision analysis first")
-    attrs = parse_vision_attributes(caption_json)
-
     try:
         parsed = json.loads(caption_json)
         if parsed.get("error", ""):
             raise RuntimeError(f"vision error: {parsed['error']}")
     except json.JSONDecodeError:
         pass
+    return caption_json
 
-    embedding, model_name, embed_source = get_embedding(
-        caption_json, force_provider=embed_provider, model=embed_model
-    )
-    if embedding is None:
-        raise RuntimeError("embedding failed (LM Studio and Gemini both unavailable)")
 
-    client = db.client()
-    collection = client.get_or_create_collection(name=collection_name_for(model_name))
-
-    if detect_faces:
-        face_data = detect_and_embed_faces(img_data["path"])
-        save_face_data(img_id, face_data)
-        index_faces(img_id, face_data)
-
+def build_embed_payload(img_data: dict, caption_json: str,
+                        embed_source: str, model_name: str) -> dict:
+    """ChromaDB metadata payload for one embedded image."""
+    attrs = parse_vision_attributes(caption_json)
     meta = img_data.get("metadata", {})
     year = meta.get("date", "")[:4] if meta.get("date", "") else "unknown"
-    payload = {
+    return {
         "path": img_data["path"],
         "filename": img_data["filename"],
         "caption": attrs["caption"],
@@ -587,6 +611,34 @@ def _embed_one(img_id: str, img_data: dict, upsert: bool = False,
         "embedding_source": embed_source,
         "embedding_model": model_name,
     }
+
+
+def _embed_one(img_id: str, img_data: dict, upsert: bool = False,
+               embed_provider: str = "auto", embed_model: str = None,
+               caption_source_model: str = None, detect_faces: bool = True) -> str:
+    """
+    Embedding + (optional) face detection + ChromaDB store.
+    caption_source_model: if set, use the caption from that specific model in
+    caption_history; otherwise use the latest caption_json.
+    detect_faces: when True, also run + persist face detection inline.
+    """
+    caption_json = resolve_caption_json(img_data, caption_source_model)
+
+    embedding, model_name, embed_source = get_embedding(
+        caption_json, force_provider=embed_provider, model=embed_model
+    )
+    if embedding is None:
+        raise RuntimeError("embedding failed (LM Studio and Gemini both unavailable)")
+
+    client = db.client()
+    collection = client.get_or_create_collection(name=collection_name_for(model_name))
+
+    if detect_faces:
+        face_data = detect_and_embed_faces(img_data["path"])
+        save_face_data(img_id, face_data)
+        index_faces(img_id, face_data)
+
+    payload = build_embed_payload(img_data, caption_json, embed_source, model_name)
 
     if upsert:
         collection.upsert(ids=[img_id], embeddings=[embedding], metadatas=[payload])

@@ -154,6 +154,33 @@ def _lm_studio_embed(text: str, model: str = None) -> tuple[list, str]:
     return result["data"][0]["embedding"], model_name
 
 
+def _lm_studio_embed_batch(texts: list[str], model: str = None) -> tuple[list, str]:
+    """Embed many texts in ONE /v1/embeddings call (the API takes a list).
+    Returns (vectors in input order, model_name)."""
+    model_name = model or "lm_studio_embed"
+    if not model:
+        try:
+            req = urllib.request.Request(f"{LM_STUDIO_URL}/models")
+            with urllib.request.urlopen(req, timeout=3) as r:
+                data = json.loads(r.read())
+                models = data.get("data", [])
+                if models:
+                    model_name = models[0].get("id", model_name)
+        except Exception:
+            pass
+
+    payload = json.dumps({"model": model_name, "input": texts}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{LM_STUDIO_URL}/embeddings",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as r:
+        result = json.loads(r.read())
+    rows = sorted(result["data"], key=lambda d: d.get("index", 0))
+    return [row["embedding"] for row in rows], model_name
+
+
 def _gemini_embed(text: str, model: str = None) -> tuple[list, str]:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set")
@@ -206,5 +233,51 @@ def get_embedding(
                 print(f"[embeddings] {source} offline, trying next")
                 continue
             print(f"[embeddings] {source} error: {e}")
+            continue
+    return None, "", "error"
+
+
+def get_embeddings_batch(
+    texts: list[str], force_provider: str = "auto", model: str = None
+) -> tuple[list | None, str, str]:
+    """Batch variant of get_embedding: returns (vectors in input order,
+    model_name, source), or (None, '', 'error') on full failure. LM Studio
+    embeds the whole list in one request; Gemini has no batch endpoint on the
+    free tier, so it loops (still one provider decision for the whole batch,
+    keeping every vector in the same space)."""
+    if not texts:
+        return [], "", ""
+
+    def _gem_batch(ts):
+        m = model if force_provider == "gemini" else None
+        vecs, name = [], None
+        for t in ts:
+            v, name = _gemini_embed(t, m)
+            vecs.append(v)
+        return vecs, name
+
+    lm = ("lm_studio", lambda ts: _lm_studio_embed_batch(ts, model))
+    gem = ("gemini", _gem_batch)
+    if force_provider == "lm_studio":
+        chain = [lm]
+    elif force_provider == "gemini":
+        chain = [gem]
+    else:
+        chain = [lm, gem]
+
+    for source, fn in chain:
+        try:
+            vectors, model_name = fn(texts)
+            if len(vectors) != len(texts):
+                raise RuntimeError(
+                    f"{source} returned {len(vectors)} vectors for {len(texts)} inputs"
+                )
+            register_model(source, model_name, len(vectors[0]))
+            return vectors, model_name, source
+        except Exception as e:
+            if _is_connection_error(e):
+                print(f"[embeddings] {source} offline, trying next")
+                continue
+            print(f"[embeddings] {source} batch error: {e}")
             continue
     return None, "", "error"

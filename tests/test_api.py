@@ -473,3 +473,28 @@ def test_delete_image_rejected_while_job_active(client):
     with patch("api.manager.status", return_value={"active": True}):
         r = client.delete("/api/image?id=abc")
     assert r.status_code == 409
+
+
+def test_similar_returns_neighbors_excluding_self(client):
+    col = MagicMock()
+    col.get.return_value = {"ids": ["x"], "embeddings": [[0.1, 0.2]]}
+    col.count.return_value = 3
+    col.query.return_value = {
+        "ids": [["x", "y", "z"]],
+        "metadatas": [[{"path": "/x.jpg"}, {"path": "/y.jpg"}, {"path": "/z.jpg"}]],
+    }
+    with patch("api.get_active_model", return_value="m"), \
+         patch("api.db.collection", return_value=col):
+        r = client.get("/api/similar?id=x&top_k=5")
+    assert r.status_code == 200
+    ids = [c["id"] for c in r.json()["results"]]
+    assert ids == ["y", "z"]  # self excluded
+
+
+def test_similar_404_when_not_indexed(client):
+    col = MagicMock()
+    col.get.return_value = {"ids": [], "embeddings": []}
+    with patch("api.get_active_model", return_value="m"), \
+         patch("api.db.collection", return_value=col):
+        r = client.get("/api/similar?id=nope")
+    assert r.status_code == 404

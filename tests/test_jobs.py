@@ -131,3 +131,66 @@ def test_reset_clears_finished_state():
     s = mgr.status()
     assert s["finished"] is False
     assert s["done"] == 0
+
+
+def test_embed_job_batches_one_request(monkeypatch):
+    """The embed job embeds the whole chunk in ONE get_embeddings_batch call
+    and stores all vectors with ONE ChromaDB upsert."""
+    monkeypatch.setattr(
+        "jobs.settings_mod.load",
+        lambda: {"vision_concurrency": 1, "faces_during_embed": False},
+    )
+    mgr = JobManager()
+    imgs = {
+        "a": {"path": "/a.jpg", "filename": "a.jpg", "caption_json": '{"caption":"one"}', "metadata": {}},
+        "b": {"path": "/b.jpg", "filename": "b.jpg", "caption_json": '{"caption":"two"}', "metadata": {}},
+    }
+    fake = MagicMock()
+    fake.get_embed_pending.return_value = list(imgs.items())
+    fake.image_catalog = {"images": imgs}
+
+    col = MagicMock()
+    client = MagicMock()
+    client.get_or_create_collection.return_value = col
+
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("embeddings.get_embeddings_batch",
+               return_value=([[0.1], [0.2]], "test-model", "lm_studio")) as geb, \
+         patch("db.client", return_value=client):
+        mgr.start("embed")
+        s = _wait_idle(mgr)
+
+    assert s["ok"] == 2 and s["fail"] == 0
+    assert geb.call_count == 1
+    assert geb.call_args[0][0] == ['{"caption":"one"}', '{"caption":"two"}']
+    assert col.upsert.call_count == 1
+    assert col.upsert.call_args[1]["ids"] == ["a", "b"]
+
+
+def test_embed_job_bad_caption_fails_only_that_image(monkeypatch):
+    monkeypatch.setattr(
+        "jobs.settings_mod.load",
+        lambda: {"vision_concurrency": 1, "faces_during_embed": False},
+    )
+    mgr = JobManager()
+    imgs = {
+        "good": {"path": "/g.jpg", "filename": "g.jpg", "caption_json": '{"caption":"ok"}', "metadata": {}},
+        "bad": {"path": "/b.jpg", "filename": "b.jpg", "caption_json": "", "metadata": {}},
+    }
+    fake = MagicMock()
+    fake.get_embed_pending.return_value = list(imgs.items())
+    fake.image_catalog = {"images": imgs}
+    col = MagicMock()
+    client = MagicMock()
+    client.get_or_create_collection.return_value = col
+
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("embeddings.get_embeddings_batch",
+               return_value=([[0.1]], "test-model", "lm_studio")), \
+         patch("db.client", return_value=client):
+        mgr.start("embed")
+        s = _wait_idle(mgr)
+
+    assert s["ok"] == 1
+    assert s["fail"] == 1
+    assert s["failed_ids"] == ["bad"]

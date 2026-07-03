@@ -105,6 +105,8 @@ export const api = {
   setActiveModel: (model) => j("POST", "/api/models/active", { model }),
 
   // Images
+  similar: (id, top_k = 12) =>
+    j("GET", `/api/similar?id=${encodeURIComponent(id)}&top_k=${top_k}`),
   meta: (id) => j("GET", `/api/meta?id=${encodeURIComponent(id)}`),
   explore: (id) => j("GET", `/api/explore?id=${encodeURIComponent(id)}`),
   deleteImage: (id, deleteFile) =>
