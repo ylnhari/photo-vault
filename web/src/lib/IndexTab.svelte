@@ -195,6 +195,12 @@
   // ── scan (runs as a background job — folder walks can take minutes) ─────────
   async function scan() { await start("scan"); }
 
+  function gotoSection(id) {
+    // Instant, not smooth: content-visibility:auto sections re-layout while a
+    // smooth scroll animates, and Chrome silently aborts the animation.
+    document.getElementById(id)?.scrollIntoView({ block: "start" });
+  }
+
   // ── duplicates ────────────────────────────────────────────────────────────
   let dupes = null;
   let dupesBusy = false;
@@ -371,28 +377,30 @@
     <button class="ghost sm" on:click={refreshStatus}>Refresh</button>
   </div>
   <div class="pipeline">
-    <div class="stage">
+    <button class="stage" title="Go to Folder Management (A)" on:click={() => gotoSection("sec-scan")}>
       <div class="num">{totalScanned}</div>
       <div class="lbl">Scanned</div>
-    </div>
+    </button>
     <div class="arrow">→</div>
-    <div class="stage" class:pending={visionPending > 0}>
+    <button class="stage" class:pending={visionPending > 0}
+            title="Go to Vision analysis (B)" on:click={() => gotoSection("sec-vision")}>
       <div class="num">{mVision.done ?? st.stage?.vision_done ?? 0}</div>
       <div class="lbl">Captioned</div>
       {#if visionPending > 0}<div class="pend">{visionPending} pending</div>{/if}
       {#if mVision.selected_label}
         <div class="model-badge">{mVision.selected_label}</div>
       {/if}
-    </div>
+    </button>
     <div class="arrow">→</div>
-    <div class="stage" class:pending={embedPending > 0}>
+    <button class="stage" class:pending={embedPending > 0}
+            title="Go to Embed (C)" on:click={() => gotoSection("sec-embed")}>
       <div class="num">{mEmbed.done ?? st.stage?.active_model_embedded ?? 0}</div>
       <div class="lbl">Embedded</div>
       {#if embedPending > 0}<div class="pend">{embedPending} pending</div>{/if}
       {#if mEmbed.selected_model}
         <div class="model-badge">{mEmbed.selected_model}</div>
       {/if}
-    </div>
+    </button>
   </div>
   {#if mVision.model_summary && Object.keys(mVision.model_summary).length > 1}
     <div class="model-summary">
@@ -548,7 +556,7 @@
 
 <!-- A: Folder Management -->
 <div class="card">
-  <div class="section-label">A · Folder Management</div>
+  <div class="section-label" id="sec-scan">A · Folder Management</div>
   <p class="hint">Manages which directories are scanned. Photos are tracked by content — moves and renames within scanned folders are detected automatically.</p>
 
   <div class="subsection-label">Included folders</div>
@@ -561,7 +569,7 @@
           <div class="folder-info">
             <span class="folder-path" title={folder.path}>{folder.path}</span>
             <span class="hint">
-              {folder.image_count > 0 ? `${folder.image_count} files` : "not yet scanned"}
+              {folder.image_count > 0 ? `${folder.image_count} files seen at last scan` : "not yet scanned"}
               {#if folder.last_scanned_at} · {fmtDate(folder.last_scanned_at)}{/if}
             </span>
           </div>
@@ -633,7 +641,7 @@
 
 <!-- B: Vision analysis -->
 <div class="card">
-  <div class="section-label">B · Vision analysis
+  <div class="section-label" id="sec-vision">B · Vision analysis
     <span class="hint">(image → caption + 12 attributes)</span>
   </div>
   {#if selectedVisionLabel}
@@ -661,7 +669,7 @@
 
 <!-- C: Embed -->
 <div class="card">
-  <div class="section-label">C · Embed
+  <div class="section-label" id="sec-embed">C · Embed
     <span class="hint">(caption → searchable vector)</span>
   </div>
   {#if settings.caption_source_model}

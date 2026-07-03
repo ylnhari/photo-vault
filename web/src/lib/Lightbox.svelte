@@ -228,7 +228,8 @@
   .content { display: grid; grid-template-columns: 1.6fr 1fr; gap: 0; max-height: 90vh; }
   .imgwrap { background: #000; display: flex; align-items: center; justify-content: center; }
   .imgwrap img { max-width: 100%; max-height: 90vh; object-fit: contain; }
-  .side { padding: 24px; overflow-y: auto; }
+  /* Extra top padding keeps the first metadata line clear of the ✕ button. */
+  .side { padding: 44px 24px 24px; overflow-y: auto; }
   @media (max-width: 700px) { .content { grid-template-columns: 1fr; } }
   .sm { padding: 5px 10px; font-size: 13px; }
   .muted { color: var(--muted); }

@@ -8,6 +8,13 @@
                    faces: "Face detection", thumbs: "Thumbnails",
                    dhash: "Duplicate scan", scan: "Scanning folders" };
 
+  // Stop is honored between work items/batches — with slow local models the
+  // in-flight batch can take minutes, so show an explicit "stopping" state
+  // instead of a Stop button that looks ignored.
+  let stopRequested = false;
+  $: if (!job.active) stopRequested = false;  // reset once the job halts
+  function requestStop() { stopRequested = true; dispatch("stop"); }
+
   $: running = job.active;
   $: pct = job.total ? Math.round((job.done / job.total) * 100) : (running ? 0 : 100);
 </script>
@@ -17,9 +24,15 @@
     <span class="title">
       {#if running}<span class="spin"></span>{:else}<span class="check">✓</span>{/if}
       {TITLES[job.type] || "Working"}
+      {#if running && stopRequested}
+        <span class="warn" style="font-weight:400; font-size:12px">
+          — stopping after the current batch…</span>
+      {/if}
     </span>
     {#if running}
-      <button class="danger sm" on:click={() => dispatch("stop")}>🛑 Stop</button>
+      <button class="danger sm" on:click={requestStop} disabled={stopRequested}>
+        {stopRequested ? "Stopping…" : "🛑 Stop"}
+      </button>
     {:else}
       <div class="row">
         {#if job.failed_ids?.length}
