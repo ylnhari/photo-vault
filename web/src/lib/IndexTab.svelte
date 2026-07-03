@@ -11,6 +11,7 @@
   let poll = null;
   let busy = {};
   let err = "";
+  let rechecking = false;
 
   // ── provider model catalogue ─────────────────────────────────────────────────
   let pmodels = { lm_studio: [], lm_studio_types: {}, gemini_vision: [], gemini_embed: [] };
@@ -177,6 +178,12 @@
   }
   async function clearJob() { await api.indexReset(); job = await api.indexProgress(); }
 
+  async function recheckHealth() {
+    rechecking = true;
+    await refreshHealth();
+    rechecking = false;
+  }
+
   // ── scan ──────────────────────────────────────────────────────────────────────
   async function scan() {
     busy = { ...busy, scan: true }; err = ""; scanResults = null;
@@ -287,7 +294,9 @@
 <div class="card">
   <div class="row" style="justify-content:space-between">
     <div class="section-label">Services</div>
-    <button class="ghost sm" on:click={refreshHealth}>Recheck</button>
+    <button class="ghost sm" on:click={recheckHealth} disabled={rechecking}>
+      {rechecking ? "⟳ Checking…" : "Recheck"}
+    </button>
   </div>
   <div class="row" style="flex-wrap:wrap; gap:10px; margin-top:8px">
     {#if !$health.loaded}
@@ -505,7 +514,7 @@
               {#if folder.last_scanned_at} · {fmtDate(folder.last_scanned_at)}{/if}
             </span>
           </div>
-          <button class="sm ghost danger-hover" on:click={() => requestRemoveFolder(folder)}>Remove</button>
+          <button class="sm ghost danger-hover" on:click={() => requestRemoveFolder(folder)} disabled={busy.scan}>Remove</button>
         </div>
         {#if scanResults?.per_folder?.[folder.path]}
           {@const s = scanResults.per_folder[folder.path]}
@@ -524,11 +533,12 @@
 
   <div class="add-row">
     <input bind:value={newFolderPath} placeholder="Folder path…"
-           on:keydown={(e) => e.key === "Enter" && addFolder()} />
-    <button on:click={addFolder} disabled={!newFolderPath.trim() || busy.addFolder}>
+           on:keydown={(e) => e.key === "Enter" && addFolder()}
+           disabled={busy.scan} />
+    <button on:click={addFolder} disabled={!newFolderPath.trim() || busy.addFolder || busy.scan}>
       {busy.addFolder ? "Adding…" : "Add folder"}
     </button>
-    <button class="ghost" on:click={suggestDefaults}>Suggest defaults</button>
+    <button class="ghost" on:click={suggestDefaults} disabled={busy.scan}>Suggest defaults</button>
   </div>
   {#if defaults.length}
     <div class="defaults-list">
@@ -552,15 +562,16 @@
         {#each folderConfig.excluded as ex}
           <div class="folder-row">
             <span class="folder-path" title={ex.path}>{ex.path}</span>
-            <button class="sm ghost" on:click={() => removeExclude(ex.path)}>Remove exclusion</button>
+            <button class="sm ghost" on:click={() => removeExclude(ex.path)} disabled={busy.scan}>Remove exclusion</button>
           </div>
         {/each}
       </div>
     {/if}
     <div class="add-row">
       <input bind:value={newExcludePath} placeholder="Subfolder to skip…"
-             on:keydown={(e) => e.key === "Enter" && addExclude()} />
-      <button on:click={addExclude} disabled={!newExcludePath.trim() || busy.addExclude}>
+             on:keydown={(e) => e.key === "Enter" && addExclude()}
+             disabled={busy.scan} />
+      <button on:click={addExclude} disabled={!newExcludePath.trim() || busy.addExclude || busy.scan}>
         {busy.addExclude ? "Adding…" : "Exclude folder"}
       </button>
     </div>
@@ -572,6 +583,9 @@
       {busy.scan ? "Scanning…" : `Scan ${folderConfig.included.length} folder${folderConfig.included.length === 1 ? "" : "s"}`}
     </button>
   </div>
+  {#if busy.scan}
+    <div class="scan-progress"><span></span></div>
+  {/if}
   {#if scanResults && !busy.scan}
     <div class="scan-summary">
       <span class="ok-text">+{scanResults.added} new</span>
@@ -596,7 +610,11 @@
   {#if jobIs("vision")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if visionPending === 0}
-    <p class="ok-text">✓ All photos have captions{selectedVisionLabel ? ` from ${selectedVisionLabel}` : ""}.</p>
+    {#if totalScanned > 0}
+      <p class="ok-text">✓ All photos have captions{selectedVisionLabel ? ` from ${selectedVisionLabel}` : ""}.</p>
+    {:else}
+      <p class="hint">No photos scanned yet — start with section A.</p>
+    {/if}
   {:else if running}
     <p class="hint">Another job is running — stop it first.</p>
   {:else}
@@ -643,7 +661,11 @@
   {#if jobIs("faces")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if facesPending === 0}
-    <p class="ok-text">✓ All photos have been scanned for faces.</p>
+    {#if totalScanned > 0}
+      <p class="ok-text">✓ All photos have been scanned for faces.</p>
+    {:else}
+      <p class="hint">No photos scanned yet — start with section A.</p>
+    {/if}
   {:else if running}
     <p class="hint">Another job is running — stop it first.</p>
   {:else}
@@ -659,7 +681,11 @@
   {#if jobIs("full")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if missingFull === 0}
-    <p class="ok-text">✓ All scanned photos are in the index.</p>
+    {#if totalScanned > 0}
+      <p class="ok-text">✓ All scanned photos are in the index.</p>
+    {:else}
+      <p class="hint">No photos scanned yet — start with section A.</p>
+    {/if}
   {:else if running}
     <p class="hint">Another job is running — stop it first.</p>
   {:else}
@@ -676,7 +702,11 @@
   {#if jobIs("reanalyze")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if missingAttrs === 0}
-    <p class="ok-text">✓ All indexed photos have full attributes.</p>
+    {#if totalScanned > 0}
+      <p class="ok-text">✓ All indexed photos have full attributes.</p>
+    {:else}
+      <p class="hint">No photos scanned yet — start with section A.</p>
+    {/if}
   {:else if running}
     <p class="hint">Another job is running — stop it first.</p>
   {:else}
@@ -770,6 +800,11 @@
   .add-row input { flex: 1; min-width: 200px; }
   .defaults-list { display: flex; align-items: center; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
   .scan-summary { margin-top: 10px; font-size: 13px; }
+  .scan-progress { height: 4px; border-radius: 99px; background: var(--surface2);
+    overflow: hidden; margin: 10px 0; }
+  .scan-progress > span { display: block; height: 100%; background: var(--accent);
+    width: 30%; animation: scan-indeterminate 1.5s ease-in-out infinite; border-radius: 99px; }
+  @keyframes scan-indeterminate { 0% { transform: translateX(-100%); } 100% { transform: translateX(400%); } }
 
   /* orphaned */
   .orphan-list { margin-top: 10px; border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--border));

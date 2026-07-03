@@ -4,20 +4,27 @@ import re
 import urllib.request
 import urllib.error
 from datetime import datetime
-from constants import LM_STUDIO_URL, GEMINI_API_KEY, GEMINI_BASE, EMBEDDING_REGISTRY_PATH
+from constants import (
+    LM_STUDIO_URL,
+    GEMINI_API_KEY,
+    GEMINI_BASE,
+    EMBEDDING_REGISTRY_PATH,
+)
 
 _GEMINI_EMBED_MODEL = "text-embedding-004"
 import time as _time
+
 _gemini_embed_cache: tuple[float, list[str]] | None = None
 
 
-def list_gemini_embed_models() -> list[str]:
-    """Fetch Gemini embedding models from the API, cached 5 min."""
+def list_gemini_embed_models(fallback: bool = True) -> list[str]:
+    """Fetch Gemini embedding models from the API, cached 5 min.
+    When `fallback=False` returns [] instead of hardcoded fallback on failure."""
     global _gemini_embed_cache
     if _gemini_embed_cache and _time.time() - _gemini_embed_cache[0] < 300:
         return _gemini_embed_cache[1]
     if not GEMINI_API_KEY:
-        return [_GEMINI_EMBED_MODEL]
+        return [_GEMINI_EMBED_MODEL] if fallback else []
     try:
         url = f"{GEMINI_BASE}/models?key={GEMINI_API_KEY}"
         req = urllib.request.Request(url)
@@ -28,23 +35,25 @@ def list_gemini_embed_models() -> list[str]:
             for m in data.get("models", [])
             if "embedContent" in m.get("supportedGenerationMethods", [])
         ]
-        result = models if models else [_GEMINI_EMBED_MODEL]
+        result = models if models else ([_GEMINI_EMBED_MODEL] if fallback else [])
         _gemini_embed_cache = (_time.time(), result)
         return result
     except Exception as e:
         print(f"[embeddings] Gemini model list failed: {e}")
-        return [_GEMINI_EMBED_MODEL]
+        return [_GEMINI_EMBED_MODEL] if fallback else []
 
 
 # ── Collection naming ─────────────────────────────────────────────────────────
 
+
 def collection_name_for(model_name: str) -> str:
     """Stable, ChromaDB-safe collection name for a given embedding model."""
-    safe = re.sub(r'[^a-z0-9]', '_', model_name.lower()).strip('_')
+    safe = re.sub(r"[^a-z0-9]", "_", model_name.lower()).strip("_")
     return f"img_{safe}"[:63]
 
 
 # ── Registry (persists all models ever used + active selection) ───────────────
+
 
 def _load_registry() -> dict:
     if os.path.exists(EMBEDDING_REGISTRY_PATH):
@@ -69,8 +78,12 @@ def register_model(source: str, model_name: str, dimension: int):
             "collection": collection_name_for(model_name),
             "first_used": datetime.now().isoformat(timespec="seconds"),
         }
-        print(f"[embeddings] Registered new model: {model_name} ({source}, {dimension}d)")
-    reg["models"][model_name]["last_used"] = datetime.now().isoformat(timespec="seconds")
+        print(
+            f"[embeddings] Registered new model: {model_name} ({source}, {dimension}d)"
+        )
+    reg["models"][model_name]["last_used"] = datetime.now().isoformat(
+        timespec="seconds"
+    )
     if reg["active_model"] is None:
         reg["active_model"] = model_name
         print(f"[embeddings] Active model set to: {model_name}")
@@ -88,19 +101,33 @@ def get_active_model() -> str | None:
 def set_active_model(model_name: str):
     reg = _load_registry()
     if model_name not in reg.get("models", {}):
-        raise ValueError(f"Model '{model_name}' not in registry — index some photos with it first")
+        raise ValueError(
+            f"Model '{model_name}' not in registry — index some photos with it first"
+        )
     reg["active_model"] = model_name
     _save_registry(reg)
 
 
 # ── Connection error detection ────────────────────────────────────────────────
 
+
 def _is_connection_error(e: Exception) -> bool:
     msg = str(e).lower()
-    return any(w in msg for w in ("connection", "refused", "unreachable", "timeout", "connect error", "cannot connect"))
+    return any(
+        w in msg
+        for w in (
+            "connection",
+            "refused",
+            "unreachable",
+            "timeout",
+            "connect error",
+            "cannot connect",
+        )
+    )
 
 
 # ── Provider implementations ──────────────────────────────────────────────────
+
 
 def _lm_studio_embed(text: str, model: str = None) -> tuple[list, str]:
     """Embed via LM Studio /v1/embeddings. Uses `model` if given, else auto-detects."""
@@ -118,8 +145,9 @@ def _lm_studio_embed(text: str, model: str = None) -> tuple[list, str]:
 
     payload = json.dumps({"model": model_name, "input": text}).encode("utf-8")
     req = urllib.request.Request(
-        f"{LM_STUDIO_URL}/embeddings", data=payload,
-        headers={"Content-Type": "application/json"}
+        f"{LM_STUDIO_URL}/embeddings",
+        data=payload,
+        headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=15) as r:
         result = json.loads(r.read())
@@ -129,12 +157,18 @@ def _lm_studio_embed(text: str, model: str = None) -> tuple[list, str]:
 def _gemini_embed(text: str) -> tuple[list, str]:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set")
-    url = f"{GEMINI_BASE}/models/{_GEMINI_EMBED_MODEL}:embedContent?key={GEMINI_API_KEY}"
-    payload = json.dumps({
-        "model": f"models/{_GEMINI_EMBED_MODEL}",
-        "content": {"parts": [{"text": text}]},
-    }).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    url = (
+        f"{GEMINI_BASE}/models/{_GEMINI_EMBED_MODEL}:embedContent?key={GEMINI_API_KEY}"
+    )
+    payload = json.dumps(
+        {
+            "model": f"models/{_GEMINI_EMBED_MODEL}",
+            "content": {"parts": [{"text": text}]},
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"}
+    )
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             result = json.loads(r.read())
@@ -145,7 +179,10 @@ def _gemini_embed(text: str) -> tuple[list, str]:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def get_embedding(text: str, force_provider: str = "auto", model: str = None) -> tuple[list | None, str, str]:
+
+def get_embedding(
+    text: str, force_provider: str = "auto", model: str = None
+) -> tuple[list | None, str, str]:
     """Returns (vector, model_name, source).
     force_provider: "auto" (LM Studio → Gemini), "lm_studio", or "gemini".
     model: explicit LM Studio embedding model id (ignored for Gemini, which is fixed).

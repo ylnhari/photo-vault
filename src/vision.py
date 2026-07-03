@@ -31,6 +31,7 @@ _PROMPT = (
 
 _lm_client = None
 
+
 def _get_lm_client():
     global _lm_client
     if _lm_client is None:
@@ -52,7 +53,17 @@ def encode_image(image_path, max_size=(1024, 1024)):
 
 def _is_connection_error(e: Exception) -> bool:
     msg = str(e).lower()
-    return any(w in msg for w in ("connection", "refused", "unreachable", "timeout", "connect error", "cannot connect"))
+    return any(
+        w in msg
+        for w in (
+            "connection",
+            "refused",
+            "unreachable",
+            "timeout",
+            "connect error",
+            "cannot connect",
+        )
+    )
 
 
 def _strip_markdown(text: str) -> str:
@@ -83,11 +94,29 @@ def list_lm_studio_models() -> list[str]:
 
 
 _VISION_NAME_PATTERNS = (
-    "llava", "bakllava", "moondream", "minicpm-v", "pixtral", "cogvlm", "idefics",
-    "-vl", "vl-", "vision", "visual", "multimodal",
+    "llava",
+    "bakllava",
+    "moondream",
+    "minicpm-v",
+    "pixtral",
+    "cogvlm",
+    "idefics",
+    "-vl",
+    "vl-",
+    "vision",
+    "visual",
+    "multimodal",
 )
 _EMBED_NAME_PATTERNS = (
-    "embed", "nomic", "bge-", "e5-", "gte-", "minilm", "mpnet", "mxbai", "sfr-embedding",
+    "embed",
+    "nomic",
+    "bge-",
+    "e5-",
+    "gte-",
+    "minilm",
+    "mpnet",
+    "mxbai",
+    "sfr-embedding",
 )
 
 
@@ -98,24 +127,36 @@ def classify_lm_studio_model(model_id: str) -> dict:
     is_embed = any(p in lower for p in _EMBED_NAME_PATTERNS)
     is_vision = any(p in lower for p in _VISION_NAME_PATTERNS)
     if is_embed and not is_vision:
-        return {"type": "embed", "warning": "Embedding model — not suitable for image analysis"}
+        return {
+            "type": "embed",
+            "warning": "Embedding model — not suitable for image analysis",
+        }
     if is_vision and not is_embed:
         return {"type": "vision", "warning": None}
     if is_vision and is_embed:
-        return {"type": "unknown", "warning": "Name matches both vision and embed patterns — verify model type"}
-    return {"type": "unknown", "warning": "Cannot determine model type from name — image output may be unreliable"}
+        return {
+            "type": "unknown",
+            "warning": "Name matches both vision and embed patterns — verify model type",
+        }
+    return {
+        "type": "unknown",
+        "warning": "Cannot determine model type from name — image output may be unreliable",
+    }
 
 
 _gemini_cache: dict[str, tuple[float, list[str]]] = {}
 
 
-def _fetch_gemini_models(method: str) -> list[str]:
-    """Fetch Gemini models supporting `method`, with 5-min in-memory cache."""
+def _fetch_gemini_models(method: str, fallback: bool = True) -> list[str]:
+    """Fetch Gemini models supporting `method`, with 5-min in-memory cache.
+    When `fallback=False` returns [] instead of hardcoded list on failure."""
     cached = _gemini_cache.get(method)
     if cached and time.time() - cached[0] < 300:
         return cached[1]
     if not GEMINI_API_KEY:
-        return GEMINI_VISION_MODELS if method == "generateContent" else []
+        return (
+            GEMINI_VISION_MODELS if (method == "generateContent" and fallback) else []
+        )
     try:
         url = f"{GEMINI_BASE}/models?key={GEMINI_API_KEY}"
         req = urllib.request.Request(url)
@@ -131,11 +172,13 @@ def _fetch_gemini_models(method: str) -> list[str]:
         return models
     except Exception as e:
         print(f"[vision] Gemini model list failed: {e}")
-        return GEMINI_VISION_MODELS if method == "generateContent" else []
+        return (
+            GEMINI_VISION_MODELS if (method == "generateContent" and fallback) else []
+        )
 
 
-def list_gemini_vision_models() -> list[str]:
-    return _fetch_gemini_models("generateContent")
+def list_gemini_vision_models(fallback: bool = True) -> list[str]:
+    return _fetch_gemini_models("generateContent", fallback=fallback)
 
 
 _REQUIRED_VISION_KEYS = ("caption", "scene", "occasion", "weather", "group_size")
@@ -147,12 +190,18 @@ def validate_vision_output(text: str) -> dict:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        return {"valid": False, "warning": "Output is not valid JSON — model may not support image input"}
+        return {
+            "valid": False,
+            "warning": "Output is not valid JSON — model may not support image input",
+        }
     if "error" in data:
         return {"valid": False, "warning": f"Model returned error: {data['error']}"}
     missing = [k for k in _REQUIRED_VISION_KEYS if k not in data]
     if missing:
-        return {"valid": False, "warning": f"Missing expected keys: {missing} — model may be text-only"}
+        return {
+            "valid": False,
+            "warning": f"Missing expected keys: {missing} — model may be text-only",
+        }
     return {"valid": True, "warning": None}
 
 
@@ -160,13 +209,18 @@ def _call_lm_studio(base64_image: str, model: str = "vision-model") -> str:
     client = _get_lm_client()
     response = client.chat.completions.create(
         model=model or "vision-model",
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": _PROMPT},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-            ],
-        }],
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                    },
+                ],
+            }
+        ],
         max_tokens=800,
     )
     return _strip_markdown(response.choices[0].message.content.strip())
@@ -175,21 +229,36 @@ def _call_lm_studio(base64_image: str, model: str = "vision-model") -> str:
 def _call_gemini(base64_image: str, model: str = None) -> tuple[str, str]:
     """Returns (caption_json, model_used)."""
     if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY not set — LM Studio is offline and no fallback available")
+        raise RuntimeError(
+            "GEMINI_API_KEY not set — LM Studio is offline and no fallback available"
+        )
 
-    payload = json.dumps({
-        "contents": [{"parts": [
-            {"text": _PROMPT},
-            {"inline_data": {"mime_type": "image/jpeg", "data": base64_image}},
-        ]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 800},
-    }).encode("utf-8")
+    payload = json.dumps(
+        {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": _PROMPT},
+                        {
+                            "inline_data": {
+                                "mime_type": "image/jpeg",
+                                "data": base64_image,
+                            }
+                        },
+                    ]
+                }
+            ],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 800},
+        }
+    ).encode("utf-8")
 
     candidates = [model] if model else GEMINI_VISION_MODELS
     last_err = None
     for m in candidates:
         url = f"{GEMINI_BASE}/models/{m}:generateContent?key={GEMINI_API_KEY}"
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            url, data=payload, headers={"Content-Type": "application/json"}
+        )
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 result = json.loads(r.read())
@@ -204,14 +273,19 @@ def _call_gemini(base64_image: str, model: str = None) -> tuple[str, str]:
     raise RuntimeError(f"All Gemini vision models exhausted. Last: {last_err}")
 
 
-def get_image_caption(image_path: str, force_provider: str = "auto",
-                      with_model: bool = False, model: str = None):
+def get_image_caption(
+    image_path: str,
+    force_provider: str = "auto",
+    with_model: bool = False,
+    model: str = None,
+):
     """
     force_provider: "auto" (LM Studio → Gemini fallback), "lm_studio", or "gemini"
     model: explicit model id to use (only honored when force_provider is lm_studio/gemini).
     with_model=False → returns caption text (str, backward compatible).
     with_model=True  → returns (caption_text, model_label) identifying which model produced it.
     """
+
     def _ret(text, label):
         return (text, label) if with_model else text
 
@@ -244,16 +318,27 @@ def get_image_caption(image_path: str, force_provider: str = "auto",
                 text, used_model = _call_gemini(base64_image)
                 return _ret(text, f"gemini:{used_model}")
             except Exception as ge:
-                return _ret(json.dumps({"error": f"LM Studio offline; Gemini failed: {ge}"}), "error")
+                return _ret(
+                    json.dumps({"error": f"LM Studio offline; Gemini failed: {ge}"}),
+                    "error",
+                )
         return _ret(json.dumps({"error": str(e)}), "error")
 
 
 def parse_vision_attributes(caption_json: str) -> dict:
     defaults = {
-        "caption": "", "scene": "unknown", "location_type": "unknown",
-        "weather": "unknown", "season": "unknown", "time_of_day": "unknown",
-        "occasion": "unknown", "group_size": "unknown", "clothing_style": "unknown",
-        "mood": "unknown", "objects": [], "people_description": ""
+        "caption": "",
+        "scene": "unknown",
+        "location_type": "unknown",
+        "weather": "unknown",
+        "season": "unknown",
+        "time_of_day": "unknown",
+        "occasion": "unknown",
+        "group_size": "unknown",
+        "clothing_style": "unknown",
+        "mood": "unknown",
+        "objects": [],
+        "people_description": "",
     }
     try:
         data = json.loads(caption_json)

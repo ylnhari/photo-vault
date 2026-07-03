@@ -4,6 +4,7 @@ Thin JSON layer over the existing, UI-agnostic backend (indexer / search /
 embeddings / vision / faces / tagger). Serves the built Svelte SPA from web/dist
 in production. Run:  uv run uvicorn api:app --app-dir src --port <port>
 """
+
 import hashlib
 import os
 import threading
@@ -20,7 +21,9 @@ import imaging  # noqa: F401 — registers HEIF opener + pixel-bomb cap on impor
 from imaging import safe_open
 
 from constants import (
-    THUMB_DIR, PROJECT_ROOT, SERVER_PORT, GEMINI_VISION_MODELS,
+    THUMB_DIR,
+    PROJECT_ROOT,
+    SERVER_PORT,
 )
 import db
 import security
@@ -33,11 +36,16 @@ _THUMB_PX = 400
 _MEDIUM_PX = 1600
 from search import search_images, get_available_filter_values
 from vision import (
-    list_lm_studio_models, classify_lm_studio_model,
-    list_gemini_vision_models, validate_vision_output,
+    list_lm_studio_models,
+    classify_lm_studio_model,
+    list_gemini_vision_models,
+    validate_vision_output,
 )
 from embeddings import (
-    get_registry, get_active_model, set_active_model, collection_name_for,
+    get_registry,
+    get_active_model,
+    set_active_model,
+    collection_name_for,
     list_gemini_embed_models,
 )
 from tagger import add_person_reference, add_person_embedding, get_all_persons
@@ -63,7 +71,9 @@ _scan_active = threading.Event()
 # PV_ALLOWED_HOSTS (comma-separated) lets a deployment add its own hostname/IP
 # (e.g. a LAN address when self-hosting beyond localhost).
 _BASE_HOSTS = ["localhost", "127.0.0.1", "[::1]", "testserver"]
-_EXTRA_HOSTS = [h.strip() for h in os.environ.get("PV_ALLOWED_HOSTS", "").split(",") if h.strip()]
+_EXTRA_HOSTS = [
+    h.strip() for h in os.environ.get("PV_ALLOWED_HOSTS", "").split(",") if h.strip()
+]
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=_BASE_HOSTS + _EXTRA_HOSTS,
@@ -73,8 +83,10 @@ app.add_middleware(
 # Vite dev port). No wildcard — a random website can no longer read API
 # responses cross-origin.
 _ALLOWED_ORIGINS = [
-    f"http://localhost:{SERVER_PORT}", f"http://127.0.0.1:{SERVER_PORT}",
-    "http://localhost:5173", "http://127.0.0.1:5173",
+    f"http://localhost:{SERVER_PORT}",
+    f"http://127.0.0.1:{SERVER_PORT}",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -105,7 +117,7 @@ async def _require_token(request: Request, call_next):
 
 # ── models ──────────────────────────────────────────────────────────────────
 class ScanReq(BaseModel):
-    dirs: list[str] = []   # empty → use folder registry
+    dirs: list[str] = []  # empty → use folder registry
 
 
 class IndexReq(BaseModel):
@@ -132,7 +144,7 @@ class FolderReq(BaseModel):
 
 
 class OrphanedCleanupReq(BaseModel):
-    ids: list[str] = []   # empty → remove all orphaned
+    ids: list[str] = []  # empty → remove all orphaned
 
 
 class BatchDeleteReq(BaseModel):
@@ -209,9 +221,11 @@ def status():
     stage = idx.get_stage_stats()
 
     # Model-aware counts based on current settings
-    vm_label = settings_mgr.vision_model_label(s)   # e.g. "lm_studio:qwen2-vl-7b" or None
-    csm = s.get("caption_source_model")              # caption source for embed
-    em = s.get("embed_model")                        # embed model (raw name, no provider prefix)
+    vm_label = settings_mgr.vision_model_label(
+        s
+    )  # e.g. "lm_studio:qwen2-vl-7b" or None
+    csm = s.get("caption_source_model")  # caption source for embed
+    em = s.get("embed_model")  # embed model (raw name, no provider prefix)
 
     total = stage.get("total_scanned", 0)
 
@@ -423,7 +437,9 @@ def get_orphaned():
             {
                 "id": img_id,
                 "path": data.get("path", ""),
-                "filename": data.get("filename", os.path.basename(data.get("path", ""))),
+                "filename": data.get(
+                    "filename", os.path.basename(data.get("path", ""))
+                ),
             }
             for img_id, data in missing
         ],
@@ -441,8 +457,7 @@ def cleanup_orphaned(req: OrphanedCleanupReq = None):
     if req and req.ids:
         target_ids = set(req.ids)
         to_delete = [
-            img_id for img_id, _ in idx.get_missing_files()
-            if img_id in target_ids
+            img_id for img_id, _ in idx.get_missing_files() if img_id in target_ids
         ]
     else:
         to_delete = [img_id for img_id, _ in idx.get_missing_files()]
@@ -466,8 +481,11 @@ def index_start(req: IndexReq):
         vml = f"{req.vision_provider}:{req.vision_model}"
     try:
         return manager.start(
-            req.type, vision_provider=req.vision_provider, max_fail=req.max_fail,
-            vision_model=req.vision_model, embed_provider=req.embed_provider,
+            req.type,
+            vision_provider=req.vision_provider,
+            max_fail=req.max_fail,
+            vision_model=req.vision_model,
+            embed_provider=req.embed_provider,
             embed_model=req.embed_model,
             caption_source_model=req.caption_source_model,
             vision_model_label=vml,
@@ -478,13 +496,14 @@ def index_start(req: IndexReq):
 
 @app.get("/api/provider-models")
 def provider_models():
-    """Models available per provider for the run-config dropdowns."""
+    """Models available per provider for the run-config dropdowns.
+    Gemini lists only include verified models — no hardcoded fallback."""
     lm_models = list_lm_studio_models()
     return {
         "lm_studio": lm_models,
         "lm_studio_types": {m: classify_lm_studio_model(m) for m in lm_models},
-        "gemini_vision": list_gemini_vision_models() or GEMINI_VISION_MODELS,
-        "gemini_embed": list_gemini_embed_models(),
+        "gemini_vision": list_gemini_vision_models(fallback=False),
+        "gemini_embed": list_gemini_embed_models(fallback=False),
     }
 
 
@@ -527,8 +546,12 @@ def search(
 def search_post(body: dict):
     q = body.get("q") or "photo"
     person = body.get("person") or None
-    filters_in = {k: v for k, v in (body.get("filters") or {}).items() if v and v != "All"}
-    res = search_images(q, top_k=body.get("top_k", 200), filters=filters_in, person=person)
+    filters_in = {
+        k: v for k, v in (body.get("filters") or {}).items() if v and v != "All"
+    }
+    res = search_images(
+        q, top_k=body.get("top_k", 200), filters=filters_in, person=person
+    )
     metas = res.get("metadatas", [[]])[0] if res else []
     ids = res.get("ids", [[]])[0] if res else []
     return {"results": [_card(i, m) for i, m in zip(ids, metas)]}
@@ -564,14 +587,18 @@ def _cards_for_ids(ids: list[str]) -> list[dict]:
         m = meta_by_id.get(iid, {})
         c = catalog.get(iid, {})
         path = m.get("path") or c.get("path", "")
-        cards.append({
-            "id": iid,
-            "filename": m.get("filename") or c.get("filename") or os.path.basename(path),
-            "caption": m.get("caption", ""),
-            "year": m.get("year", ""),
-            "occasion": m.get("occasion", ""),
-            "exists": os.path.exists(path),
-        })
+        cards.append(
+            {
+                "id": iid,
+                "filename": m.get("filename")
+                or c.get("filename")
+                or os.path.basename(path),
+                "caption": m.get("caption", ""),
+                "year": m.get("year", ""),
+                "occasion": m.get("occasion", ""),
+                "exists": os.path.exists(path),
+            }
+        )
     return cards
 
 
@@ -594,7 +621,11 @@ def albums_get(album_id: str):
     a = albums_mgr.get_album(album_id)
     if not a:
         raise HTTPException(404, "album not found")
-    return {"id": album_id, "name": a["name"], "photos": _cards_for_ids(a.get("image_ids", []))}
+    return {
+        "id": album_id,
+        "name": a["name"],
+        "photos": _cards_for_ids(a.get("image_ids", [])),
+    }
 
 
 @app.put("/api/albums/{album_id}")
@@ -642,7 +673,9 @@ def recent(limit: int = 60):
     # metadata for just those ids — no full-collection scan. Over-fetch a little
     # because some recent photos may not be embedded into the active model yet.
     cat = load_catalog_cached().get("images", {})
-    ordered = sorted(cat.items(), key=lambda kv: kv[1].get("created_at", 0), reverse=True)
+    ordered = sorted(
+        cat.items(), key=lambda kv: kv[1].get("created_at", 0), reverse=True
+    )
     candidate_ids = [img_id for img_id, _ in ordered[: max(limit * 3, limit)]]
     if not candidate_ids:
         return {"results": []}
@@ -667,13 +700,15 @@ def map_photos():
         meta = data.get("metadata", {})
         lat, lon = meta.get("gps_lat"), meta.get("gps_lon")
         if lat is not None and lon is not None:
-            points.append({
-                "id": img_id,
-                "lat": lat,
-                "lon": lon,
-                "filename": data.get("filename", ""),
-                "exists": os.path.exists(data.get("path", "")),
-            })
+            points.append(
+                {
+                    "id": img_id,
+                    "lat": lat,
+                    "lon": lon,
+                    "filename": data.get("filename", ""),
+                    "exists": os.path.exists(data.get("path", "")),
+                }
+            )
     return {"points": points}
 
 
@@ -684,16 +719,19 @@ def timeline():
     for img_id, data in list(catalog.items()):
         date = data.get("metadata", {}).get("date", "")
         year = date[:4] if date and len(date) >= 4 else "Unknown"
-        by_year.setdefault(year, []).append({
-            "id": img_id,
-            "filename": data.get("filename", ""),
-            "exists": os.path.exists(data.get("path", "")),
-        })
-    return {"years": [
-        {"year": y, "count": len(by_year[y]),
-         "photos": by_year[y]}
-        for y in sorted(by_year, reverse=True)
-    ]}
+        by_year.setdefault(year, []).append(
+            {
+                "id": img_id,
+                "filename": data.get("filename", ""),
+                "exists": os.path.exists(data.get("path", "")),
+            }
+        )
+    return {
+        "years": [
+            {"year": y, "count": len(by_year[y]), "photos": by_year[y]}
+            for y in sorted(by_year, reverse=True)
+        ]
+    }
 
 
 # ── people ────────────────────────────────────────────────────────────────────
@@ -735,7 +773,9 @@ def faces_reindex():
     """Rebuild the ANN face index from on-disk face JSON (for libraries indexed
     before the index existed, or to repair it)."""
     if _scan_active.is_set() or manager.status().get("active"):
-        raise HTTPException(409, "a scan or indexing job is running; wait for it to finish")
+        raise HTTPException(
+            409, "a scan or indexing job is running; wait for it to finish"
+        )
     return {"indexed": rebuild_face_index()}
 
 
@@ -743,10 +783,16 @@ def faces_reindex():
 def faces_cluster(req: ClusterReq):
     """Run DBSCAN clustering over all detected faces. User-triggered."""
     if _scan_active.is_set() or manager.status().get("active"):
-        raise HTTPException(409, "a scan or indexing job is running; wait for it to finish")
+        raise HTTPException(
+            409, "a scan or indexing job is running; wait for it to finish"
+        )
     s = settings_mgr.load()
     eps = req.eps if req.eps is not None else s.get("face_cluster_eps", 0.5)
-    min_samples = req.min_samples if req.min_samples is not None else s.get("face_cluster_min_samples", 3)
+    min_samples = (
+        req.min_samples
+        if req.min_samples is not None
+        else s.get("face_cluster_min_samples", 3)
+    )
     summary = clustering.cluster_faces(eps=eps, min_samples=min_samples)
     return summary
 
@@ -759,13 +805,15 @@ def faces_clusters(samples: int = 6):
     for c in data.get("clusters", []):
         if c.get("status") == "ignored":
             continue
-        out.append({
-            "cluster_id": c["cluster_id"],
-            "size": c["size"],
-            "status": c.get("status", "new"),
-            "name": c.get("name"),
-            "samples": c["members"][:samples],
-        })
+        out.append(
+            {
+                "cluster_id": c["cluster_id"],
+                "size": c["size"],
+                "status": c.get("status", "new"),
+                "name": c.get("name"),
+                "samples": c["members"][:samples],
+            }
+        )
     return {"clusters": out}
 
 
@@ -807,8 +855,12 @@ def face_crop(image_id: str = Query(...), face_index: int = 0):
                 x1, y1, x2, y2 = bbox if len(bbox) == 4 else (0, 0, w, h)
                 # pad ~30% around the face box, clamped to image bounds
                 pw, ph = (x2 - x1) * 0.3, (y2 - y1) * 0.3
-                box = (max(0, int(x1 - pw)), max(0, int(y1 - ph)),
-                       min(w, int(x2 + pw)), min(h, int(y2 + ph)))
+                box = (
+                    max(0, int(x1 - pw)),
+                    max(0, int(y1 - ph)),
+                    min(w, int(x2 + pw)),
+                    min(h, int(y2 + ph)),
+                )
                 crop = im.crop(box)
                 crop.thumbnail((200, 200))
                 crop.save(out, "JPEG", quality=80)
@@ -858,7 +910,10 @@ def _placeholder_thumb() -> Response:
     if not os.path.exists(ph):
         try:
             from PIL import Image as _Img
-            _Img.new("RGB", (_THUMB_PX, _THUMB_PX), (40, 44, 52)).save(ph, "JPEG", quality=70)
+
+            _Img.new("RGB", (_THUMB_PX, _THUMB_PX), (40, 44, 52)).save(
+                ph, "JPEG", quality=70
+            )
         except Exception:
             return Response(status_code=204)
     return FileResponse(ph, media_type="image/jpeg")
@@ -959,12 +1014,20 @@ def explore(id: str = Query(...)):
 
     history = img_data.get("caption_history", [])
     if not history and img_data.get("caption_json"):
-        history = [{"model": img_data.get("caption_model", "unknown"),
-                    "caption_json": img_data["caption_json"]}]
+        history = [
+            {
+                "model": img_data.get("caption_model", "unknown"),
+                "caption_json": img_data["caption_json"],
+            }
+        ]
     history_out = []
     for h in history:
         cj = h.get("caption_json", "")
-        validation = validate_vision_output(cj) if cj else {"valid": False, "warning": "No output"}
+        validation = (
+            validate_vision_output(cj)
+            if cj
+            else {"valid": False, "warning": "No output"}
+        )
         history_out.append({**h, "validation": validation})
 
     reg = get_registry()
@@ -975,12 +1038,14 @@ def explore(id: str = Query(...)):
             col = client.get_or_create_collection(name=collection_name_for(model_name))
             res = col.get(ids=[id], include=["metadatas"])
             if res["ids"]:
-                embed_info.append({
-                    "model": model_name,
-                    "source": info.get("source"),
-                    "dimension": info.get("dimension"),
-                    "is_active": model_name == reg.get("active_model"),
-                })
+                embed_info.append(
+                    {
+                        "model": model_name,
+                        "source": info.get("source"),
+                        "dimension": info.get("dimension"),
+                        "is_active": model_name == reg.get("active_model"),
+                    }
+                )
         except Exception:
             pass
 
@@ -1028,12 +1093,13 @@ def _index_html_with_token() -> str:
     with open(os.path.join(_DIST, "index.html"), encoding="utf-8") as f:
         html = f.read()
     if security.auth_enabled():
-        inject = f'<script>window.__PV_TOKEN__={security.get_token()!r};</script>'
+        inject = f"<script>window.__PV_TOKEN__={security.get_token()!r};</script>"
         html = html.replace("</head>", inject + "</head>", 1)
     return html
 
 
 if os.path.isdir(_DIST):
+
     @app.get("/", response_class=HTMLResponse)
     def _spa_index():
         return HTMLResponse(_index_html_with_token())
@@ -1045,10 +1111,13 @@ if os.path.isdir(_DIST):
     # All other static assets (hashed JS/CSS) served verbatim.
     app.mount("/", StaticFiles(directory=_DIST, html=True), name="spa")
 else:
+
     @app.get("/")
     def _no_build():
         return JSONResponse(
-            {"message": "SPA not built yet. Run `cd web && npm install && npm run build`, "
-                        "or use the Vite dev server (`npm run dev`).",
-             "api_port": SERVER_PORT},
+            {
+                "message": "SPA not built yet. Run `cd web && npm install && npm run build`, "
+                "or use the Vite dev server (`npm run dev`).",
+                "api_port": SERVER_PORT,
+            },
         )
