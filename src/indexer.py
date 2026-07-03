@@ -170,6 +170,19 @@ class Indexer:
 
         return {"per_folder": per_folder, **aggregate}
 
+    def scan_folder_one(self, folder: str) -> str:
+        """Scan one configured folder (driven by the background 'scan' job)."""
+        from folders import get_excluded_paths, update_scan_result
+
+        s = scan_directory(folder, IMAGE_CATALOG_PATH,
+                           excluded_paths=get_excluded_paths())
+        update_scan_result(folder, s.get("scanned", 0))
+        self.image_catalog = self._load_image_catalog()
+        if s.get("moved"):
+            self.reconcile_paths()
+        return (f"+{s.get('added', 0)} new · {s.get('moved', 0)} moved · "
+                f"{s.get('unchanged', 0)} unchanged")
+
     def get_folders(self) -> dict:
         """Scanned-folder registry from images.json (legacy, kept for compat)."""
         return self.image_catalog.get("folders", {})
@@ -529,13 +542,9 @@ class Indexer:
         self._save_catalog()
         return len(to_remove)
 
-    # ── Delete (single image) ─────────────────────────────────────────────────
+    # ── Delete / trash (single image) ────────────────────────────────────────
 
-    def delete_image(self, img_id: str) -> str | None:
-        """Remove from all ChromaDB collections, catalog, and face data. Returns file path."""
-        catalog = self.image_catalog.get("images", {})
-        img_path = catalog.get(img_id, {}).get("path")
-
+    def _drop_from_collections(self, img_id: str):
         reg = get_registry()
         client = db.client()
         for model_name in reg.get("models", {}):
@@ -549,12 +558,71 @@ class Indexer:
         except Exception:
             pass
 
-        if img_id in catalog:
+    def delete_image(self, img_id: str, to_trash: bool = True,
+                     file_deleted: bool = False) -> str | None:
+        """
+        Remove a photo from search. to_trash=True (default) soft-deletes: the
+        catalog entry moves to the trash store and derived files (thumbs, face
+        data) are KEPT so restore is cheap. to_trash=False removes permanently.
+        Returns the file path.
+        """
+        import trash as trash_mod
+
+        catalog = self.image_catalog.get("images", {})
+        entry = catalog.get(img_id)
+        img_path = entry.get("path") if entry else None
+
+        self._drop_from_collections(img_id)
+
+        if entry is not None:
+            if to_trash:
+                trash_mod.add(img_id, entry, file_deleted=file_deleted)
             del self.image_catalog["images"][img_id]
             self._save_catalog()
 
-        _remove_derived_files(img_id)
+        if not to_trash:
+            _remove_derived_files(img_id)
         return img_path
+
+    def restore_images(self, img_ids: list[str]) -> int:
+        """Bring trashed photos back into the catalog. Their caption survives,
+        so only the embed stage needs re-running (they show as embed-pending)."""
+        import trash as trash_mod
+
+        entries = trash_mod.take(img_ids)
+        if not entries:
+            return 0
+        self.image_catalog.setdefault("images", {}).update(entries)
+        self._save_catalog()
+        return len(entries)
+
+    def purge_trash(self, img_ids: list[str] | None = None) -> int:
+        """Permanently drop trashed photos (all when img_ids is None)."""
+        import trash as trash_mod
+
+        dropped = trash_mod.purge(img_ids)
+        for iid in dropped:
+            _remove_derived_files(iid)
+        return len(dropped)
+
+    # ── Perceptual hash (duplicates) ─────────────────────────────────────────
+
+    def get_dhash_pending(self) -> list[tuple]:
+        return [
+            (img_id, data)
+            for img_id, data in self.image_catalog.get("images", {}).items()
+            if not data.get("dhash")
+        ]
+
+    def dhash_one(self, img_id: str) -> str:
+        """Compute + store the perceptual hash for one image (caller persists)."""
+        from dupes import dhash
+        data = self.image_catalog["images"][img_id]
+        path = data.get("path", "")
+        if not os.path.exists(path):
+            return "dhash:skipped (file missing)"
+        data["dhash"] = dhash(path)
+        return "dhash:ok"
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────

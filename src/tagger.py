@@ -37,6 +37,27 @@ def add_person_embedding(person_name, embedding):
     return True
 
 
+def rename_person(old_name, new_name):
+    """Rename a registered person. Raises KeyError/ValueError on bad input."""
+    person_map = _load_map()
+    if old_name not in person_map:
+        raise KeyError(old_name)
+    if new_name in person_map:
+        raise ValueError(f"'{new_name}' already exists")
+    person_map[new_name] = person_map.pop(old_name)
+    _save_map(person_map)
+
+
+def delete_person(person_name) -> bool:
+    """Unregister a person (their photos stay indexed). True if they existed."""
+    person_map = _load_map()
+    existed = person_name in person_map
+    person_map.pop(person_name, None)
+    if existed:
+        _save_map(person_map)
+    return existed
+
+
 def get_person_embedding(person_name):
     return _load_map().get(person_name)
 

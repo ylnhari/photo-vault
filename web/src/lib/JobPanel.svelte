@@ -5,7 +5,8 @@
 
   const TITLES = { vision: "Vision analysis", embed: "Embedding",
                    full: "Full index", reanalyze: "Re-analyze",
-                   faces: "Face detection", thumbs: "Thumbnails" };
+                   faces: "Face detection", thumbs: "Thumbnails",
+                   dhash: "Duplicate scan", scan: "Scanning folders" };
 
   $: running = job.active;
   $: pct = job.total ? Math.round((job.done / job.total) * 100) : (running ? 0 : 100);

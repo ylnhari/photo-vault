@@ -76,7 +76,8 @@
 
 <main>
   {#if tab === "Search"}
-    <SearchTab {indexedCount} on:select={onSelect} on:deleted={onDeleted} />
+    <SearchTab {indexedCount} on:select={onSelect} on:deleted={onDeleted}
+               on:goto-index={() => (tab = "Index & Manage")} />
   {:else if tab === "Timeline"}
     <TimelineTab on:select={onSelect} />
   {:else if tab === "Map"}

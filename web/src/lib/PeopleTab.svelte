@@ -82,6 +82,26 @@
     rowBusy = { ...rowBusy, [cid]: false };
   }
 
+  async function renamePersonUi(name) {
+    const newName = prompt(`Rename “${name}” to:`, name);
+    if (!newName || !newName.trim() || newName.trim() === name) return;
+    err = "";
+    try {
+      await api.renamePerson(name, newName.trim());
+      if (active === name) active = newName.trim();
+      await refresh();
+    } catch (e) { err = e.message; }
+  }
+  async function deletePersonUi(name) {
+    if (!confirm(`Remove “${name}”? Their photos stay indexed — only the person label is deleted.`)) return;
+    err = "";
+    try {
+      await api.deletePerson(name);
+      if (active === name) { active = null; results = []; }
+      await refresh();
+    } catch (e) { err = e.message; }
+  }
+
   async function find(name) {
     active = name; loadingFind = true; results = [];
     // Empty query = person-only browse: the backend returns ALL of the
@@ -170,7 +190,11 @@
       {#each persons as name}
         <div class="row" style="justify-content:space-between">
           <span>👤 <b>{name}</b></span>
-          <button on:click={() => find(name)} disabled={indexedCount === 0}>Find</button>
+          <span class="row" style="gap:6px">
+            <button class="sm ghost" on:click={() => renamePersonUi(name)} title="Rename">✎</button>
+            <button class="sm ghost" on:click={() => deletePersonUi(name)} title="Remove person">✕</button>
+            <button on:click={() => find(name)} disabled={indexedCount === 0}>Find</button>
+          </span>
         </div>
         {#if active === name}
           {#if loadingFind}

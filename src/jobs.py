@@ -12,7 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 import settings as settings_mod
 from indexer import Indexer, resolve_caption_json, build_embed_payload
 
-JOB_TYPES = ("vision", "embed", "full", "reanalyze", "faces", "thumbs")
+JOB_TYPES = ("vision", "embed", "full", "reanalyze", "faces", "thumbs",
+             "dhash", "scan")
 
 # Captions per /v1/embeddings request during embed jobs. LM Studio accepts a
 # list, so one round-trip embeds the whole chunk.
@@ -67,6 +68,13 @@ class JobManager:
             items = idx.get_faces_pending()
         elif jtype == "thumbs":
             items = idx.get_thumbs_pending()
+        elif jtype == "dhash":
+            items = idx.get_dhash_pending()
+        elif jtype == "scan":
+            # One work item per configured folder (paths, not image ids).
+            from folders import ensure_defaults, get_effective_scan_dirs
+            ensure_defaults()
+            return get_effective_scan_dirs()
         else:
             raise ValueError(f"unknown job type: {jtype}")
         return [img_id for img_id, _ in items]
@@ -309,7 +317,8 @@ class JobManager:
             if self._stop.is_set():
                 self._update(stopped=True)
                 break
-            fname = idx.image_catalog["images"].get(img_id, {}).get("filename", "")
+            fname = (img_id if jtype == "scan" else
+                     idx.image_catalog["images"].get(img_id, {}).get("filename", ""))
             try:
                 if jtype == "embed":
                     note = idx.embed_one(img_id, embed_provider=ep, embed_model=em,
@@ -318,6 +327,11 @@ class JobManager:
                     note = idx.detect_faces_one(img_id)
                 elif jtype == "thumbs":
                     note = idx.thumb_one(img_id)
+                elif jtype == "dhash":
+                    note = idx.dhash_one(img_id)
+                    dirty = True
+                elif jtype == "scan":
+                    note = idx.scan_folder_one(img_id)  # img_id is a folder path
                 elif jtype == "full":
                     note = idx.index_one_full(img_id, use_cached=True, upsert=False,
                                               vision_provider=vp, vision_model=vm,

@@ -31,7 +31,6 @@
   let newFolderPath = "";
   let newExcludePath = "";
   let defaults = [];
-  let scanResults = null;
   let confirmRemove = null;
   let showExcluded = false;
 
@@ -113,6 +112,8 @@
   $: facesPending = $status.faces_pending || 0;
   $: facesDone = $status.faces_done || 0;
   $: thumbsPending = $status.thumbs_pending || 0;
+  $: dhashPending = $status.dhash_pending || 0;
+  $: trashCount = $status.trash_count || 0;
 
   // ── settings helpers ──────────────────────────────────────────────────────────
   function markDirty() { settingsDirty = true; }
@@ -153,6 +154,8 @@
       if (!job.active) {
         clearInterval(poll);
         await Promise.all([refreshStatus(), refreshModels()]);
+        loadFolderConfig();  // scan jobs update folder stats
+        loadOrphaned();
         dispatch("indexed");
       }
     }, 1000);
@@ -160,6 +163,7 @@
 
   $: noServices = $health.loaded && !$health.lm_studio && !$health.gemini;
   $: running = job && job.active;
+  $: scanRunning = running && job.type === "scan";
   $: st = $status;
 
   async function start(type) {
@@ -188,15 +192,54 @@
     rechecking = false;
   }
 
-  // ── scan ──────────────────────────────────────────────────────────────────────
-  async function scan() {
-    busy = { ...busy, scan: true }; err = ""; scanResults = null;
+  // ── scan (runs as a background job — folder walks can take minutes) ─────────
+  async function scan() { await start("scan"); }
+
+  // ── duplicates ────────────────────────────────────────────────────────────
+  let dupes = null;
+  let dupesBusy = false;
+  let dupeDeleteFiles = false;
+  async function loadDupes() {
+    dupesBusy = true; err = "";
+    try { dupes = await api.duplicates(); } catch (e) { err = e.message; }
+    dupesBusy = false;
+  }
+  async function removeDupeGroup(g) {
+    const ids = g.photos.slice(1).map((p) => p.id);  // keep the largest file
+    busy = { ...busy, dupes: true }; err = "";
     try {
-      const res = await api.scan();
-      scanResults = res.summary;
-      await Promise.all([loadFolderConfig(), loadOrphaned(), refreshStatus()]);
+      await api.batchDelete(ids, dupeDeleteFiles);
+      dupes.groups = dupes.groups.filter((x) => x !== g);
+      dupes.total_groups -= 1;
+      dupes = dupes;
+      refreshStatus();
     } catch (e) { err = e.message; }
-    busy = { ...busy, scan: false };
+    busy = { ...busy, dupes: false };
+  }
+
+  // ── trash ─────────────────────────────────────────────────────────────────
+  let trashItems = null;
+  let showTrash = false;
+  async function loadTrash() {
+    try { trashItems = (await api.trashList()).items; } catch {}
+  }
+  async function toggleTrash() {
+    showTrash = !showTrash;
+    if (showTrash && trashItems === null) await loadTrash();
+  }
+  async function restoreTrash(ids = []) {
+    err = "";
+    try {
+      await api.trashRestore(ids);
+      await Promise.all([loadTrash(), refreshStatus()]);
+    } catch (e) { err = e.message; }
+  }
+  async function emptyTrash() {
+    err = "";
+    try {
+      await api.trashPurge([]);
+      await Promise.all([loadTrash(), refreshStatus()]);
+    } catch (e) { err = e.message; }
   }
 
   // ── folder actions ────────────────────────────────────────────────────────────
@@ -522,19 +565,8 @@
               {#if folder.last_scanned_at} · {fmtDate(folder.last_scanned_at)}{/if}
             </span>
           </div>
-          <button class="sm ghost danger-hover" on:click={() => requestRemoveFolder(folder)} disabled={busy.scan}>Remove</button>
+          <button class="sm ghost danger-hover" on:click={() => requestRemoveFolder(folder)} disabled={scanRunning}>Remove</button>
         </div>
-        {#if scanResults?.per_folder?.[folder.path]}
-          {@const s = scanResults.per_folder[folder.path]}
-          <div class="scan-result-row">
-            {#if s.error}<span class="err-text">Error: {s.error}</span>
-            {:else}
-              <span class="ok-text">+{s.added} new</span>
-              {#if s.moved}<span class="warn-text"> · {s.moved} moved</span>{/if}
-              <span class="hint"> · {s.unchanged} unchanged · {s.scanned} found</span>
-            {/if}
-          </div>
-        {/if}
       {/each}
     </div>
   {/if}
@@ -542,11 +574,11 @@
   <div class="add-row">
     <input bind:value={newFolderPath} placeholder="Folder path…"
            on:keydown={(e) => e.key === "Enter" && addFolder()}
-           disabled={busy.scan} />
-    <button on:click={addFolder} disabled={!newFolderPath.trim() || busy.addFolder || busy.scan}>
+           disabled={scanRunning} />
+    <button on:click={addFolder} disabled={!newFolderPath.trim() || busy.addFolder || scanRunning}>
       {busy.addFolder ? "Adding…" : "Add folder"}
     </button>
-    <button class="ghost" on:click={suggestDefaults} disabled={busy.scan}>Suggest defaults</button>
+    <button class="ghost" on:click={suggestDefaults} disabled={scanRunning}>Suggest defaults</button>
   </div>
   {#if defaults.length}
     <div class="defaults-list">
@@ -570,7 +602,7 @@
         {#each folderConfig.excluded as ex}
           <div class="folder-row">
             <span class="folder-path" title={ex.path}>{ex.path}</span>
-            <button class="sm ghost" on:click={() => removeExclude(ex.path)} disabled={busy.scan}>Remove exclusion</button>
+            <button class="sm ghost" on:click={() => removeExclude(ex.path)} disabled={scanRunning}>Remove exclusion</button>
           </div>
         {/each}
       </div>
@@ -578,30 +610,25 @@
     <div class="add-row">
       <input bind:value={newExcludePath} placeholder="Subfolder to skip…"
              on:keydown={(e) => e.key === "Enter" && addExclude()}
-             disabled={busy.scan} />
-      <button on:click={addExclude} disabled={!newExcludePath.trim() || busy.addExclude || busy.scan}>
+             disabled={scanRunning} />
+      <button on:click={addExclude} disabled={!newExcludePath.trim() || busy.addExclude || scanRunning}>
         {busy.addExclude ? "Adding…" : "Exclude folder"}
       </button>
     </div>
   {/if}
 
   <div style="margin-top:16px">
-    <button class="primary" on:click={scan}
-            disabled={busy.scan || running || folderConfig.included.length === 0}>
-      {busy.scan ? "Scanning…" : `Scan ${folderConfig.included.length} folder${folderConfig.included.length === 1 ? "" : "s"}`}
-    </button>
+    {#if jobIs(job, "scan")}
+      <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+    {:else if running}
+      <p class="hint">Another job is running — stop it first.</p>
+    {:else}
+      <button class="primary" on:click={scan}
+              disabled={folderConfig.included.length === 0}>
+        Scan {folderConfig.included.length} folder{folderConfig.included.length === 1 ? "" : "s"}
+      </button>
+    {/if}
   </div>
-  {#if busy.scan}
-    <div class="scan-progress"><span></span></div>
-  {/if}
-  {#if scanResults && !busy.scan}
-    <div class="scan-summary">
-      <span class="ok-text">+{scanResults.added} new</span>
-      {#if scanResults.moved}<span class="warn-text"> · {scanResults.moved} moved</span>{/if}
-      <span class="hint"> · {scanResults.unchanged} unchanged · {scanResults.total} total</span>
-      {#if scanResults.reconciled}<span class="hint"> · {scanResults.reconciled} index paths updated</span>{/if}
-    </div>
-  {/if}
 </div>
 
 <!-- B: Vision analysis -->
@@ -706,6 +733,99 @@
     </button>
   {/if}
 </div>
+
+<!-- Duplicates -->
+<div class="card">
+  <div class="section-label">Duplicates
+    <span class="hint">(find near-identical photos — resaves, bursts, WhatsApp copies)</span>
+  </div>
+  {#if jobIs(job, "dhash")}
+    <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+  {:else if dhashPending > 0}
+    <p class="hint">{dhashPending} photo{dhashPending === 1 ? "" : "s"} not fingerprinted yet.</p>
+    {#if running}
+      <p class="hint">Another job is running — stop it first.</p>
+    {:else}
+      <button class="primary" on:click={() => start("dhash")}>
+        ▶ Fingerprint {dhashPending} photo{dhashPending === 1 ? "" : "s"}
+      </button>
+    {/if}
+  {:else if totalScanned > 0}
+    <p class="ok-text">✓ All photos fingerprinted.</p>
+  {/if}
+
+  {#if totalScanned > 0 && dhashPending < totalScanned}
+    <div class="row" style="gap:10px; margin-top:10px; flex-wrap:wrap">
+      <button class="ghost sm" on:click={loadDupes} disabled={dupesBusy}>
+        {dupesBusy ? "Scanning…" : dupes ? "Refresh duplicate groups" : "Show duplicate groups"}
+      </button>
+      {#if dupes}
+        <span class="hint">{dupes.total_groups} group{dupes.total_groups === 1 ? "" : "s"}
+          found across {dupes.hashed} fingerprinted photos</span>
+      {/if}
+    </div>
+  {/if}
+
+  {#if dupes && dupes.groups.length}
+    <label class="row" style="gap:6px; font-size:13px; margin-top:10px">
+      <input type="checkbox" bind:checked={dupeDeleteFiles} style="width:auto" />
+      also move duplicate files to the Recycle Bin
+    </label>
+    <div class="dupe-list">
+      {#each dupes.groups.slice(0, 40) as g (g.photos[0].id)}
+        <div class="dupe-group">
+          <div class="dupe-thumbs">
+            {#each g.photos.slice(0, 8) as p, pi}
+              <div class="dupe-cell" class:keeper={pi === 0} title={p.path}>
+                <img src={api.thumbUrl(p.id)} alt={p.filename} loading="lazy" decoding="async"
+                     on:click={() => dispatch("select", { id: p.id, ids: g.photos.map((x) => x.id) })} />
+                {#if pi === 0}<span class="keep-badge">keep</span>{/if}
+              </div>
+            {/each}
+            {#if g.count > 8}<span class="hint">+{g.count - 8} more</span>{/if}
+          </div>
+          <div class="row" style="justify-content:space-between; margin-top:6px">
+            <span class="hint">{g.count} copies · keeping the largest file</span>
+            <button class="sm danger" on:click={() => removeDupeGroup(g)} disabled={busy.dupes || running}>
+              Remove {g.count - 1} duplicate{g.count - 1 === 1 ? "" : "s"}
+            </button>
+          </div>
+        </div>
+      {/each}
+    </div>
+  {:else if dupes}
+    <p class="ok-text" style="margin-top:8px">✓ No duplicate groups found.</p>
+  {/if}
+</div>
+
+<!-- Trash -->
+{#if trashCount > 0}
+<div class="card warn-card">
+  <div class="row" style="justify-content:space-between; align-items:center">
+    <span class="warn-text">🗑 Trash — {trashCount} photo{trashCount === 1 ? "" : "s"}
+      <span class="hint">(removed from the library; restorable)</span></span>
+    <div class="row" style="gap:8px">
+      <button class="ghost sm" on:click={toggleTrash}>{showTrash ? "Hide" : "Show"}</button>
+      <button class="sm" on:click={() => restoreTrash([])} disabled={running}>Restore all</button>
+      <button class="sm danger" on:click={emptyTrash} disabled={running}>Empty trash</button>
+    </div>
+  </div>
+  {#if showTrash && trashItems}
+    <div class="orphan-list">
+      {#each trashItems as t (t.id)}
+        <div class="orphan-row">
+          <span class="orphan-path" title={t.path}>
+            {t.filename}{t.file_deleted ? " · file sent to Recycle Bin" : ""}
+          </span>
+          <button class="sm ghost" on:click={() => restoreTrash([t.id])} disabled={running}>Restore</button>
+        </div>
+      {/each}
+    </div>
+    <p class="hint" style="margin-top:6px">Restored photos keep their caption and
+      reappear as embed-pending (run C to make them searchable again).</p>
+  {/if}
+</div>
+{/if}
 
 <!-- D: Full index -->
 <div class="card">
@@ -837,6 +957,17 @@
   .scan-progress > span { display: block; height: 100%; background: var(--accent);
     width: 30%; animation: scan-indeterminate 1.5s ease-in-out infinite; border-radius: 99px; }
   @keyframes scan-indeterminate { 0% { transform: translateX(-100%); } 100% { transform: translateX(400%); } }
+
+  /* duplicates */
+  .dupe-list { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
+  .dupe-group { border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
+  .dupe-thumbs { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .dupe-cell { position: relative; width: 72px; height: 72px; border-radius: 6px; overflow: hidden;
+    border: 1px solid var(--border); cursor: pointer; }
+  .dupe-cell.keeper { border: 2px solid var(--success); }
+  .dupe-cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .keep-badge { position: absolute; bottom: 0; left: 0; right: 0; text-align: center;
+    font-size: 9px; background: color-mix(in srgb, var(--success) 80%, black); color: #fff; }
 
   /* orphaned */
   .orphan-list { margin-top: 10px; border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--border));

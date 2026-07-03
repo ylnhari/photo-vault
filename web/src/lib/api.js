@@ -80,6 +80,16 @@ export const api = {
   // People
   people: () => j("GET", "/api/people"),
   addPerson: (name, ref_dir) => j("POST", "/api/people", { name, ref_dir }),
+  renamePerson: (name, new_name) =>
+    j("PUT", `/api/people/${encodeURIComponent(name)}`, { new_name }),
+  deletePerson: (name) => j("DELETE", `/api/people/${encodeURIComponent(name)}`),
+
+  // Duplicates + trash
+  duplicates: (threshold = 6, limit = 100) =>
+    j("GET", `/api/duplicates?threshold=${threshold}&limit=${limit}`),
+  trashList: () => j("GET", "/api/trash"),
+  trashRestore: (ids = []) => j("POST", "/api/trash/restore", { ids }),
+  trashPurge: (ids = []) => j("DELETE", "/api/trash", { ids }),
 
   // Faces (detection is a job via index/start type=faces; below is clustering/tagging)
   facesStatus: () => j("GET", "/api/faces/status"),

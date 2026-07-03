@@ -52,7 +52,15 @@ from embeddings import (
     collection_name_for,
     list_gemini_embed_models,
 )
-from tagger import add_person_reference, add_person_embedding, get_all_persons
+from tagger import (
+    add_person_reference,
+    add_person_embedding,
+    get_all_persons,
+    rename_person,
+    delete_person,
+)
+import dupes as dupes_mod
+import trash as trash_mod
 from faces import load_face_data, face_index_count, rebuild_face_index
 from validator import service_status
 from jobs import manager, JOB_TYPES
@@ -291,6 +299,11 @@ def status():
         "faces_pending": faces["pending"],
         "faces_done": faces["detected"],
         "thumbs_pending": idx.count_thumbs_missing(),
+        "dhash_pending": sum(
+            1 for d in idx.image_catalog.get("images", {}).values()
+            if not d.get("dhash")
+        ),
+        "trash_count": len(trash_mod.list_items()),
         "settings": s,
     }
 
@@ -316,27 +329,32 @@ def reset_settings():
 # ── scanning ────────────────────────────────────────────────────────────────
 @app.post("/api/scan")
 def scan(req: ScanReq):
-    # A scan and the background index job both rewrite images.json — never let
-    # them overlap or one will clobber the other's writes.
+    """
+    Explicit dirs → synchronous scan (API/tests). No dirs → the folder-registry
+    scan runs as a background job ("scan" type) so a 26k-file walk doesn't hold
+    an HTTP request open for minutes; poll /api/index/progress like any job.
+    """
     if manager.status().get("active"):
-        raise HTTPException(409, "an indexing job is running; stop it before scanning")
+        raise HTTPException(409, "a job is running; stop it before scanning")
     if _scan_active.is_set():
         raise HTTPException(409, "a scan is already in progress")
 
     dirs = [d.strip() for d in req.dirs if d.strip()]
 
-    if dirs:
-        # Explicit dirs: validate they exist on disk
-        invalid = [d for d in dirs if not os.path.isdir(d)]
-        if invalid:
-            raise HTTPException(400, f"directories not found: {', '.join(invalid)}")
-        idx = Indexer(target_directories=dirs)
-    else:
-        # No dirs provided → use folder registry
+    if not dirs:
         cfg = folder_mgr.ensure_defaults()
         if not cfg.get("included"):
             raise HTTPException(400, "No folders configured. Add a folder first.")
-        idx = Indexer()
+        try:
+            return manager.start("scan")
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+
+    # Explicit dirs: validate they exist on disk, scan synchronously
+    invalid = [d for d in dirs if not os.path.isdir(d)]
+    if invalid:
+        raise HTTPException(400, f"directories not found: {', '.join(invalid)}")
+    idx = Indexer(target_directories=dirs)
 
     _scan_active.set()
     try:
@@ -756,10 +774,11 @@ def timeline(year: str | None = None, offset: int = 0, limit: int = 60):
         y = date[:4] if date and len(date) >= 4 else "Unknown"
         by_year.setdefault(y, []).append((date, img_id, data))
 
-    def _tcard(img_id, data):
+    def _tcard(img_id, data, date):
         return {
             "id": img_id,
             "filename": data.get("filename", ""),
+            "date": date,  # "YYYY:MM:DD hh:mm:ss" — the UI groups by month
             "exists": os.path.exists(data.get("path", "")),
         }
 
@@ -770,7 +789,7 @@ def timeline(year: str | None = None, offset: int = 0, limit: int = 60):
         return {
             "year": year,
             "count": len(rows),
-            "photos": [_tcard(i, d) for _, i, d in page],
+            "photos": [_tcard(i, d, dt) for dt, i, d in page],
         }
 
     # Newest year first; "Unknown" (sorts above digits) belongs at the end.
@@ -784,7 +803,7 @@ def timeline(year: str | None = None, offset: int = 0, limit: int = 60):
             {
                 "year": y,
                 "count": len(rows),
-                "photos": [_tcard(i, d) for _, i, d in rows[:limit]],
+                "photos": [_tcard(i, d, dt) for dt, i, d in rows[:limit]],
             }
         )
     return {"years": years_out}
@@ -808,6 +827,31 @@ def add_person(req: PersonReq):
             400, "no faces detected in the reference folder — person not registered"
         )
     return {"ok": True, "name": req.name, "faces": faces_found}
+
+
+class PersonRenameReq(BaseModel):
+    new_name: str
+
+
+@app.put("/api/people/{name}")
+def person_rename(name: str, req: PersonRenameReq):
+    new = req.new_name.strip()
+    if not new:
+        raise HTTPException(400, "new name required")
+    try:
+        rename_person(name, new)
+    except KeyError:
+        raise HTTPException(404, "person not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "name": new}
+
+
+@app.delete("/api/people/{name}")
+def person_delete(name: str):
+    if not delete_person(name):
+        raise HTTPException(404, "person not found")
+    return {"ok": True}
 
 
 # ── face clustering / tagging ─────────────────────────────────────────────────
@@ -1048,39 +1092,127 @@ def meta(id: str = Query(...)):
     return m
 
 
+def _delete_file_recoverably(path: str) -> bool:
+    """Windows Recycle Bin first, plain delete elsewhere. True when gone."""
+    if trash_mod.delete_file_to_recycle_bin(path):
+        return True
+    try:
+        os.remove(path)
+        return True
+    except Exception as e:
+        print(f"[api] file delete failed for {path}: {e}")
+        return False
+
+
 @app.delete("/api/image")
 def delete_image(id: str = Query(...), delete_file: bool = False):
+    """Soft-delete: the photo moves to the app trash (restorable). With
+    delete_file the file itself goes to the OS Recycle Bin."""
     _reject_if_writer_active()
     idx = Indexer()
-    path = idx.delete_image(id)
+    path = idx.image_catalog.get("images", {}).get(id, {}).get("path")
     removed_file = False
     if delete_file and path and os.path.exists(path):
-        try:
-            os.remove(path)
-            removed_file = True
-        except Exception as e:
-            raise HTTPException(500, f"index removed, file delete failed: {e}")
+        removed_file = _delete_file_recoverably(path)
+        if not removed_file:
+            raise HTTPException(500, "file delete failed; photo left in the index")
+    idx.delete_image(id, to_trash=True, file_deleted=removed_file)
     return {"ok": True, "removed_file": removed_file}
 
 
 @app.post("/api/images/delete")
 def batch_delete(req: BatchDeleteReq):
-    """Remove multiple images from the index (and optionally from disk) in one call."""
+    """Soft-delete multiple images (files optionally to the Recycle Bin)."""
     if not req.ids:
         return {"removed": 0, "files_removed": 0}
     _reject_if_writer_active()
     idx = Indexer()
     removed = files_removed = 0
     for img_id in req.ids:
-        path = idx.delete_image(img_id)
-        removed += 1
+        path = idx.image_catalog.get("images", {}).get(img_id, {}).get("path")
+        file_deleted = False
         if req.delete_file and path and os.path.exists(path):
-            try:
-                os.remove(path)
+            file_deleted = _delete_file_recoverably(path)
+            if file_deleted:
                 files_removed += 1
-            except Exception:
-                pass
+        idx.delete_image(img_id, to_trash=True, file_deleted=file_deleted)
+        removed += 1
     return {"removed": removed, "files_removed": files_removed}
+
+
+# ── trash ─────────────────────────────────────────────────────────────────────
+class TrashIdsReq(BaseModel):
+    ids: list[str] = []  # empty → all
+
+
+@app.get("/api/trash")
+def trash_list():
+    items = trash_mod.list_items()
+    out = []
+    for iid, item in items.items():
+        e = item.get("entry", {})
+        out.append(
+            {
+                "id": iid,
+                "filename": e.get("filename", ""),
+                "path": e.get("path", ""),
+                "deleted_at": item.get("deleted_at"),
+                "file_deleted": item.get("file_deleted", False),
+            }
+        )
+    out.sort(key=lambda x: x.get("deleted_at") or 0, reverse=True)
+    return {"items": out, "total": len(out)}
+
+
+@app.post("/api/trash/restore")
+def trash_restore(req: TrashIdsReq):
+    """Restore trashed photos to the catalog. Their caption survives, so they
+    reappear as embed-pending (run C to make them searchable again)."""
+    _reject_if_writer_active()
+    ids = req.ids or list(trash_mod.list_items().keys())
+    idx = Indexer()
+    return {"restored": idx.restore_images(ids)}
+
+
+@app.delete("/api/trash")
+def trash_purge(req: TrashIdsReq = None):
+    """Permanently drop trashed entries (all when ids empty)."""
+    _reject_if_writer_active()
+    idx = Indexer(use_cache=True)  # purge doesn't touch the live catalog
+    return {"purged": idx.purge_trash(req.ids if req and req.ids else None)}
+
+
+# ── duplicates ────────────────────────────────────────────────────────────────
+@app.get("/api/duplicates")
+def duplicates(threshold: int = Query(dupes_mod.DEFAULT_THRESHOLD, ge=0, le=16),
+               limit: int = 100):
+    """Near-duplicate groups from the stored perceptual hashes (run the
+    'dhash' job first). Photos in each group are largest-file-first."""
+    catalog = load_catalog_cached().get("images", {})
+    groups = dupes_mod.group_duplicates(catalog, threshold=threshold)
+    out = []
+    for g in groups[:limit]:
+        photos = []
+        for iid in g:
+            d = catalog.get(iid, {})
+            photos.append(
+                {
+                    "id": iid,
+                    "filename": d.get("filename", ""),
+                    "path": d.get("path", ""),
+                    "size_bytes": d.get("size_bytes", 0),
+                    "exists": os.path.exists(d.get("path", "")),
+                }
+            )
+        photos.sort(key=lambda p: -(p["size_bytes"] or 0))
+        out.append({"photos": photos, "count": len(photos)})
+    hashed = sum(1 for d in catalog.values() if d.get("dhash"))
+    return {
+        "groups": out,
+        "total_groups": len(groups),
+        "hashed": hashed,
+        "total": len(catalog),
+    }
 
 
 @app.get("/api/explore")

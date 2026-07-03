@@ -102,8 +102,17 @@
 </script>
 
 {#if indexedCount === 0}
-  <div class="card">
-    <p>No photos indexed yet. Go to <b>Index &amp; Manage</b> to scan and index your photos.</p>
+  <div class="card onboard">
+    <h2>Set up your library</h2>
+    <ol>
+      <li><b>Scan</b> — pick your photo folders and let Photo Vault find every image
+        <span class="muted">(Index &amp; Manage → A)</span></li>
+      <li><b>Caption</b> — a local vision model describes each photo
+        <span class="muted">(B — needs LM Studio or a Gemini key)</span></li>
+      <li><b>Embed</b> — captions become search vectors; search, timeline and people light up
+        <span class="muted">(C)</span></li>
+    </ol>
+    <button class="primary" on:click={() => dispatch("goto-index")}>Open Index &amp; Manage →</button>
   </div>
 {:else}
   <div class="layout">
@@ -186,6 +195,10 @@
   aside { width: 240px; flex-shrink: 0; position: sticky; top: 12px; }
   @media (max-width: 800px) { .layout { flex-direction: column; } aside { width: 100%; position: static; } }
   .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; min-height: 30px; flex-wrap: wrap; }
+  .onboard { max-width: 560px; margin: 40px auto; padding: 28px; }
+  .onboard h2 { margin-bottom: 14px; font-size: 20px; }
+  .onboard ol { margin: 0 0 18px 20px; display: flex; flex-direction: column; gap: 10px; font-size: 14px; }
+  .onboard .muted { color: var(--muted); font-size: 12px; }
   .sm { padding: 5px 10px; font-size: 13px; }
   .ghost.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   .danger { background: var(--danger); color: #fff; border-color: var(--danger); }

@@ -27,6 +27,17 @@
 
   function emit() { dispatch("selectionchange", Array.from(selected)); }
 
+  // Aspect ratios learned as thumbs load → justified rows (Google-Photos-style)
+  // instead of square crops. Cells render square until their thumb arrives.
+  let ratios = {};
+  function onImgLoad(e, p) {
+    const img = e.target;
+    if (img.naturalWidth && img.naturalHeight) {
+      const ar = Math.max(0.55, Math.min(2.4, img.naturalWidth / img.naturalHeight));
+      if (ratios[p.id] !== ar) { ratios[p.id] = ar; ratios = ratios; }
+    }
+  }
+
   // Live cell elements, in visible order. Queried on demand — a cached
   // bind:this array goes stale when the keyed {#each} reuses nodes.
   function cellNodes() {
@@ -132,16 +143,18 @@
   <p class="muted">No photos to show.</p>
 {:else}
   <div class="gridwrap" class:dragging bind:this={wrapEl} on:mousedown={onDown} role="presentation">
-    <div class="grid" style="--cols:{cols}">
+    <div class="grid" style="--rowh:{cols >= 6 ? 180 : 220}px">
       {#each visible as p, i (p.id)}
         <div class="cell" class:missing={p.exists === false} class:selected={selected.has(p.id)}
+             style="--ar:{ratios[p.id] || 1}"
              on:click={(e) => onCellClick(e, p, i)}
              on:keydown={(e) => onCellKey(e, p, i)}
              role="button" tabindex="0">
           {#if p.exists === false}
             <div class="gone">🚫<br /><small>{p.filename}</small></div>
           {:else}
-            <img src={api.thumbUrl(p.id)} alt={p.filename} loading="lazy" decoding="async" draggable="false" />
+            <img src={api.thumbUrl(p.id)} alt={p.filename} loading="lazy" decoding="async"
+                 draggable="false" on:load={(e) => onImgLoad(e, p)} />
             {#if p.caption}<div class="cap">{p.caption}</div>{/if}
             {#if selectMode || selected.has(p.id)}
               <div class="check" class:on={selected.has(p.id)}>{selected.has(p.id) ? "✓" : ""}</div>
@@ -149,6 +162,7 @@
           {/if}
         </div>
       {/each}
+      <span class="rowfill"></span>
     </div>
     {#if dragging && dragMoved}
       <div class="marquee"
@@ -160,20 +174,26 @@
 <style>
   .gridwrap { position: relative; }
   .gridwrap.dragging { user-select: none; }
+  /* Justified rows: each cell's flex share is its aspect ratio, so photos
+     keep their shape and every row lines up flush (Google-Photos style). */
   .grid {
-    display: grid;
-    grid-template-columns: repeat(var(--cols), 1fr);
-    gap: 8px;
+    display: flex; flex-wrap: wrap; gap: 8px;
   }
   .cell {
     position: relative; border-radius: 8px; overflow: hidden;
-    background: var(--surface); aspect-ratio: 1; cursor: pointer;
+    background: var(--surface); cursor: pointer;
     border: 1px solid var(--border);
+    height: var(--rowh);
+    flex-grow: calc(var(--ar) * 100);
+    flex-basis: calc(var(--ar) * var(--rowh));
+    max-width: calc(var(--ar) * var(--rowh) * 1.6);
     /* Skip rendering/layout of off-screen cells so a 10k-photo grid stays
        smooth. The intrinsic size keeps the scrollbar accurate. */
     content-visibility: auto;
-    contain-intrinsic-size: 220px;
+    contain-intrinsic-size: calc(var(--ar) * var(--rowh)) var(--rowh);
   }
+  /* Absorb leftover space so a short last row doesn't stretch its photos. */
+  .rowfill { flex-grow: 1000000; }
   .cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .cell:hover img { filter: brightness(1.1); }
   .cell:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
