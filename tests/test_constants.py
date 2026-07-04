@@ -77,6 +77,56 @@ def test_load_env_skips_comments(tmp_path):
     del os.environ["VALID_VAR"]
 
 
+def test_load_env_strips_matching_double_quotes(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text('QUOTED_VAR="hello world"\n')
+
+    import constants
+    original = constants.PROJECT_ROOT
+    constants.PROJECT_ROOT = str(tmp_path)
+    os.environ.pop("QUOTED_VAR", None)
+    constants._load_env()
+    constants.PROJECT_ROOT = original
+
+    assert os.environ.get("QUOTED_VAR") == "hello world"
+    del os.environ["QUOTED_VAR"]
+
+
+def test_load_env_strips_matching_single_quotes(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("SINGLE_QUOTED='hello'\n")
+
+    import constants
+    original = constants.PROJECT_ROOT
+    constants.PROJECT_ROOT = str(tmp_path)
+    os.environ.pop("SINGLE_QUOTED", None)
+    constants._load_env()
+    constants.PROJECT_ROOT = original
+
+    assert os.environ.get("SINGLE_QUOTED") == "hello"
+    del os.environ["SINGLE_QUOTED"]
+
+
+def test_load_env_does_not_strip_mismatched_or_internal_quotes(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text('MISMATCHED="unterminated\nINTERNAL=has"quote"inside\n')
+
+    import constants
+    original = constants.PROJECT_ROOT
+    constants.PROJECT_ROOT = str(tmp_path)
+    os.environ.pop("MISMATCHED", None)
+    os.environ.pop("INTERNAL", None)
+    constants._load_env()
+    constants.PROJECT_ROOT = original
+
+    # Mismatched leading/trailing quote is left as-is (not a matching pair).
+    assert os.environ.get("MISMATCHED") == '"unterminated'
+    # A quote embedded in the middle (not at both ends) is preserved verbatim.
+    assert os.environ.get("INTERNAL") == 'has"quote"inside'
+    del os.environ["MISMATCHED"]
+    del os.environ["INTERNAL"]
+
+
 def test_load_env_no_file_no_crash(tmp_path):
     import constants
     original = constants.PROJECT_ROOT

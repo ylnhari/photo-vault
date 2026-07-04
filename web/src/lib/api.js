@@ -5,14 +5,26 @@
 // every request so the hardened local API accepts us.
 let _token = (typeof window !== "undefined" && window.__PV_TOKEN__) || null;
 let _tokenTried = false;
+let _lastTryTime = 0;
+const TOKEN_RETRY_MIN_INTERVAL_MS = 2000;
 
 async function ensureToken() {
   if (_token || _tokenTried) return;
-  _tokenTried = true;
+  const now = Date.now();
+  if (now - _lastTryTime < TOKEN_RETRY_MIN_INTERVAL_MS) return;
+  _lastTryTime = now;
   try {
     const r = await fetch("/api/token");
-    if (r.ok) _token = (await r.json()).token || null;
+    if (r.ok) {
+      const token = (await r.json()).token || null;
+      if (token) {
+        _token = token;
+        _tokenTried = true;  // only latch "done" once we actually have a token
+      }
+    }
   } catch {}
+  // On failure, _tokenTried stays false so the next call retries (subject to
+  // the min-interval guard above) instead of permanently 401ing every request.
 }
 
 async function j(method, url, body) {
@@ -53,7 +65,7 @@ export const api = {
 
   // Orphaned images
   getOrphaned: () => j("GET", "/api/orphaned"),
-  cleanupOrphaned: (ids = []) => j("DELETE", "/api/orphaned", { ids }),
+  cleanupOrphaned: (ids = []) => j("POST", "/api/orphaned/cleanup", { ids }),
 
   // Settings
   getSettings: () => j("GET", "/api/settings"),
@@ -90,7 +102,7 @@ export const api = {
     j("GET", `/api/duplicates?threshold=${threshold}&limit=${limit}`),
   trashList: () => j("GET", "/api/trash"),
   trashRestore: (ids = []) => j("POST", "/api/trash/restore", { ids }),
-  trashPurge: (ids = []) => j("DELETE", "/api/trash", { ids }),
+  trashPurge: (ids = []) => j("POST", "/api/trash/purge", { ids }),
 
   // Faces (detection is a job via index/start type=faces; below is clustering/tagging)
   facesStatus: () => j("GET", "/api/faces/status"),

@@ -58,6 +58,8 @@ def test_collection_name_for_truncates_long_names():
 # ── _lm_studio_embed ──────────────────────────────────────────────────────────
 
 def test_lm_studio_embed_success():
+    """No loaded embeddings model reported by the v0 API → falls back to the
+    plain /v1/models heuristic (first entry)."""
     from embeddings import _lm_studio_embed
     expected = [0.3, 0.4, 0.5]
     responses = [
@@ -69,10 +71,27 @@ def test_lm_studio_embed_success():
         r = responses[call_count[0]]
         call_count[0] += 1
         return r
-    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("embeddings.list_lm_studio_models_v0", return_value=[]):
         vec, model = _lm_studio_embed("test")
     assert vec == expected
     assert model == "test-embed-model"
+
+
+def test_lm_studio_embed_prefers_v0_loaded_embedding_model():
+    """When the v0 API reports a loaded embeddings model, use it directly —
+    no /v1/models heuristic call needed at all."""
+    from embeddings import _lm_studio_embed
+    expected = [0.7, 0.8]
+    v0_models = [
+        {"id": "some-vlm", "type": "vlm", "state": "loaded"},
+        {"id": "nomic-embed-text", "type": "embeddings", "state": "loaded"},
+    ]
+    with patch("urllib.request.urlopen", return_value=_fake_urlopen_lm_studio_embed(expected)), \
+         patch("embeddings.list_lm_studio_models_v0", return_value=v0_models):
+        vec, model = _lm_studio_embed("test")
+    assert vec == expected
+    assert model == "nomic-embed-text"
 
 
 def test_lm_studio_embed_falls_back_to_default_model_name_on_models_error():
@@ -84,7 +103,8 @@ def test_lm_studio_embed_falls_back_to_default_model_name_on_models_error():
         if call_count[0] == 1:
             raise ConnectionRefusedError("refused")  # /models call fails
         return _fake_urlopen_lm_studio_embed(expected)
-    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+         patch("embeddings.list_lm_studio_models_v0", return_value=[]):
         vec, model = _lm_studio_embed("test")
     assert vec == expected
     assert model == "lm_studio_embed"  # default fallback name
@@ -244,6 +264,29 @@ def test_set_active_model_raises_if_not_registered(tmp_path):
             set_active_model("unknown-model")
 
 
+def test_register_model_raises_on_dimension_change(tmp_path):
+    """A model name that suddenly reports a different vector dimension would
+    silently corrupt the collection (mixed vector sizes) if allowed through —
+    must raise instead of quietly updating the stored dimension."""
+    from embeddings import register_model, get_registry
+    reg_path = str(tmp_path / "reg.json")
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", reg_path):
+        register_model("lm_studio", "model-a", 768)
+        with pytest.raises(RuntimeError, match="dimension"):
+            register_model("lm_studio", "model-a", 384)
+        # The stored dimension must not have been silently overwritten.
+        reg = get_registry()
+        assert reg["models"]["model-a"]["dimension"] == 768
+
+
+def test_register_model_same_dimension_again_does_not_raise(tmp_path):
+    from embeddings import register_model
+    reg_path = str(tmp_path / "reg.json")
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", reg_path):
+        register_model("lm_studio", "model-a", 768)
+        register_model("lm_studio", "model-a", 768)  # same dimension: no raise
+
+
 # ── _is_connection_error ──────────────────────────────────────────────────────
 
 def test_is_connection_error_true():
@@ -296,3 +339,113 @@ def test_batch_embed_one_request_in_order():
 def test_batch_embed_empty_input():
     from embeddings import get_embeddings_batch
     assert get_embeddings_batch([]) == ([], "", "")
+
+
+def test_batch_embed_gemini_partial_failure_keeps_successful_vectors():
+    """One bad text in a Gemini batch must not discard the whole chunk — the
+    failing slot comes back None, the rest keep their real vectors."""
+    from embeddings import get_embeddings_batch
+
+    def fake_gemini_embed(text, model=None):
+        if text == "bad":
+            raise RuntimeError("content blocked")
+        return ([0.1] if text == "good1" else [0.2]), "text-embedding-004"
+
+    with patch("embeddings._lm_studio_embed_batch", side_effect=ConnectionRefusedError("refused")), \
+         patch("embeddings._gemini_embed", side_effect=fake_gemini_embed), \
+         patch("embeddings.register_model"):
+        vectors, model, source = get_embeddings_batch(["good1", "bad", "good2"])
+
+    assert source == "gemini"
+    assert vectors[0] == [0.1]
+    assert vectors[1] is None
+    assert vectors[2] == [0.2]
+
+
+def test_batch_embed_gemini_all_fail_returns_none():
+    from embeddings import get_embeddings_batch
+
+    with patch("embeddings._lm_studio_embed_batch", side_effect=ConnectionRefusedError("refused")), \
+         patch("embeddings._gemini_embed", side_effect=RuntimeError("quota exceeded")):
+        vectors, model, source = get_embeddings_batch(["a", "b"], force_provider="gemini")
+
+    assert vectors is None
+    assert source == "error"
+
+
+# ── registry persistence resilience (items 7, 8, 20) ────────────────────────
+
+def test_load_registry_recovers_from_corrupt_file(tmp_path):
+    """A truncated/corrupt registry file (e.g. from a crash mid-write) must
+    not crash every subsequent registry read — start fresh instead."""
+    from embeddings import _load_registry
+    reg_path = tmp_path / "reg.json"
+    reg_path.write_text("{not valid json")
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", str(reg_path)):
+        reg = _load_registry()
+    assert reg == {"active_model": None, "models": {}}
+
+
+def test_save_registry_is_atomic_no_leftover_tmp_file(tmp_path):
+    from embeddings import _save_registry
+    reg_path = tmp_path / "reg.json"
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", str(reg_path)):
+        _save_registry({"active_model": "m", "models": {}})
+    assert reg_path.exists()
+    assert not (tmp_path / "reg.json.tmp").exists()
+    import json as _json
+    assert _json.loads(reg_path.read_text())["active_model"] == "m"
+
+
+def test_register_model_raises_on_dimension_mismatch(tmp_path):
+    """Re-registering a model name with a different embedding dimension must
+    not silently upsert a mismatched vector into the same collection — it
+    raises a clear error instead (callers already catch exceptions from
+    register_model and surface them as a normal per-item/per-batch failure,
+    same as any other embedding-provider error)."""
+    from embeddings import register_model, get_registry
+    reg_path = str(tmp_path / "reg.json")
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", reg_path):
+        register_model("lm_studio", "model-a", 768)
+        with pytest.raises(RuntimeError, match="dimension"):
+            register_model("lm_studio", "model-a", 384)  # dimension changed
+        reg = get_registry()
+    # Dimension recorded at first registration is left as-is (the mismatched
+    # second call never reached _save_registry).
+    assert reg["models"]["model-a"]["dimension"] == 768
+
+
+def test_register_model_same_dimension_repeated_call_does_not_raise(tmp_path):
+    """The normal case: every successful embed re-registers the same model at
+    the same dimension — must not raise or otherwise regress."""
+    from embeddings import register_model, get_registry
+    reg_path = str(tmp_path / "reg.json")
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", reg_path):
+        register_model("lm_studio", "model-a", 768)
+        register_model("lm_studio", "model-a", 768)
+        reg = get_registry()
+    assert reg["models"]["model-a"]["dimension"] == 768
+
+
+# ── Gemini embed rate-limit cooldown (item 9) ───────────────────────────────
+
+def test_gemini_embed_429_sets_cooldown_and_skips_retry():
+    from embeddings import _gemini_embed, gemini_embed_cooldowns
+    import embeddings as embeddings_mod
+    embeddings_mod._gemini_embed_cooldown.clear()
+
+    with patch("urllib.request.urlopen", side_effect=_http_error(429)), \
+         patch("embeddings.GEMINI_API_KEY", "fake-key"):
+        with pytest.raises(RuntimeError, match="429"):
+            _gemini_embed("test", model="text-embedding-004")
+
+    cooldowns = gemini_embed_cooldowns()
+    assert "text-embedding-004" in cooldowns
+    assert cooldowns["text-embedding-004"] > 0
+
+    # A second call while in cooldown must not hit the network at all.
+    with patch("urllib.request.urlopen") as mock_open:
+        with pytest.raises(RuntimeError, match="cooldown"):
+            _gemini_embed("test", model="text-embedding-004")
+        mock_open.assert_not_called()
+    embeddings_mod._gemini_embed_cooldown.clear()

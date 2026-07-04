@@ -1,3 +1,7 @@
+import os
+import sqlite3
+import pytest
+
 from scanner import _gps_to_decimal, _ratio_to_float
 
 
@@ -40,6 +44,26 @@ def test_gps_bad_input_returns_none():
     assert _gps_to_decimal(None, "N") is None
 
 
+def test_gps_out_of_range_latitude_returns_none():
+    # 200 degrees is not a valid latitude — malformed EXIF must not produce
+    # a garbage coordinate that flows into geocoding.
+    lat = _gps_to_decimal([_Ratio(200), _Ratio(0), _Ratio(0)], "N")
+    assert lat is None
+
+
+def test_gps_out_of_range_longitude_returns_none():
+    lon = _gps_to_decimal([_Ratio(300), _Ratio(0), _Ratio(0)], "E")
+    assert lon is None
+
+
+def test_gps_boundary_values_are_valid():
+    # Exactly at the boundary must still be accepted.
+    lat = _gps_to_decimal([_Ratio(90), _Ratio(0), _Ratio(0)], "N")
+    assert lat == 90.0
+    lon = _gps_to_decimal([_Ratio(180), _Ratio(0), _Ratio(0)], "W")
+    assert lon == -180.0
+
+
 def test_in_place_edit_retires_old_uid(tmp_path):
     """Editing a file in place (same path, new bytes) must replace the old
     catalog entry, not leave a stale duplicate that never shows as orphaned."""
@@ -58,3 +82,89 @@ def test_in_place_edit_retires_old_uid(tmp_path):
     scan_directory(str(root), out)
     images = catalog_db.load_all(out)["images"]
     assert len(images) == 1, f"stale duplicate left behind: {list(images)}"
+
+
+def test_scan_aborts_without_wiping_catalog_on_load_failure(tmp_path, monkeypatch):
+    """The most important regression to lock in: a transient catalog-load
+    failure (locked DB, corrupted row, transient I/O) must abort the scan
+    rather than being silently treated as 'empty catalog'. scan_directory's
+    checkpoint save is a full sync that deletes every row absent from the
+    in-memory dict — if the failure were swallowed into {}, the very next
+    save would wipe the whole catalog."""
+    import catalog_db
+    from scanner import scan_directory
+
+    root = tmp_path / "photos"
+    root.mkdir()
+    (root / "a.jpg").write_bytes(b"new-file")
+    out = str(tmp_path / "catalog.db")
+
+    # Seed the catalog with a pre-existing row that must survive the failed scan.
+    catalog_db.save_all(out, {"existing-uid": {"path": "/somewhere/old.jpg"}}, {})
+
+    def boom(_db_path):
+        raise sqlite3.OperationalError("database is locked")
+
+    with monkeypatch.context() as m:
+        m.setattr(catalog_db, "load_all", boom)
+        with pytest.raises(sqlite3.OperationalError):
+            scan_directory(str(root), out)
+
+    # Real load_all is restored now — the pre-existing row must be untouched
+    # and no destructive save should have run.
+    data = catalog_db.load_all(out)
+    assert "existing-uid" in data["images"]
+    assert data["images"]["existing-uid"]["path"] == "/somewhere/old.jpg"
+
+
+def test_scan_handles_symlink_cycle_without_hanging(tmp_path):
+    """os.walk(followlinks=True) would traverse a self-referential directory
+    symlink/junction forever without cycle detection — the scan must
+    terminate and must not re-process files under the cyclic subtree
+    infinitely."""
+    from scanner import scan_directory
+
+    root = tmp_path / "photos"
+    root.mkdir()
+    (root / "a.jpg").write_bytes(b"hello")
+    try:
+        os.symlink(str(root), str(root / "loop"), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not supported in this environment")
+
+    out = str(tmp_path / "catalog.db")
+    summary = scan_directory(str(root), out)
+    # Only the one real file should be catalogued — the cycle must not cause
+    # runaway re-discovery (this call must also simply return promptly;
+    # a regression here would hang the whole test suite).
+    assert summary["added"] == 1
+    assert summary["total"] == 1
+
+
+def test_duplicate_content_path_is_stable_across_rescans(tmp_path):
+    """Two byte-identical files share one content uid. The catalog can only
+    track one path per uid (a documented data-model limitation) — but which
+    path it tracks must be deterministic (lexicographically first) instead
+    of flip-flopping with os.walk's visitation order on every rescan."""
+    from scanner import scan_directory
+    import catalog_db
+
+    root = tmp_path / "photos"
+    root.mkdir()
+    a = root / "a_copy.jpg"
+    b = root / "b_copy.jpg"
+    a.write_bytes(b"identical-bytes")
+    b.write_bytes(b"identical-bytes")
+    out = str(tmp_path / "catalog.db")
+
+    scan_directory(str(root), out)
+    images = catalog_db.load_all(out)["images"]
+    assert len(images) == 1
+    tracked_path = next(iter(images.values()))["path"]
+    assert tracked_path == str(a)  # "a_copy.jpg" sorts before "b_copy.jpg"
+
+    # Repeated rescans must not flip the tracked path.
+    for _ in range(3):
+        scan_directory(str(root), out)
+        images = catalog_db.load_all(out)["images"]
+        assert next(iter(images.values()))["path"] == tracked_path

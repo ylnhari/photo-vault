@@ -3,7 +3,12 @@
 Single-user, single-job model: one indexing pass runs at a time in a worker
 thread. The API polls `status()` for live progress and calls `stop()` to abort.
 Unlike the old Streamlit one-photo-per-rerun hack, this is a real background
-task — the UI never blocks and Stop is honored between photos.
+task — the UI never blocks. Stop granularity depends on job type: "vision"
+(_run_vision_parallel) and "embed" (_run_embed_batched) check between batches
+(sized by vision_concurrency and EMBED_BATCH respectively, so up to one
+batch's worth of in-flight work can finish after Stop is pressed); every other
+job type (faces/thumbs/dhash/full/reanalyze/scan) runs via _run_sequential and
+checks between every individual item.
 """
 import threading
 import time
@@ -36,8 +41,8 @@ class JobManager:
     def _idle_state() -> dict:
         return {
             "active": False, "type": None, "total": 0, "done": 0,
-            "ok": 0, "fail": 0, "failed_ids": [], "log": [],
-            "aborted": False, "stopped": False, "finished": False,
+            "ok": 0, "fail": 0, "skipped": 0, "failed_ids": [], "log": [],
+            "aborted": False, "stopped": False, "finished": False, "error": None,
             "started_at": None, "max_fail": 5,
             "vision_provider": "auto", "vision_model": None,
             "embed_provider": "auto", "embed_model": None,
@@ -86,6 +91,21 @@ class JobManager:
               vision_model_label: str = None) -> dict:
         if jtype not in JOB_TYPES:
             raise ValueError(f"unknown job type: {jtype}")
+        # max_fail <= 0 would abort the job after the very first batch
+        # regardless of how many images actually failed — clamp to a sane
+        # floor instead of trusting whatever the caller passed.
+        try:
+            max_fail = max(1, int(max_fail))
+        except (TypeError, ValueError):
+            max_fail = 5
+        # Derive the caption_history model label from vision_provider/vision_model
+        # in exactly one place (matches settings.vision_model_label's formula)
+        # instead of trusting a second, independently-computed value from the
+        # caller — the two could otherwise silently disagree. The parameter is
+        # kept for call-signature compatibility but is no longer trusted as-is.
+        vision_model_label = settings_mod.vision_model_label(
+            {"vision_provider": vision_provider, "vision_model": vision_model}
+        )
         with self._lock:
             if self._state["active"]:
                 raise RuntimeError("a job is already running")
@@ -143,6 +163,23 @@ class JobManager:
                 self._run_embed_batched(idx, ids, cfg)
             else:
                 self._run_sequential(idx, jtype, ids, cfg)
+        except Exception as e:
+            # Without this, an unexpected bug in a runner (as opposed to a
+            # per-image failure, which the runners already catch) would only
+            # ever surface via Python's default thread excepthook on stderr —
+            # invisible in the UI, and the job would be left stuck "active".
+            # `error` is a new, additive status field (existing consumers of
+            # `aborted`/`log` keep working unchanged) that lets the UI show
+            # the actual crash reason instead of a generic "too many failures".
+            import traceback
+            print(f"[jobs] worker thread crashed: {e}")
+            traceback.print_exc()
+            with self._lock:
+                self._state["aborted"] = True
+                self._state["error"] = str(e)
+                self._state["log"].append(
+                    {"kind": "fail", "id": None, "note": f"job crashed: {e}", "file": ""}
+                )
         finally:
             with self._lock:
                 self._state["active"] = False
@@ -195,7 +232,12 @@ class JobManager:
                         consecutive += 1
                         self._update(fail=1, done=1, failed_id=bid, log=("fail", bid, errm, fname))
                 idx._save_catalog()  # one write per batch, not per image
-                if consecutive >= max_fail:
+                # Gated on consecutive > 0 so this can only ever fire because
+                # of real accumulated failures, never as a side effect of a
+                # misconfigured max_fail (max_fail is clamped to >= 1 in
+                # start(), but this is cheap defense-in-depth against a
+                # 0-or-negative value ever aborting a fully-successful batch).
+                if consecutive > 0 and consecutive >= max_fail:
                     self._update(aborted=True)
                     break
 
@@ -226,9 +268,18 @@ class JobManager:
             chunk = ids[i:i + EMBED_BATCH]
             i += len(chunk)
 
-            # Resolve captions; per-image failures don't sink the chunk.
+            # Resolve captions; per-image failures don't sink the chunk. Also
+            # check Stop here (not just at the top of the outer while loop) —
+            # this work is pure catalog reads/CPU, no network yet, so breaking
+            # here means Stop takes effect after at most a partial chunk
+            # instead of waiting for a full EMBED_BATCH-sized network round
+            # trip to finish first.
             texts, members = [], []   # members: (img_id, img_data, caption_json)
+            stopped_mid_chunk = False
             for iid in chunk:
+                if self._stop.is_set():
+                    stopped_mid_chunk = True
+                    break
                 img_data = idx.image_catalog["images"].get(iid)
                 fname = (img_data or {}).get("filename", "")
                 try:
@@ -241,6 +292,9 @@ class JobManager:
                     consecutive += 1
                     self._update(fail=1, done=1, failed_id=iid,
                                  log=("fail", iid, str(e), fname))
+            if stopped_mid_chunk:
+                self._update(stopped=True)
+                break
             if not members:
                 if consecutive >= max_fail:
                     self._update(aborted=True)
@@ -261,6 +315,27 @@ class JobManager:
                     self._update(aborted=True)
                     break
                 continue
+
+            # A Gemini batch can partially fail per item (see get_embeddings_batch)
+            # — vectors[i] is None for those; don't let one bad item in the chunk
+            # drop the successful ones.
+            if any(v is None for v in vectors):
+                good_members, good_vectors = [], []
+                for (iid, img_data, cj), vec in zip(members, vectors):
+                    if vec is None:
+                        consecutive += 1
+                        self._update(fail=1, done=1, failed_id=iid,
+                                     log=("fail", iid, "embedding failed for this item",
+                                          img_data.get("filename", "")))
+                    else:
+                        good_members.append((iid, img_data, cj))
+                        good_vectors.append(vec)
+                members, vectors = good_members, good_vectors
+                if not members:
+                    if consecutive >= max_fail:
+                        self._update(aborted=True)
+                        break
+                    continue
 
             # Faces (optional, per image) then one batched ChromaDB add.
             if faces_during:
@@ -347,9 +422,16 @@ class JobManager:
                                               caption_source_model=csm, persist=False,
                                               detect_faces=faces_during_embed)
                     dirty = True
-                consecutive = 0
-                icon = "cloud" if "gemini" in note.lower() else "ok"
-                self._update(ok=1, done=1, log=(icon, img_id, note, fname))
+                if "skipped" in note.lower():
+                    # A missing/moved file: neither a real failure (must not
+                    # trip consecutive-failure abort) nor a silent permanent
+                    # success (must stay distinguishable + retryable) — track
+                    # it in its own bucket and leave `consecutive` untouched.
+                    self._update(skipped=1, done=1, log=("skip", img_id, note, fname))
+                else:
+                    consecutive = 0
+                    icon = "cloud" if "gemini" in note.lower() else "ok"
+                    self._update(ok=1, done=1, log=(icon, img_id, note, fname))
             except Exception as e:
                 consecutive += 1
                 self._update(fail=1, done=1, failed_id=img_id,
@@ -363,11 +445,12 @@ class JobManager:
         if dirty:
             idx._save_catalog()
 
-    def _update(self, ok=0, fail=0, done=0, failed_id=None, log=None,
+    def _update(self, ok=0, fail=0, skipped=0, done=0, failed_id=None, log=None,
                 stopped=False, aborted=False):
         with self._lock:
             self._state["ok"] += ok
             self._state["fail"] += fail
+            self._state["skipped"] += skipped
             self._state["done"] += done
             if failed_id is not None:
                 self._state["failed_ids"].append(failed_id)

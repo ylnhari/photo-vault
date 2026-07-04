@@ -46,7 +46,10 @@
   }
   function onClose() { selectedId = null; selectedIds = null; }
   function onDeleted(e) {
-    if (e?.detail) lastDeleted.set(e.detail);  // grids hide the photo instantly
+    // Lightbox dispatches a single id; batch deletes (SearchTab) write directly
+    // to the lastDeleted store themselves and dispatch "deleted" with no detail —
+    // either way, normalize to an array since that's the store's contract.
+    if (e?.detail) lastDeleted.set(Array.isArray(e.detail) ? e.detail : [e.detail]);
     refreshStatus();
   }
 </script>

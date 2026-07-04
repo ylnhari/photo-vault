@@ -93,6 +93,21 @@ def test_strip_markdown_passthrough_plain():
     assert _strip_markdown('{"a":1}') == '{"a":1}'
 
 
+def test_strip_markdown_case_insensitive_language_tag():
+    from vision import _strip_markdown
+    assert _strip_markdown('```JSON\n{"a":1}\n```') == '{"a":1}'
+    assert _strip_markdown('```Json5\n{"a":1}\n```') == '{"a":1}'
+
+
+def test_strip_markdown_does_not_eat_leading_json_content():
+    """Regression: the old lstrip('json') stripped individual j/s/o/n
+    characters, not the word — it would mangle real JSON content starting
+    with those letters (e.g. a caption beginning with "no" or "on")."""
+    from vision import _strip_markdown
+    # No language tag on the fence — nothing should be stripped besides ``` .
+    assert _strip_markdown('```\n{"caption":"nice"}\n```') == '{"caption":"nice"}'
+
+
 # ── _call_gemini ──────────────────────────────────────────────────────────────
 
 def test_call_gemini_tries_lite_first():
@@ -369,6 +384,26 @@ def test_parse_list_field_garbage_type_falls_back_to_empty():
     from vision import parse_vision_attributes
     attrs = parse_vision_attributes(json.dumps({"animals": {"weird": "dict"}}))
     assert attrs["animals"] == ""
+
+
+def test_parse_scalar_field_with_unexpected_list_is_coerced_not_left_as_list():
+    """Chroma metadata only accepts scalars. If a model hands back a list for
+    a field we expect to be scalar (not one of the known _LIST_KEYS), it must
+    be coerced to a string, not passed through — a raw list here would crash
+    build_embed_payload's Chroma add()/upsert() call downstream."""
+    from vision import parse_vision_attributes
+    data = json.dumps({"caption": ["a", "b"], "scene": "outdoor"})
+    attrs = parse_vision_attributes(data)
+    assert isinstance(attrs["caption"], str)
+    assert attrs["caption"] == "a, b"
+
+
+def test_parse_scalar_field_with_unexpected_dict_is_coerced():
+    from vision import parse_vision_attributes
+    data = json.dumps({"mood": {"primary": "happy", "secondary": "excited"}})
+    attrs = parse_vision_attributes(data)
+    assert isinstance(attrs["mood"], str)
+    assert "happy" in attrs["mood"]
 
 
 def test_parse_new_scalar_fields():

@@ -10,11 +10,19 @@ import ctypes
 import json
 import os
 import sys
+import threading
 import time
 
 from constants import DATA_DIR
 
 TRASH_PATH = os.path.join(DATA_DIR, "trash.json")
+
+# Serializes the read-modify-write cycle around TRASH_PATH. Concurrent add()
+# calls for different image ids (e.g. a multi-select bulk delete racing
+# against a single-image delete, or the API thread vs. a job) can otherwise
+# lose one call's trash record entirely, defeating undo. Same-process only,
+# per this app's single-user-local-tool scope.
+_lock = threading.Lock()
 
 
 def _load() -> dict:
@@ -38,13 +46,14 @@ def _save(data: dict):
 
 
 def add(img_id: str, img_data: dict, file_deleted: bool = False):
-    data = _load()
-    data[img_id] = {
-        "entry": img_data,
-        "deleted_at": time.time(),
-        "file_deleted": file_deleted,
-    }
-    _save(data)
+    with _lock:
+        data = _load()
+        data[img_id] = {
+            "entry": img_data,
+            "deleted_at": time.time(),
+            "file_deleted": file_deleted,
+        }
+        _save(data)
 
 
 def list_items() -> dict:
@@ -53,24 +62,26 @@ def list_items() -> dict:
 
 def take(img_ids: list[str]) -> dict[str, dict]:
     """Remove the given ids from the trash and return {id: catalog entry}."""
-    data = _load()
-    out = {}
-    for iid in img_ids:
-        item = data.pop(iid, None)
-        if item:
-            out[iid] = item["entry"]
-    _save(data)
-    return out
+    with _lock:
+        data = _load()
+        out = {}
+        for iid in img_ids:
+            item = data.pop(iid, None)
+            if item:
+                out[iid] = item["entry"]
+        _save(data)
+        return out
 
 
 def purge(img_ids: list[str] | None = None) -> list[str]:
     """Drop entries permanently (all when img_ids is None). Returns dropped ids."""
-    data = _load()
-    ids = list(data.keys()) if img_ids is None else [i for i in img_ids if i in data]
-    for iid in ids:
-        del data[iid]
-    _save(data)
-    return ids
+    with _lock:
+        data = _load()
+        ids = list(data.keys()) if img_ids is None else [i for i in img_ids if i in data]
+        for iid in ids:
+            del data[iid]
+        _save(data)
+        return ids
 
 
 def delete_file_to_recycle_bin(path: str) -> bool:

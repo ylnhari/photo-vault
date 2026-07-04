@@ -1,6 +1,7 @@
 <script>
   import { api } from "./api.js";
   import { createEventDispatcher, onMount, onDestroy } from "svelte";
+  import { onActivateKey } from "./keyboard.js";
 
   // Either a single id, or an ordered list + starting index for navigation.
   export let id = null;
@@ -77,12 +78,38 @@
   function prev() { if (pos > 0) pos -= 1; }
   function close() { dispatch("close"); }
 
+  // ── focus trap ──────────────────────────────────────────────────────────
+  // Keeps Tab/Shift+Tab cycling within the dialog instead of leaking focus
+  // into the tab nav behind the dark overlay.
+  let boxEl;
+  function focusableEls() {
+    if (!boxEl) return [];
+    return [...boxEl.querySelectorAll(
+      'button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+    )].filter((el) => !el.disabled && el.getClientRects().length > 0);
+  }
+
   function onKey(e) {
     if (e.key === "Escape") { close(); }
     else if (e.key === "ArrowRight") { next(); }
     else if (e.key === "ArrowLeft") { prev(); }
+    else if (e.key === "Tab") {
+      const els = focusableEls();
+      if (!els.length) return;
+      const first = els[0], last = els[els.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault(); last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault(); first.focus();
+      }
+    }
   }
-  onMount(() => window.addEventListener("keydown", onKey));
+  onMount(() => {
+    window.addEventListener("keydown", onKey);
+    // Move focus into the dialog so it doesn't stay on whatever triggered it
+    // (a grid cell behind the overlay).
+    focusableEls()[0]?.focus();
+  });
   onDestroy(() => window.removeEventListener("keydown", onKey));
 
   async function remove(deleteFile) {
@@ -111,7 +138,7 @@
     <button class="nav next" on:click|stopPropagation={next} aria-label="Next">›</button>
   {/if}
 
-  <div class="box">
+  <div class="box" bind:this={boxEl} role="dialog" aria-modal="true" tabindex="-1">
     <button class="ghost close" on:click={close} aria-label="Close">✕</button>
     {#if list.length > 1}
       <div class="counter">{pos + 1} / {list.length}</div>
@@ -158,9 +185,13 @@
           {:else}
             <div class="simgrid">
               {#each similar as s (s.id)}
-                <img class="simthumb" src={api.thumbUrl(s.id)} alt={s.filename}
-                     title={s.caption || s.filename} loading="lazy" decoding="async"
-                     on:click={() => openSimilar(s)} />
+                <span class="simthumb-wrap" role="button" tabindex="0"
+                     title={s.caption || s.filename}
+                     on:click={() => openSimilar(s)}
+                     on:keydown={(e) => onActivateKey(e, () => openSimilar(s))}>
+                  <img class="simthumb" src={api.thumbUrl(s.id)} alt={s.filename}
+                       loading="lazy" decoding="async" />
+                </span>
               {/each}
             </div>
           {/if}
@@ -228,17 +259,21 @@
   .content { display: grid; grid-template-columns: 1.6fr 1fr; gap: 0; max-height: 90vh; }
   .imgwrap { background: #000; display: flex; align-items: center; justify-content: center; }
   .imgwrap img { max-width: 100%; max-height: 90vh; object-fit: contain; }
-  /* Extra top padding keeps the first metadata line clear of the ✕ button. */
-  .side { padding: 44px 24px 24px; overflow-y: auto; }
+  /* Extra top padding keeps the first metadata line clear of the ✕ button.
+     max-height must be set here (not just inherited from .content/.box) —
+     otherwise the grid row stretches to the panel's full content height and
+     .box's overflow:hidden clips the bottom instead of this scrolling. */
+  .side { padding: 44px 24px 24px; overflow-y: auto; max-height: 90vh; }
   @media (max-width: 700px) { .content { grid-template-columns: 1fr; } }
   .sm { padding: 5px 10px; font-size: 13px; }
   .muted { color: var(--muted); }
   .ok-text { color: var(--success); }
   .warn-text { color: var(--warn); }
   .simgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 10px; }
-  .simthumb { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px;
+  .simthumb-wrap { display: block; aspect-ratio: 1; border-radius: 6px; overflow: hidden;
     cursor: pointer; border: 1px solid var(--border); }
-  .simthumb:hover { outline: 2px solid var(--accent); }
+  .simthumb-wrap:hover, .simthumb-wrap:focus-visible { outline: 2px solid var(--accent); }
+  .simthumb { width: 100%; height: 100%; object-fit: cover; display: block; }
   .history-entry { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
   .history-model { font-size: 11px; color: var(--muted); font-family: monospace; margin-bottom: 4px; }
   .history-caption { font-size: 13px; line-height: 1.5; }

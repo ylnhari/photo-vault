@@ -1,5 +1,9 @@
 // Photo Vault service worker — app-shell + thumbnail caching for offline use.
-const CACHE = "pv-shell-v1";
+// Bump this version whenever cached response semantics change (e.g. the
+// server-side Cache-Control fix for thumbnails after the EXIF-orientation
+// bug) — the activate handler below purges any cache not matching the
+// current name, so a bump is what actually evicts stale entries.
+const CACHE = "pv-shell-v2";
 const ASSET_RE = /\/(assets|icon|manifest)/;
 
 self.addEventListener("install", () => self.skipWaiting());

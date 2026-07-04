@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import threading
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -10,6 +11,7 @@ from constants import (
     GEMINI_BASE,
     EMBEDDING_REGISTRY_PATH,
 )
+from vision import list_lm_studio_models_v0
 
 _GEMINI_EMBED_MODEL = "text-embedding-004"
 import time as _time
@@ -55,39 +57,74 @@ def collection_name_for(model_name: str) -> str:
 # ── Registry (persists all models ever used + active selection) ───────────────
 
 
-def _load_registry() -> dict:
-    if os.path.exists(EMBEDDING_REGISTRY_PATH):
-        with open(EMBEDDING_REGISTRY_PATH) as f:
-            return json.load(f)
+def _default_registry() -> dict:
     return {"active_model": None, "models": {}}
 
 
+def _load_registry() -> dict:
+    if os.path.exists(EMBEDDING_REGISTRY_PATH):
+        try:
+            with open(EMBEDDING_REGISTRY_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[embeddings] registry read failed ({e}); starting from an empty registry")
+    return _default_registry()
+
+
 def _save_registry(reg: dict):
-    os.makedirs(os.path.dirname(EMBEDDING_REGISTRY_PATH), exist_ok=True)
-    with open(EMBEDDING_REGISTRY_PATH, "w") as f:
+    """Atomic write: a crash/kill mid-write must never leave a truncated
+    registry file that _load_registry then fails to parse."""
+    d = os.path.dirname(EMBEDDING_REGISTRY_PATH) or "."
+    os.makedirs(d, exist_ok=True)
+    tmp_path = f"{EMBEDDING_REGISTRY_PATH}.tmp"
+    with open(tmp_path, "w") as f:
         json.dump(reg, f, indent=2)
+    os.replace(tmp_path, EMBEDDING_REGISTRY_PATH)
+
+
+# Guards the load-modify-save sequence in register_model/set_active_model — the
+# API thread and a background job thread can both hit these around the same
+# time, and an unlocked read-modify-write can silently lose one update.
+_registry_lock = threading.Lock()
 
 
 def register_model(source: str, model_name: str, dimension: int):
     """Record a model in the registry. Sets it as active if first model."""
-    reg = _load_registry()
-    if model_name not in reg["models"]:
-        reg["models"][model_name] = {
-            "source": source,
-            "dimension": dimension,
-            "collection": collection_name_for(model_name),
-            "first_used": datetime.now().isoformat(timespec="seconds"),
-        }
-        print(
-            f"[embeddings] Registered new model: {model_name} ({source}, {dimension}d)"
+    with _registry_lock:
+        reg = _load_registry()
+        existing = reg["models"].get(model_name)
+        if existing is None:
+            reg["models"][model_name] = {
+                "source": source,
+                "dimension": dimension,
+                "collection": collection_name_for(model_name),
+                "first_used": datetime.now().isoformat(timespec="seconds"),
+            }
+            print(
+                f"[embeddings] Registered new model: {model_name} ({source}, {dimension}d)"
+            )
+        elif existing.get("dimension") != dimension:
+            # Different dimension under the same model name would silently
+            # corrupt the collection (Chroma stores whatever vector it's
+            # given, and a mixed-dimension collection breaks similarity
+            # search for every vector already in it) — refuse instead of
+            # quietly registering/using the mismatched dimension. Callers
+            # (get_embedding/get_embeddings_batch) already catch exceptions
+            # from register_model and surface them as a normal per-item
+            # failure, so this doesn't crash the whole indexing pass.
+            raise RuntimeError(
+                f"Model '{model_name}' embedding dimension changed "
+                f"({existing.get('dimension')} -> {dimension}) — mixing vector "
+                "sizes in one collection would corrupt search results; "
+                "re-index required (use a fresh model name/collection)."
+            )
+        reg["models"].setdefault(model_name, {})["last_used"] = datetime.now().isoformat(
+            timespec="seconds"
         )
-    reg["models"][model_name]["last_used"] = datetime.now().isoformat(
-        timespec="seconds"
-    )
-    if reg["active_model"] is None:
-        reg["active_model"] = model_name
-        print(f"[embeddings] Active model set to: {model_name}")
-    _save_registry(reg)
+        if reg["active_model"] is None:
+            reg["active_model"] = model_name
+            print(f"[embeddings] Active model set to: {model_name}")
+        _save_registry(reg)
 
 
 def get_registry() -> dict:
@@ -99,13 +136,14 @@ def get_active_model() -> str | None:
 
 
 def set_active_model(model_name: str):
-    reg = _load_registry()
-    if model_name not in reg.get("models", {}):
-        raise ValueError(
-            f"Model '{model_name}' not in registry — index some photos with it first"
-        )
-    reg["active_model"] = model_name
-    _save_registry(reg)
+    with _registry_lock:
+        reg = _load_registry()
+        if model_name not in reg.get("models", {}):
+            raise ValueError(
+                f"Model '{model_name}' not in registry — index some photos with it first"
+            )
+        reg["active_model"] = model_name
+        _save_registry(reg)
 
 
 # ── Connection error detection ────────────────────────────────────────────────
@@ -129,10 +167,28 @@ def _is_connection_error(e: Exception) -> bool:
 # ── Provider implementations ──────────────────────────────────────────────────
 
 
+def _lm_embed_model_id() -> str | None:
+    """Best-effort id of the currently loaded LM Studio EMBEDDING model, using
+    the v0 API's real type/loaded-state info (mirrors vision._lm_model_id()'s
+    vision-model lookup). Returns None when the v0 API is unreachable or no
+    embeddings model is currently loaded — callers fall back to the plain
+    /v1/models heuristic (first entry, no type/state filtering) in that case."""
+    try:
+        v0 = list_lm_studio_models_v0()
+    except Exception:
+        v0 = []
+    for m in v0:
+        if m.get("state") == "loaded" and m.get("type") == "embeddings":
+            return m.get("id")
+    return None
+
+
 def _lm_studio_embed(text: str, model: str = None) -> tuple[list, str]:
-    """Embed via LM Studio /v1/embeddings. Uses `model` if given, else auto-detects."""
-    model_name = model or "lm_studio_embed"
-    if not model:
+    """Embed via LM Studio /v1/embeddings. Uses `model` if given, else prefers
+    the v0-API-reported loaded embeddings model, else the /v1/models heuristic."""
+    model_name = model or _lm_embed_model_id()
+    if not model_name:
+        model_name = "lm_studio_embed"
         try:
             req = urllib.request.Request(f"{LM_STUDIO_URL}/models")
             with urllib.request.urlopen(req, timeout=3) as r:
@@ -157,8 +213,9 @@ def _lm_studio_embed(text: str, model: str = None) -> tuple[list, str]:
 def _lm_studio_embed_batch(texts: list[str], model: str = None) -> tuple[list, str]:
     """Embed many texts in ONE /v1/embeddings call (the API takes a list).
     Returns (vectors in input order, model_name)."""
-    model_name = model or "lm_studio_embed"
-    if not model:
+    model_name = model or _lm_embed_model_id()
+    if not model_name:
+        model_name = "lm_studio_embed"
         try:
             req = urllib.request.Request(f"{LM_STUDIO_URL}/models")
             with urllib.request.urlopen(req, timeout=3) as r:
@@ -181,10 +238,41 @@ def _lm_studio_embed_batch(texts: list[str], model: str = None) -> tuple[list, s
     return [row["embedding"] for row in rows], model_name
 
 
+# Same cooldown-tracking pattern as vision._call_gemini/gemini_cooldowns(): Gemini
+# has no "remaining quota" endpoint, so a 429 is the only real signal. Embeddings
+# has no fallback chain *within* Gemini (single model), so this can't skip to a
+# sibling model like vision does — but it does stop hammering an already-limited
+# model immediately, and exposes cooldown state for the UI the same way.
+_gemini_embed_cooldown: dict[str, float] = {}
+_EMBED_RATE_LIMIT_COOLDOWN_SEC = 90
+
+
+def _mark_embed_rate_limited(model: str, retry_after: str | None = None):
+    delay = _EMBED_RATE_LIMIT_COOLDOWN_SEC
+    if retry_after:
+        try:
+            delay = max(delay, int(retry_after))
+        except ValueError:
+            pass
+    _gemini_embed_cooldown[model] = _time.time() + delay
+
+
+def gemini_embed_cooldowns() -> dict[str, float]:
+    """{model: seconds_remaining} for embedding models currently in a post-429 cooldown."""
+    now = _time.time()
+    return {
+        m: round(until - now, 1) for m, until in _gemini_embed_cooldown.items() if until > now
+    }
+
+
 def _gemini_embed(text: str, model: str = None) -> tuple[list, str]:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set")
     model_name = model or _GEMINI_EMBED_MODEL
+    if _gemini_embed_cooldown.get(model_name, 0) > _time.time():
+        raise RuntimeError(
+            f"Gemini embed model {model_name} in post-429 cooldown — skipping retry"
+        )
     url = f"{GEMINI_BASE}/models/{model_name}:embedContent?key={GEMINI_API_KEY}"
     payload = json.dumps(
         {
@@ -200,6 +288,8 @@ def _gemini_embed(text: str, model: str = None) -> tuple[list, str]:
             result = json.loads(r.read())
         return result["embedding"]["values"], model_name
     except urllib.error.HTTPError as e:
+        if e.code == 429:
+            _mark_embed_rate_limited(model_name, e.headers.get("Retry-After") if e.headers else None)
         raise RuntimeError(f"Gemini embed {e.code}: {e.read()[:200]}")
 
 
@@ -241,10 +331,14 @@ def get_embeddings_batch(
     texts: list[str], force_provider: str = "auto", model: str = None
 ) -> tuple[list | None, str, str]:
     """Batch variant of get_embedding: returns (vectors in input order,
-    model_name, source), or (None, '', 'error') on full failure. LM Studio
-    embeds the whole list in one request; Gemini has no batch endpoint on the
-    free tier, so it loops (still one provider decision for the whole batch,
-    keeping every vector in the same space)."""
+    model_name, source), or (None, '', 'error') on full failure.
+    LM Studio embeds the whole list in ONE request — a failure there fails the
+    whole chunk since there's no partial result to salvage from a single HTTP
+    call. Gemini has no batch endpoint on the free tier, so it loops one
+    request per text; a per-item failure there does NOT discard the rest of
+    the chunk — that slot in the returned list is None while every other text
+    still gets embedded, so callers must check for (and handle) None entries
+    whenever the overall result isn't None."""
     if not texts:
         return [], "", ""
 
@@ -252,8 +346,12 @@ def get_embeddings_batch(
         m = model if force_provider == "gemini" else None
         vecs, name = [], None
         for t in ts:
-            v, name = _gemini_embed(t, m)
-            vecs.append(v)
+            try:
+                v, name = _gemini_embed(t, m)
+                vecs.append(v)
+            except Exception as e:
+                print(f"[embeddings] gemini batch item error: {e}")
+                vecs.append(None)
         return vecs, name
 
     lm = ("lm_studio", lambda ts: _lm_studio_embed_batch(ts, model))
@@ -272,7 +370,10 @@ def get_embeddings_batch(
                 raise RuntimeError(
                     f"{source} returned {len(vectors)} vectors for {len(texts)} inputs"
                 )
-            register_model(source, model_name, len(vectors[0]))
+            dims = [len(v) for v in vectors if v is not None]
+            if not dims:
+                raise RuntimeError(f"{source} failed to embed every item in the batch")
+            register_model(source, model_name, dims[0])
             return vectors, model_name, source
         except Exception as e:
             if _is_connection_error(e):

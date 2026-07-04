@@ -135,3 +135,100 @@ def test_add_person_appends_does_not_overwrite_others(tmp_path):
 
     assert "Alice" in persons
     assert "Bob" in persons
+
+
+# ── add_person_reference: multi-face reference images (#13) ────────────────
+
+def test_add_person_skips_multi_face_reference_image(tmp_path):
+    """A reference image with more than one detected face (e.g. a group
+    photo used by mistake) must be skipped entirely, not blended in."""
+    from tagger import add_person_reference, get_person_embedding
+    person_map_path = tmp_path / "person_map.json"
+    _make_image(tmp_path, "solo.jpg")
+    _make_image(tmp_path, "group.jpg")
+
+    def fake_detect(path):
+        if "group" in path:
+            return [{"embedding": [1.0, 0.0]}, {"embedding": [0.0, 1.0]}]
+        return [{"embedding": [0.5, 0.5]}]
+
+    with patch("tagger.detect_and_embed_faces", side_effect=fake_detect), \
+         patch("tagger.PERSON_MAP_PATH", str(person_map_path)):
+        result = add_person_reference("Alice", str(tmp_path))
+
+    assert result["registered"] is True
+    assert result["faces_used"] == 1
+    assert len(result["skipped_multi_face"]) == 1
+    assert "group.jpg" in result["skipped_multi_face"][0]
+
+    with patch("tagger.PERSON_MAP_PATH", str(person_map_path)):
+        emb = get_person_embedding("Alice")
+    assert emb == [0.5, 0.5]
+
+
+def test_add_person_all_images_multi_face_registers_nothing(tmp_path):
+    from tagger import add_person_reference
+    person_map_path = tmp_path / "person_map.json"
+    _make_image(tmp_path, "group.jpg")
+
+    with patch("tagger.detect_and_embed_faces",
+               return_value=[{"embedding": [1.0, 0.0]}, {"embedding": [0.0, 1.0]}]), \
+         patch("tagger.PERSON_MAP_PATH", str(person_map_path)):
+        result = add_person_reference("Nobody", str(tmp_path))
+
+    assert result["registered"] is False
+    assert result["faces_used"] == 0
+    assert len(result["skipped_multi_face"]) == 1
+
+
+def test_add_person_reference_strips_name(tmp_path):
+    """#14: the name must be .strip()'d before storing, matching the
+    cluster-naming path's behavior."""
+    from tagger import add_person_reference, get_all_persons
+    person_map_path = tmp_path / "person_map.json"
+    _make_image(tmp_path)
+
+    with patch("tagger.detect_and_embed_faces", return_value=[{"embedding": [0.5, 0.5]}]), \
+         patch("tagger.PERSON_MAP_PATH", str(person_map_path)):
+        add_person_reference("  Alice  ", str(tmp_path))
+
+    with patch("tagger.PERSON_MAP_PATH", str(person_map_path)):
+        persons = get_all_persons()
+
+    assert persons == ["Alice"]
+
+
+# ── rename_person (#16) ──────────────────────────────────────────────────────
+
+def test_rename_person_strips_new_name(tmp_path):
+    from tagger import rename_person, get_all_persons
+    person_map_path = tmp_path / "person_map.json"
+    person_map_path.write_text(json.dumps({"Alice": [0.1, 0.2]}))
+
+    with patch("tagger.PERSON_MAP_PATH", str(person_map_path)):
+        rename_person("Alice", "  Alicia  ")
+        persons = get_all_persons()
+
+    assert persons == ["Alicia"]
+
+
+def test_rename_person_rejects_whitespace_only_new_name(tmp_path):
+    from tagger import rename_person
+    person_map_path = tmp_path / "person_map.json"
+    person_map_path.write_text(json.dumps({"Alice": [0.1, 0.2]}))
+
+    with patch("tagger.PERSON_MAP_PATH", str(person_map_path)):
+        with pytest.raises(ValueError):
+            rename_person("Alice", "   ")
+
+
+def test_rename_person_stripped_duplicate_is_rejected(tmp_path):
+    """A whitespace-padded name that would collide with an existing person
+    once stripped must be rejected, not silently create a near-duplicate."""
+    from tagger import rename_person
+    person_map_path = tmp_path / "person_map.json"
+    person_map_path.write_text(json.dumps({"Alice": [0.1, 0.2], "Bob": [0.3, 0.4]}))
+
+    with patch("tagger.PERSON_MAP_PATH", str(person_map_path)):
+        with pytest.raises(ValueError):
+            rename_person("Alice", "  Bob  ")

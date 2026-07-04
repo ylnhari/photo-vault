@@ -5,6 +5,7 @@
   import StatusPill from "./StatusPill.svelte";
   import JobPanel from "./JobPanel.svelte";
   import SectionHead from "./SectionHead.svelte";
+  import { onActivateKey } from "./keyboard.js";
   const dispatch = createEventDispatcher();
 
   // ── job / poll state ────────────────────────────────────────────────────────
@@ -13,6 +14,7 @@
   let busy = {};
   let err = "";
   let rechecking = false;
+  let stopRequesting = false;  // bound into JobPanel; reset on stop() failure so the button doesn't stick
 
   // ── provider model catalogue ─────────────────────────────────────────────────
   let pmodels = { lm_studio: [], lm_studio_types: {}, gemini_vision: [], gemini_embed: [], gemini_cooldowns: {} };
@@ -59,8 +61,15 @@
     // Job status first: when a job is running, the panel (with Stop) must
     // appear immediately — providerModels can take seconds while LM Studio
     // is busy doing inference, and everything below can arrive later.
-    job = await api.indexProgress();
-    if (job.active) startPolling();
+    // Wrapped so a transient failure here doesn't skip the Promise.all below
+    // and leave the whole tab blank.
+    try {
+      job = await api.indexProgress();
+      if (job.active) startPolling();
+    } catch (e) {
+      console.error("indexProgress failed on mount", e);
+      err = "Could not load job status.";
+    }
     await Promise.all([
       loadSettings(),
       loadFolderConfig(),
@@ -215,15 +224,32 @@
       else { await refreshStatus(); dispatch("indexed"); }
     } catch (e) { err = e.message; }
   }
-  async function stop() { job = await api.indexStop(); }
+  async function stop() {
+    try {
+      job = await api.indexStop();
+    } catch (e) {
+      // Return the button to a clickable state instead of leaving it stuck
+      // on "Stopping…" forever after a transient failure.
+      stopRequesting = false;
+      err = e.message;
+    }
+  }
   async function retry() {
     const type = job.type;
-    await api.indexReset();
     err = "";
-    try { job = await api.indexStart(buildCfg(type)); if (job.active) startPolling(); }
-    catch (e) { err = e.message; }
+    try {
+      await api.indexReset();
+      job = await api.indexStart(buildCfg(type));
+      if (job.active) startPolling();
+    } catch (e) { err = e.message; }
   }
-  async function clearJob() { await api.indexReset(); job = await api.indexProgress(); }
+  async function clearJob() {
+    err = "";
+    try {
+      await api.indexReset();
+      job = await api.indexProgress();
+    } catch (e) { err = e.message; }
+  }
 
   async function recheckHealth() {
     rechecking = true;
@@ -678,7 +704,7 @@
 
   <div style="margin-top:16px">
     {#if jobIs(job, "scan")}
-      <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+      <JobPanel {job} bind:stopRequested={stopRequesting} on:stop={stop} on:retry={retry} on:clear={clearJob} />
     {:else if running}
       <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
     {:else}
@@ -830,14 +856,18 @@
       <input type="checkbox" bind:checked={dupeDeleteFiles} style="width:auto" />
       also move duplicate files to the Recycle Bin
     </label>
+    {#if dupes.total_groups > 40}
+      <p class="hint" style="margin-top:6px">Showing 40 of {dupes.total_groups} duplicate groups.</p>
+    {/if}
     <div class="dupe-list">
       {#each dupes.groups.slice(0, 40) as g (g.photos[0].id)}
         <div class="dupe-group">
           <div class="dupe-thumbs">
             {#each g.photos.slice(0, 8) as p, pi}
-              <div class="dupe-cell" class:keeper={pi === 0} title={p.path}>
-                <img src={api.thumbUrl(p.id)} alt={p.filename} loading="lazy" decoding="async"
-                     on:click={() => dispatch("select", { id: p.id, ids: g.photos.map((x) => x.id) })} />
+              <div class="dupe-cell" class:keeper={pi === 0} title={p.path} role="button" tabindex="0"
+                   on:click={() => dispatch("select", { id: p.id, ids: g.photos.map((x) => x.id) })}
+                   on:keydown={(e) => onActivateKey(e, () => dispatch("select", { id: p.id, ids: g.photos.map((x) => x.id) }))}>
+                <img src={api.thumbUrl(p.id)} alt={p.filename} loading="lazy" decoding="async" />
                 {#if pi === 0}<span class="keep-badge">keep</span>{/if}
               </div>
             {/each}

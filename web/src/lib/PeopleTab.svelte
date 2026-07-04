@@ -2,6 +2,7 @@
   import { api } from "./api.js";
   import PhotoGrid from "./PhotoGrid.svelte";
   import { createEventDispatcher, onMount } from "svelte";
+  import { onActivateKey } from "./keyboard.js";
   export let indexedCount = 0;
   const dispatch = createEventDispatcher();
 
@@ -9,7 +10,9 @@
   let active = null;
   let results = [];
   let loadingFind = false;
+  let loading = true;
   let err = "";
+  let findSeq = 0;  // request-sequencing guard so out-of-order find() responses can't clobber each other
 
   let newName = "";
   let refDir = "";
@@ -26,9 +29,15 @@
   let rowBusy = {};
 
   onMount(async () => {
-    await refresh();
-    await loadFaceStatus();
-    await loadClusters();
+    // The three are independent of each other's results, so run them in
+    // parallel instead of a serial await chain (which delayed all three by
+    // the sum of their latencies and left the empty-state messages showing
+    // the whole time).
+    try {
+      await Promise.all([refresh(), loadFaceStatus(), loadClusters()]);
+    } finally {
+      loading = false;
+    }
   });
 
   async function refresh() {
@@ -104,11 +113,17 @@
 
   async function find(name) {
     active = name; loadingFind = true; results = [];
+    const seq = ++findSeq;
     // Empty query = person-only browse: the backend returns ALL of the
     // person's photos from the face index, not a semantic top-k intersection.
-    try { results = (await api.search("", {}, name)).results; }
-    catch (e) { err = e.message; }
-    loadingFind = false;
+    try {
+      const r = await api.search("", {}, name);
+      if (seq !== findSeq) return;  // a newer find() started; ignore this stale response
+      results = r.results;
+    } catch (e) {
+      if (seq === findSeq) err = e.message;
+    }
+    if (seq === findSeq) loadingFind = false;
   }
   async function register() {
     regBusy = true; regMsg = "";
@@ -157,9 +172,12 @@
         <div class="cluster">
           <div class="faces">
             {#each c.samples as s}
-              <img class="face" src={api.faceCropUrl(s.image_id, s.face_index)} alt="face"
-                   loading="lazy" decoding="async"
-                   on:click={() => dispatch("select", { id: s.image_id, ids: c.samples.map((x) => x.image_id) })} />
+              <span class="face-wrap" role="button" tabindex="0"
+                   on:click={() => dispatch("select", { id: s.image_id, ids: c.samples.map((x) => x.image_id) })}
+                   on:keydown={(e) => onActivateKey(e, () => dispatch("select", { id: s.image_id, ids: c.samples.map((x) => x.image_id) }))}>
+                <img class="face" src={api.faceCropUrl(s.image_id, s.face_index)} alt="face"
+                     loading="lazy" decoding="async" />
+              </span>
             {/each}
           </div>
           <div class="meta">{c.size} face{c.size === 1 ? "" : "s"}</div>
@@ -181,7 +199,9 @@
   <section class="card col" style="flex:1; min-width:0">
     <div class="section-label">Registered People</div>
     {#if err}<p style="color:var(--danger)">{err}</p>{/if}
-    {#if persons.length === 0}
+    {#if loading}
+      <p class="muted">Loading…</p>
+    {:else if persons.length === 0}
       <p class="muted">No people registered yet. Name a face group above, or add someone on the right.</p>
     {:else}
       {#if indexedCount === 0}
@@ -232,8 +252,9 @@
   .clusters { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; margin-top: 10px; }
   .cluster { border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
   .faces { display: flex; gap: 4px; flex-wrap: wrap; }
-  .face { width: 52px; height: 52px; object-fit: cover; border-radius: 6px; cursor: pointer; border: 1px solid var(--border); }
-  .face:hover { outline: 2px solid var(--accent); }
+  .face-wrap { display: inline-block; cursor: pointer; border-radius: 6px; }
+  .face-wrap:hover .face, .face-wrap:focus-visible { outline: 2px solid var(--accent); }
+  .face { width: 52px; height: 52px; object-fit: cover; border-radius: 6px; border: 1px solid var(--border); display: block; }
   .meta { font-size: 12px; color: var(--muted); margin-top: 6px; }
   .cluster input { flex: 1; min-width: 0; }
 </style>

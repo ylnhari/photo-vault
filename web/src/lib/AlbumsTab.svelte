@@ -2,12 +2,14 @@
   import { api } from "./api.js";
   import PhotoGrid from "./PhotoGrid.svelte";
   import { createEventDispatcher, onMount } from "svelte";
+  import { onActivateKey } from "./keyboard.js";
   const dispatch = createEventDispatcher();
 
   let albums = [];
   let err = "";
   let newName = "";
   let creating = false;
+  let loading = true;
 
   // detail view
   let openId = null;
@@ -19,7 +21,9 @@
   let resetToken = 0;
   let busy = false;
 
-  onMount(loadAlbums);
+  onMount(async () => {
+    try { await loadAlbums(); } finally { loading = false; }
+  });
   async function loadAlbums() {
     try { albums = (await api.albums()).albums; } catch (e) { err = e.message; }
   }
@@ -77,12 +81,14 @@
     </button>
   </div>
 
-  {#if albums.length === 0}
+  {#if loading}
+    <p class="muted">Loading…</p>
+  {:else if albums.length === 0}
     <p class="muted">No albums yet. Create one above, or select photos in Search and “Add to album”.</p>
   {:else}
     <div class="albumgrid">
       {#each albums as a (a.id)}
-        <div class="album" on:click={() => open(a)} on:keydown={(e) => e.key === "Enter" && open(a)}
+        <div class="album" on:click={() => open(a)} on:keydown={(e) => onActivateKey(e, () => open(a))}
              role="button" tabindex="0">
           <div class="cover">
             {#if a.cover}

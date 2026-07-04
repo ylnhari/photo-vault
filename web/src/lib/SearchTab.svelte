@@ -2,6 +2,7 @@
   import { api } from "./api.js";
   import PhotoGrid from "./PhotoGrid.svelte";
   import { createEventDispatcher, onMount } from "svelte";
+  import { lastDeleted } from "./stores.js";
   export let indexedCount = 0;
   const dispatch = createEventDispatcher();
 
@@ -56,9 +57,21 @@
     batchBusy = true; err = "";
     try {
       const idset = new Set(selectedIds);
-      await api.batchDelete(selectedIds, deleteFiles);
+      const res = await api.batchDelete(selectedIds, deleteFiles);
       if (results) results = results.filter((p) => !idset.has(p.id));
       recent = recent.filter((p) => !idset.has(p.id));
+      // Extend the same "hide everywhere" guarantee single delete gets via
+      // the Lightbox: write every deleted id into the shared store so any
+      // other mounted PhotoGrid (Timeline, Albums, People, Map) drops them too.
+      lastDeleted.set([...selectedIds]);
+      // Defensive: the API-layer agent is adding a files_failed (or similarly
+      // named) field to this response surfacing per-file disk-delete failures.
+      // Surface it if present; silently no-op if the backend hasn't shipped
+      // it yet so this doesn't block on that parallel work.
+      const failedCount = res?.files_failed?.length ?? res?.failed_files?.length ?? 0;
+      if (failedCount > 0) {
+        err = `${failedCount} file${failedCount === 1 ? "" : "s"} could not be deleted from disk, removed from index only.`;
+      }
       clearSelection();
       selectMode = false;
       deleteFiles = false;

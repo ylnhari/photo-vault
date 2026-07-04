@@ -2,11 +2,12 @@ import os
 import base64
 import io
 import json
+import re
 import time
 import urllib.request
 import urllib.error
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageOps
 import imaging  # noqa: F401 — registers HEIF opener + sets the pixel-bomb cap on import
 from constants import LM_STUDIO_URL, GEMINI_API_KEY, GEMINI_BASE, GEMINI_VISION_MODELS
 
@@ -57,6 +58,11 @@ def _get_lm_client():
 def encode_image(image_path, max_size=(1024, 1024)):
     try:
         with Image.open(image_path) as img:
+            # Without this, a portrait photo shot with a rotated sensor is
+            # handed to the model sideways — it then captions what it sees
+            # (e.g. people described as "lying down" who are actually
+            # standing in a correctly-oriented portrait photo).
+            img = ImageOps.exif_transpose(img)
             img.thumbnail(max_size)
             # JPEG can't encode alpha/palette modes (RGBA screenshots, P-mode
             # PNGs, LA) — convert or every such file fails vision entirely.
@@ -89,7 +95,10 @@ def _strip_markdown(text: str) -> str:
     if text.startswith("```"):
         parts = text.split("```")
         text = parts[1] if len(parts) >= 2 else text
-        text = text.lstrip("json").strip()
+        # Strip a leading language tag (e.g. "json", "JSON5") left over from the
+        # fence — lstrip(chars) strips individual characters, not the word, and
+        # would also eat any leading 'j'/'s'/'o'/'n' from real JSON content.
+        text = re.sub(r"^\s*json5?\s*\n?", "", text, count=1, flags=re.IGNORECASE)
     return text.strip()
 
 
@@ -481,6 +490,21 @@ def parse_vision_attributes(caption_json: str) -> dict:
                 defaults[key] = ", ".join(str(v) for v in val)
             elif not isinstance(val, str):
                 defaults[key] = ""
+        # Chroma metadata only accepts scalars (str/int/float/bool/None). A
+        # model can still hand back a list/dict for a field we expect to be
+        # scalar (e.g. "caption": ["a", "b"]) — coerce instead of letting that
+        # reach build_embed_payload and crash the Chroma add()/upsert() call.
+        for key, val in defaults.items():
+            if key in _LIST_KEYS or key == "person_count":
+                continue
+            if val is None or isinstance(val, (str, int, float, bool)):
+                continue
+            if isinstance(val, list):
+                defaults[key] = ", ".join(str(v) for v in val)
+            elif isinstance(val, dict):
+                defaults[key] = ", ".join(f"{k}: {v}" for k, v in val.items())
+            else:
+                defaults[key] = str(val)
     except Exception:
         pass
     return defaults

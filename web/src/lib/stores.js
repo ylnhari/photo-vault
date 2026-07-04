@@ -9,7 +9,9 @@ export const health = writable({
   loaded: false, lm_studio: false, gemini: false, gemini_key_set: false,
 });
 
-export const status = writable({
+// Shared shape so a failed refreshStatus() can reset to a clear "unknown"
+// state instead of leaving stale numbers in place (see refreshStatus below).
+const STATUS_DEFAULT = {
   loaded: false,
   stage: { total_scanned: 0, vision_done: 0, vision_pending: 0,
            active_model: null, active_model_embedded: 0, embed_pending: 0, models: {} },
@@ -19,14 +21,18 @@ export const status = writable({
     embed:  { selected_model: null, caption_source: null, eligible: 0, done: 0, pending: 0 },
   },
   settings: {},
-});
+};
+
+export const status = writable({ ...STATUS_DEFAULT });
 
 export const models = writable({ loaded: false, active: null, models: {} });
 
-// Id of the most recently deleted photo. PhotoGrid subscribes and hides it, so
-// every visible grid drops a photo deleted from the Lightbox without each tab
-// having to wire up its own removal handling.
-export const lastDeleted = writable(null);
+// Ids from the most recent delete operation (single photo from the Lightbox,
+// or a whole batch from a grid's multi-select). Always an array, even for a
+// single id — PhotoGrid subscribes and hides every id in it, so every visible
+// grid drops deleted photos without each tab having to wire up its own
+// removal handling.
+export const lastDeleted = writable([]);
 
 // Lightweight background-job status for the global header pill, so a running
 // index job is visible from every tab (the detailed panel lives in
@@ -37,7 +43,11 @@ export async function refreshJob() {
   try {
     const j = await api.indexProgress();
     jobStatus.set({ active: !!j.active, type: j.type, done: j.done, total: j.total });
-  } catch {}
+  } catch {
+    // Reset to a clear "unknown" shape rather than leaving stale progress
+    // numbers on screen when the server can't be reached.
+    jobStatus.set({ active: false, type: null, done: 0, total: 0 });
+  }
 }
 
 export async function refreshHealth() {
@@ -54,7 +64,9 @@ export async function refreshStatus() {
     const s = await api.status();
     status.set({ loaded: true, ...s });
   } catch {
-    status.update((v) => ({ ...v, loaded: true }));
+    // Reset to the default/unknown shape (like refreshHealth/refreshModels)
+    // instead of silently keeping stale counts presented as current.
+    status.set({ ...STATUS_DEFAULT, loaded: true });
   }
 }
 

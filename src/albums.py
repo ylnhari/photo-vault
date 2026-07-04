@@ -5,10 +5,18 @@ deleting an image removes it from all of them.
 """
 import os
 import json
+import threading
 import uuid
 from datetime import datetime
 
 from constants import ALBUMS_PATH, DATA_DIR
+
+# Serializes the read-modify-write cycle around ALBUMS_PATH so two
+# same-process callers (e.g. two tabs' API requests, or the job thread
+# deleting an image concurrently with a UI album edit) can't race and lose
+# one caller's update. Same-process only, per this app's
+# single-user-local-tool scope.
+_lock = threading.Lock()
 
 
 def _load() -> dict:
@@ -55,14 +63,15 @@ def create_album(name: str) -> dict:
     name = (name or "").strip()
     if not name:
         raise ValueError("album name is required")
-    data = _load()
-    aid = uuid.uuid4().hex[:12]
-    data["albums"][aid] = {
-        "name": name,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "image_ids": [],
-    }
-    _save(data)
+    with _lock:
+        data = _load()
+        aid = uuid.uuid4().hex[:12]
+        data["albums"][aid] = {
+            "name": name,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "image_ids": [],
+        }
+        _save(data)
     return {"id": aid, "name": name, "count": 0, "cover": None}
 
 
@@ -70,54 +79,59 @@ def rename_album(album_id: str, name: str):
     name = (name or "").strip()
     if not name:
         raise ValueError("album name is required")
-    data = _load()
-    if album_id not in data["albums"]:
-        raise KeyError(album_id)
-    data["albums"][album_id]["name"] = name
-    _save(data)
+    with _lock:
+        data = _load()
+        if album_id not in data["albums"]:
+            raise KeyError(album_id)
+        data["albums"][album_id]["name"] = name
+        _save(data)
 
 
 def delete_album(album_id: str) -> bool:
-    data = _load()
-    if album_id in data["albums"]:
-        del data["albums"][album_id]
-        _save(data)
-        return True
-    return False
+    with _lock:
+        data = _load()
+        if album_id in data["albums"]:
+            del data["albums"][album_id]
+            _save(data)
+            return True
+        return False
 
 
 def add_to_album(album_id: str, image_ids: list[str]) -> int:
-    data = _load()
-    if album_id not in data["albums"]:
-        raise KeyError(album_id)
-    current = data["albums"][album_id]["image_ids"]
-    seen = set(current)
-    for iid in image_ids:
-        if iid not in seen:
-            current.append(iid)
-            seen.add(iid)
-    _save(data)
-    return len(current)
+    with _lock:
+        data = _load()
+        if album_id not in data["albums"]:
+            raise KeyError(album_id)
+        current = data["albums"][album_id]["image_ids"]
+        seen = set(current)
+        for iid in image_ids:
+            if iid not in seen:
+                current.append(iid)
+                seen.add(iid)
+        _save(data)
+        return len(current)
 
 
 def remove_from_album(album_id: str, image_ids: list[str]) -> int:
-    data = _load()
-    if album_id not in data["albums"]:
-        raise KeyError(album_id)
-    rm = set(image_ids)
-    kept = [i for i in data["albums"][album_id]["image_ids"] if i not in rm]
-    data["albums"][album_id]["image_ids"] = kept
-    _save(data)
-    return len(kept)
+    with _lock:
+        data = _load()
+        if album_id not in data["albums"]:
+            raise KeyError(album_id)
+        rm = set(image_ids)
+        kept = [i for i in data["albums"][album_id]["image_ids"] if i not in rm]
+        data["albums"][album_id]["image_ids"] = kept
+        _save(data)
+        return len(kept)
 
 
 def remove_image_from_all(image_id: str):
     """Drop an image from every album (called when the image is deleted)."""
-    data = _load()
-    changed = False
-    for a in data["albums"].values():
-        if image_id in a["image_ids"]:
-            a["image_ids"] = [i for i in a["image_ids"] if i != image_id]
-            changed = True
-    if changed:
-        _save(data)
+    with _lock:
+        data = _load()
+        changed = False
+        for a in data["albums"].values():
+            if image_id in a["image_ids"]:
+                a["image_ids"] = [i for i in a["image_ids"] if i != image_id]
+                changed = True
+        if changed:
+            _save(data)

@@ -19,13 +19,19 @@ def _load_port(default: int = 8768) -> int:
         try:
             return int(env_port)
         except ValueError:
-            pass
+            print(f"[constants] PHOTO_VAULT_PORT={env_port!r} is not a valid "
+                  f"integer; falling back to ports.json/default.")
+    registry = os.path.join(os.path.dirname(PROJECT_ROOT), "ports.json")
     try:
-        registry = os.path.join(os.path.dirname(PROJECT_ROOT), "ports.json")
         with open(registry) as f:
             return int(json.load(f)["registry"]["photo-vault"]["port"])
-    except Exception:
-        return default
+    except FileNotFoundError:
+        print(f"[constants] ports.json not found at {registry}; using default port {default}.")
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"[constants] ports.json at {registry} is malformed ({e!r}); using default port {default}.")
+    except Exception as e:
+        print(f"[constants] could not read port from {registry} ({e!r}); using default port {default}.")
+    return default
 
 
 SERVER_PORT = _load_port()
@@ -43,7 +49,16 @@ def _load_env():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
-                    os.environ.setdefault(k.strip(), v.strip())
+                    k = k.strip()
+                    v = v.strip()
+                    # Standard .env convention: KEY="value" / KEY='value' —
+                    # strip one matching layer of surrounding quotes so the
+                    # literal quote characters don't end up embedded in the
+                    # value. Only strip when both ends match, so values that
+                    # legitimately contain a stray quote aren't mangled.
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                        v = v[1:-1]
+                    os.environ.setdefault(k, v)
 
 _load_env()
 

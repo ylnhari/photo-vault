@@ -33,10 +33,21 @@ def _record_caption_history(img_data: dict, model: str, text: str):
 
 
 def _path_under(path: str, folder: str) -> bool:
-    """True if path is exactly folder or is inside folder. Case-insensitive on Windows."""
-    p = os.path.normcase(path)
-    f = os.path.normcase(folder)
-    return p == f or p.startswith(f + os.sep) or p.startswith(f + "/")
+    """True if path is exactly folder or is inside folder. Case-insensitive on Windows.
+
+    normpath() is required, not just normcase(): for a drive-root folder like
+    "D:\\", Path.resolve() keeps the trailing separator, so a naive
+    f + os.sep comparison doubles up ("D:\\\\") and never matches real child
+    paths. normpath() collapses that trailing separator for every folder
+    except a bare drive root, so stripping any remaining trailing separator
+    before re-appending exactly one handles that edge case too.
+    """
+    p = os.path.normcase(os.path.normpath(path)) if path else ""
+    f = os.path.normcase(os.path.normpath(folder)) if folder else ""
+    if not p or not f:
+        return False
+    f_trimmed = f.rstrip(os.sep) or f
+    return p == f or p.startswith(f_trimmed + os.sep)
 
 
 # mtime-cached catalog read so hot paths (status polls, image serving, timeline)
@@ -154,6 +165,7 @@ class Indexer:
 
         aggregate = {"added": 0, "moved": 0, "unchanged": 0, "total": 0}
         per_folder = {}
+        all_moved_ids: list[str] = []
 
         for d in scan_dirs:
             d_norm = str(Path(d).resolve())
@@ -170,6 +182,7 @@ class Indexer:
             for k in ("added", "moved", "unchanged"):
                 aggregate[k] += s.get(k, 0)
             aggregate["total"] = s.get("total", aggregate["total"])
+            all_moved_ids.extend(s.get("moved_ids", []))
 
             # Update folder registry with latest scan stats
             update_scan_result(d_norm, s.get("scanned", 0))
@@ -177,7 +190,7 @@ class Indexer:
         self.image_catalog = self._load_image_catalog()
 
         if aggregate["moved"]:
-            aggregate["reconciled"] = self.reconcile_paths()
+            aggregate["reconciled"] = self.reconcile_paths(moved_ids=all_moved_ids or None)
 
         return {"per_folder": per_folder, **aggregate}
 
@@ -190,7 +203,7 @@ class Indexer:
         update_scan_result(folder, s.get("scanned", 0))
         self.image_catalog = self._load_image_catalog()
         if s.get("moved"):
-            self.reconcile_paths()
+            self.reconcile_paths(moved_ids=s.get("moved_ids") or None)
         return (f"+{s.get('added', 0)} new · {s.get('moved', 0)} moved · "
                 f"{s.get('unchanged', 0)} unchanged")
 
@@ -198,9 +211,14 @@ class Indexer:
         """Scanned-folder registry from images.json (legacy, kept for compat)."""
         return self.image_catalog.get("folders", {})
 
-    def reconcile_paths(self) -> int:
+    def reconcile_paths(self, moved_ids: list[str] | None = None) -> int:
         """After a scan that detected moved files, update the stored path in every
-        ChromaDB collection so search results still resolve to the new location."""
+        ChromaDB collection so search results still resolve to the new location.
+
+        moved_ids: when the caller knows exactly which ids moved (scan_directory
+        tracks this), fetch only those from Chroma instead of the whole
+        collection. Falls back to a full collection scan when unknown (e.g. an
+        older/foreign caller) — still correct, just O(collection size)."""
         catalog = self.image_catalog.get("images", {})
         reg = get_registry()
         client = db.client()
@@ -208,14 +226,25 @@ class Indexer:
         for model_name in reg.get("models", {}):
             try:
                 col = client.get_or_create_collection(name=collection_name_for(model_name))
-                res = col.get(include=["metadatas"])
+                if moved_ids:
+                    res = col.get(ids=moved_ids, include=["metadatas"])
+                else:
+                    res = col.get(include=["metadatas"])
+                # Collect every changed id/metadata pair and hand Chroma ONE
+                # update() call per collection instead of one per id — with a
+                # large collection and many moved files this turns an O(n)
+                # sequence of API round-trips into O(1) per scan.
+                changed_ids, changed_metas = [], []
                 for cid, meta in zip(res["ids"], res["metadatas"]):
                     cat = catalog.get(cid)
                     if cat and meta.get("path") != cat.get("path"):
                         meta["path"] = cat["path"]
                         meta["filename"] = cat.get("filename", "")
-                        col.update(ids=[cid], metadatas=[meta])
-                        fixed += 1
+                        changed_ids.append(cid)
+                        changed_metas.append(meta)
+                if changed_ids:
+                    col.update(ids=changed_ids, metadatas=changed_metas)
+                    fixed += len(changed_ids)
             except Exception as e:
                 print(f"[indexer] reconcile ({model_name}) warning: {e}")
         return fixed
@@ -294,11 +323,15 @@ class Indexer:
         return {"total": total, "detected": detected, "pending": total - detected}
 
     def detect_faces_one(self, img_id: str) -> str:
-        """Run face detection for one image and persist its face JSON. Raises on missing file."""
+        """Run face detection for one image and persist its face JSON.
+        Returns a 'skipped' note (not a failure, not a silent success) when the
+        file is missing/moved — same convention as thumb_one/dhash_one, so a
+        gap doesn't trip the job's consecutive-failure abort but also isn't
+        indistinguishable from real face-detection output."""
         img_data = self.image_catalog["images"][img_id]
         path = img_data.get("path", "")
         if not os.path.exists(path):
-            raise FileNotFoundError(f"file not on disk: {path}")
+            return "faces:skipped (file missing)"
         data = detect_and_embed_faces(path)
         save_face_data(img_id, data)
         index_faces(img_id, data)
@@ -445,7 +478,7 @@ class Indexer:
             "vision_pending": total - captioned,
             "active_model": active_model,
             "active_model_embedded": active_embedded,
-            "embed_pending": captioned - active_embedded,
+            "embed_pending": max(0, captioned - active_embedded),
             "models": model_stats,
         }
 
@@ -667,10 +700,10 @@ def resolve_caption_json(img_data: dict, caption_source_model: str = None) -> st
         raise RuntimeError("No caption available — run vision analysis first")
     try:
         parsed = json.loads(caption_json)
-        if parsed.get("error", ""):
-            raise RuntimeError(f"vision error: {parsed['error']}")
     except json.JSONDecodeError:
-        pass
+        raise RuntimeError("Stored caption is not valid JSON — cannot build an embedding from it")
+    if parsed.get("error", ""):
+        raise RuntimeError(f"vision error: {parsed['error']}")
     return caption_json
 
 
@@ -680,7 +713,7 @@ def build_embed_payload(img_data: dict, caption_json: str,
     attrs = parse_vision_attributes(caption_json)
     meta = img_data.get("metadata", {})
     date = meta.get("date", "")
-    year = date[:4] if date else "unknown"
+    year = date[:4] if date and len(date) >= 4 else "unknown"
     month = date[5:7] if len(date) >= 7 else "unknown"
     lat, lon = meta.get("gps_lat"), meta.get("gps_lon")
     place = geocode.place_for(lat, lon) if lat is not None and lon is not None else None
@@ -740,9 +773,14 @@ def _embed_one(img_id: str, img_data: dict, upsert: bool = False,
     collection = client.get_or_create_collection(name=collection_name_for(model_name))
 
     if detect_faces:
-        face_data = detect_and_embed_faces(img_data["path"])
-        save_face_data(img_id, face_data)
-        index_faces(img_id, face_data)
+        # Mirrors _run_embed_batched in jobs.py: a corrupt/unreadable image
+        # must not discard an already-successful text embedding for this id.
+        try:
+            face_data = detect_and_embed_faces(img_data["path"])
+            save_face_data(img_id, face_data)
+            index_faces(img_id, face_data)
+        except Exception as e:
+            print(f"[indexer] face detection failed for {img_id}: {e}")
 
     payload = build_embed_payload(img_data, caption_json, embed_source, model_name)
 
@@ -763,6 +801,13 @@ def _index_one(img_id: str, img_data: dict, upsert: bool = False, use_cached: bo
         text, vmodel = get_image_caption(
             img_data["path"], force_provider=vision_provider, with_model=True, model=vision_model
         )
+        # Same schema check compute_caption() (the "vision" job path) already
+        # does — without it, a bad/incomplete model response (missing keys, or
+        # not JSON at all) was silently accepted here and embedded with
+        # all-default attributes instead of failing loudly.
+        validation = validate_vision_output(text)
+        if not validation["valid"]:
+            raise RuntimeError(validation["warning"])
         _record_caption_history(img_data, vmodel, text)
     return _embed_one(img_id, img_data, upsert=upsert,
                       embed_provider=embed_provider, embed_model=embed_model,

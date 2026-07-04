@@ -1,5 +1,5 @@
 <script>
-  import { onMount, onDestroy, createEventDispatcher } from "svelte";
+  import { onMount, onDestroy, createEventDispatcher, tick } from "svelte";
   import { api } from "./api.js";
   import L from "leaflet";
   import "leaflet/dist/leaflet.css";
@@ -22,8 +22,11 @@
     } catch (e) { err = e.message; }
     loading = false;
     if (points.length) {
-      // wait a tick so the container has its height before Leaflet measures it
-      await Promise.resolve();
+      // Wait for Svelte to actually flush the DOM update that removes
+      // .mapwrap's class:hidden (a bare microtask doesn't guarantee that —
+      // tick() does), so the element has real layout dimensions before
+      // Leaflet measures it.
+      await tick();
       initMap();
     }
   });

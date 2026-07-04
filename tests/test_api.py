@@ -76,6 +76,48 @@ def test_search_post(client):
     assert cards[0]["filename"] == "a.jpg"
 
 
+def test_search_get_forwards_json_filters(client):
+    with patch("api.search_images", return_value={"ids": [[]], "metadatas": [[]]}) as si:
+        r = client.get("/api/search", params={"q": "x", "filters": '{"year": "2024"}'})
+    assert r.status_code == 200
+    assert si.call_args.kwargs["filters"] == {"year": "2024"}
+
+
+def test_search_get_rejects_malformed_filters_json(client):
+    r = client.get("/api/search", params={"q": "x", "filters": "not json"})
+    assert r.status_code == 400
+
+
+def test_search_unavailable_returns_503(client):
+    from search import SearchUnavailableError
+
+    with patch("api.search_images", side_effect=SearchUnavailableError("both providers down")):
+        r = client.get("/api/search", params={"q": "x"})
+    assert r.status_code == 503
+
+    with patch("api.search_images", side_effect=SearchUnavailableError("both providers down")):
+        r = client.post("/api/search", json={"q": "x"})
+    assert r.status_code == 503
+
+
+def test_search_surfaces_person_not_found_and_filter_error_flags(client):
+    res = {"ids": [[]], "metadatas": [[]], "person_not_found": True, "filter_error": True}
+    with patch("api.search_images", return_value=res):
+        r = client.post("/api/search", json={"q": "", "person": "Nobody"})
+    body = r.json()
+    assert body["person_not_found"] is True
+    assert body["filter_error"] is True
+
+
+def test_faces_name_stale_cluster_returns_409(client):
+    from clustering import ClusterMembersStaleError
+
+    with patch("api.clustering.cluster_mean_embedding",
+               side_effect=ClusterMembersStaleError(1)):
+        r = client.post("/api/faces/name", json={"cluster_id": 1, "name": "Alice"})
+    assert r.status_code == 409
+
+
 def test_filters(client):
     with patch(
         "api.get_available_filter_values",
@@ -444,8 +486,31 @@ def test_batch_delete_removes_each(client):
 def test_batch_delete_empty_is_noop(client):
     with patch("api.Indexer") as Idx:
         r = client.post("/api/images/delete", json={"ids": []})
-    assert r.json() == {"removed": 0, "files_removed": 0}
+    assert r.json() == {"removed": 0, "files_removed": 0, "files_failed": []}
     Idx.assert_not_called()
+
+
+def test_batch_delete_reports_failed_files_without_aborting(client):
+    """A failed on-disk delete for one item must not abort the whole batch
+    (that's the single-delete endpoint's stricter behavior) — it should soft-
+    delete the catalog entry anyway and surface the failure via files_failed."""
+    fake = MagicMock()
+    fake.image_catalog = {"images": {"a": {"path": "/p/a.jpg"}}}
+    fake.delete_image.return_value = None
+    with (
+        patch("api.Indexer", return_value=fake),
+        patch("api.os.path.exists", return_value=True),
+        patch("api._delete_file_recoverably", return_value=False),
+    ):
+        r = client.post(
+            "/api/images/delete", json={"ids": ["a"], "delete_file": True}
+        )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["removed"] == 1
+    assert body["files_removed"] == 0
+    assert body["files_failed"] == ["a"]
+    fake.delete_image.assert_called_once()
 
 
 def test_cleanup_missing(client):
@@ -470,7 +535,8 @@ def test_search_post_empty_q_preserved_for_person_browse(client):
 
 def test_add_person_no_faces_is_400(client):
     with patch("api.os.path.isdir", return_value=True), \
-         patch("api.add_person_reference", return_value=0):
+         patch("api.add_person_reference",
+                return_value={"registered": False, "faces_used": 0, "skipped_multi_face": []}):
         r = client.post("/api/people", json={"name": "Bob", "ref_dir": "C:/refs"})
     assert r.status_code == 400
     assert "no faces" in r.json()["detail"]
@@ -504,4 +570,246 @@ def test_similar_404_when_not_indexed(client):
     with patch("api.get_active_model", return_value="m"), \
          patch("api.db.collection", return_value=col):
         r = client.get("/api/similar?id=nope")
+    assert r.status_code == 404
+
+
+# ── audit fixes: bounded top_k / limit / samples query params (422, not 500) ──
+
+
+def test_search_get_rejects_non_positive_top_k(client):
+    r = client.get("/api/search", params={"q": "x", "top_k": 0})
+    assert r.status_code == 422
+    r2 = client.get("/api/search", params={"q": "x", "top_k": -5})
+    assert r2.status_code == 422
+
+
+def test_search_post_rejects_non_positive_top_k(client):
+    r = client.post("/api/search", json={"q": "x", "top_k": 0})
+    assert r.status_code == 422
+
+
+def test_similar_rejects_non_positive_top_k(client):
+    r = client.get("/api/similar", params={"id": "x", "top_k": -1})
+    assert r.status_code == 422
+
+
+def test_recent_rejects_non_positive_limit(client):
+    r = client.get("/api/recent", params={"limit": 0})
+    assert r.status_code == 422
+
+
+def test_duplicates_rejects_non_positive_limit(client):
+    r = client.get("/api/duplicates", params={"limit": -3})
+    assert r.status_code == 422
+
+
+def test_faces_clusters_rejects_out_of_range_samples(client):
+    assert client.get("/api/faces/clusters", params={"samples": 0}).status_code == 422
+    assert client.get("/api/faces/clusters", params={"samples": 21}).status_code == 422
+
+
+# ── audit fixes: /api/models/active validates against the registry ───────────
+
+
+def test_set_model_rejects_unknown_model(client):
+    with patch("api.set_active_model", side_effect=ValueError("not in registry")):
+        r = client.post("/api/models/active", json={"model": "typo-model"})
+    assert r.status_code == 400
+
+
+def test_set_model_accepts_known_model(client):
+    with patch("api.set_active_model") as sam:
+        r = client.post("/api/models/active", json={"model": "m1"})
+    assert r.status_code == 200
+    sam.assert_called_once_with("m1")
+
+
+# ── audit fixes: auth hardening ───────────────────────────────────────────────
+
+
+def test_docs_blocked_when_auth_enabled(client, monkeypatch):
+    monkeypatch.setenv("PV_REQUIRE_AUTH", "1")
+    assert client.get("/openapi.json").status_code == 401
+    assert client.get("/docs").status_code == 401
+
+
+def test_token_endpoint_rejects_non_loopback_client(monkeypatch):
+    """A request whose actual connection isn't loopback must not receive the
+    real bearer token even though /api/token is exempt from the bearer check
+    itself — that exemption exists only to bootstrap a loopback SPA."""
+    import api
+
+    monkeypatch.setenv("PV_REQUIRE_AUTH", "1")
+    remote = TestClient(api.app, client=("203.0.113.5", 40000))
+    r = remote.get("/api/token")
+    assert r.status_code == 403
+
+
+def test_token_endpoint_null_when_auth_disabled_regardless_of_client():
+    import api
+
+    remote = TestClient(api.app, client=("203.0.113.5", 40000))
+    r = remote.get("/api/token")
+    assert r.status_code == 200
+    assert r.json()["token"] is None
+
+
+# ── audit fixes: destructive-op defaults / consistency ────────────────────────
+
+
+def test_remove_folder_defaults_to_no_purge(client):
+    with (
+        patch("api.folder_mgr.remove_included", return_value={"status": "ok"}) as ri,
+        patch("api.Indexer") as Idx,
+    ):
+        r = client.request(
+            "DELETE", "/api/folders/include", params={"path": "/some/dir"}
+        )
+    assert r.status_code == 200
+    assert r.json()["images_purged"] == 0
+    Idx.assert_not_called()
+    ri.assert_called_once()
+
+
+def test_put_settings_explicit_null_clears_field(client):
+    """exclude_unset must let an explicit `null` clear a field, while an
+    omitted field leaves the stored value untouched — filtering by
+    `is not None` (the old behavior) could never distinguish the two."""
+    captured = {}
+    with patch("api.settings_mgr.update", side_effect=lambda p: captured.update(p) or p):
+        r = client.put("/api/settings", json={"vision_model": None})
+    assert r.status_code == 200
+    assert "vision_model" in captured
+    assert captured["vision_model"] is None
+    # A field never mentioned in the body must not appear in the patch at all.
+    assert "embed_model" not in captured
+
+
+def test_add_person_strips_whitespace(client):
+    with (
+        patch("api.os.path.isdir", return_value=True),
+        patch("api.add_person_reference",
+              return_value={"registered": True, "faces_used": 3, "skipped_multi_face": []}) as apr,
+    ):
+        r = client.post(
+            "/api/people", json={"name": "  Bob  ", "ref_dir": "  C:/refs  "}
+        )
+    assert r.status_code == 200
+    assert r.json()["name"] == "Bob"
+    apr.assert_called_once_with("Bob", "C:/refs")
+
+
+# ── audit fixes: orphaned/trash cleanup moved off DELETE-with-body ────────────
+
+
+def test_cleanup_orphaned_is_now_a_post(client):
+    fake = MagicMock()
+    fake.get_missing_files.return_value = [("a", {}), ("b", {})]
+    with patch("api.Indexer", return_value=fake):
+        r = client.post("/api/orphaned/cleanup", json={"ids": ["a"]})
+    assert r.status_code == 200
+    assert r.json()["removed"] == 1
+    # The old DELETE route must be gone, not silently still working.
+    assert client.delete("/api/orphaned").status_code == 405
+
+
+def test_trash_purge_is_now_a_post(client):
+    fake = MagicMock()
+    fake.purge_trash.return_value = 2
+    with patch("api.Indexer", return_value=fake):
+        r = client.post("/api/trash/purge", json={"ids": []})
+    assert r.status_code == 200
+    assert r.json()["purged"] == 2
+    assert client.delete("/api/trash").status_code == 405
+
+
+# ── audit fixes: timeline offset only meaningful with a year ─────────────────
+
+
+def test_timeline_offset_without_year_is_rejected(client):
+    with patch("api.load_catalog_cached", return_value={"images": {}}):
+        r = client.get("/api/timeline", params={"offset": 10})
+    assert r.status_code == 400
+
+
+def test_timeline_offset_with_year_still_works(client):
+    catalog = {
+        "images": {
+            "a": {"filename": "a.jpg", "path": "/a.jpg", "metadata": {"date": "2024:01:01"}},
+        }
+    }
+    with (
+        patch("api.load_catalog_cached", return_value=catalog),
+        patch("api.os.path.exists", return_value=True),
+    ):
+        r = client.get("/api/timeline", params={"year": "2024", "offset": 0})
+    assert r.status_code == 200
+    assert r.json()["year"] == "2024"
+
+
+# ── audit fix: face-crop applies EXIF transpose before cropping by bbox ───────
+
+
+def test_face_crop_applies_exif_transpose(client, tmp_path):
+    out_path = str(tmp_path / "face.webp")
+    legacy_path = str(tmp_path / "legacy.jpg")
+
+    class FakeImg:
+        size = (100, 100)
+
+        def convert(self, mode):
+            return self
+
+        def crop(self, box):
+            return self
+
+        def thumbnail(self, size):
+            pass
+
+        def save(self, path, fmt, quality=80):
+            with open(path, "wb") as f:
+                f.write(b"fake-webp-bytes")
+
+    fake_img = FakeImg()
+    cm = MagicMock()
+    cm.__enter__.return_value = fake_img
+    cm.__exit__.return_value = False
+
+    with (
+        patch("api.derivative_path", return_value=out_path),
+        patch("api.legacy_derivative_path", return_value=legacy_path),
+        patch("api._resolve_indexed_path", return_value="/fake/source.jpg"),
+        patch("api.load_face_data", return_value=[{"bbox": [10, 10, 50, 50]}]),
+        patch("api.safe_open", return_value=cm),
+        patch("api.ImageOps.exif_transpose", return_value=fake_img) as et,
+    ):
+        r = client.get(
+            "/api/faces/crop", params={"image_id": "abc", "face_index": 0}
+        )
+    assert r.status_code == 200
+    et.assert_called_once_with(fake_img)
+
+
+# ── audit fix: /api/image sets a real media_type instead of defaulting to text/plain ──
+
+
+def test_image_full_sets_webp_media_type(tmp_path, client):
+    real = tmp_path / "photo.webp"
+    real.write_bytes(b"RIFFfakewebpdata")
+    with patch("api._chroma_meta", return_value={"path": str(real)}):
+        r = client.get("/api/image", params={"id": "abc123", "size": "full"})
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/webp"
+
+
+# ── audit fix: _chroma_meta logs unexpected failures instead of silently
+#    collapsing them into "not indexed" ──────────────────────────────────────
+
+
+def test_meta_404_when_truly_not_indexed(client):
+    with patch("api.db.collection", side_effect=Exception("boom")):
+        r = client.get("/api/meta", params={"id": "nope"})
+    # Still surfaces as 404 (no distinct "not found" exception type exists in
+    # this Chroma usage pattern), but the failure is now logged server-side —
+    # exercised here via a plain call to confirm it doesn't crash the request.
     assert r.status_code == 404

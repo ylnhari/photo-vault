@@ -6,6 +6,8 @@ job). Grouping uses banding: two hashes within a small Hamming distance share
 at least one of four 16-bit bands, so candidates are found in O(n) instead of
 comparing all pairs, then verified with the real Hamming distance.
 """
+from PIL import ImageOps
+
 from imaging import safe_open
 
 # Hamming distance (out of 64 bits) at or under which two photos count as
@@ -16,6 +18,10 @@ DEFAULT_THRESHOLD = 6
 def dhash(image_path: str) -> str:
     """64-bit difference hash as a 16-char hex string. Raises on unreadable files."""
     with safe_open(image_path) as im:
+        # A camera original (EXIF rotation tag, unrotated pixels) and a
+        # WhatsApp/resave copy of the same photo (rotation baked into pixels,
+        # tag stripped) must hash identically to be recognized as duplicates.
+        im = ImageOps.exif_transpose(im)
         gray = im.convert("L").resize((9, 8))
     px = list(gray.getdata())
     bits = 0

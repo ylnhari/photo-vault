@@ -40,6 +40,25 @@ def main():
     # Loopback by default. Docker sets PV_BIND_HOST=0.0.0.0 (safe there because the
     # token auth above is enabled and the container network is isolated + port-mapped).
     host = os.environ.get("PV_BIND_HOST", "127.0.0.1")
+
+    # setdefault() above only protects the "PV_REQUIRE_AUTH unset" case.
+    # Nothing else stops someone from explicitly setting PV_BIND_HOST to a
+    # non-loopback address *and* PV_REQUIRE_AUTH to a falsy value at the same
+    # time, which would start an unauthenticated server reachable from any
+    # interface. Refuse to start rather than allow that combination silently.
+    # Mirror security.py's own truthiness check exactly (only the literal
+    # string "1" counts as enabled) so this guard can't disagree with what
+    # security.py will actually enforce at request time.
+    _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+    _require_auth = os.environ.get("PV_REQUIRE_AUTH", "0") == "1"
+    if host not in _LOOPBACK_HOSTS and not _require_auth:
+        raise RuntimeError(
+            f"Refusing to start: PV_BIND_HOST={host!r} is not loopback and "
+            f"PV_REQUIRE_AUTH is disabled. Binding a non-loopback host "
+            f"without auth would expose an unauthenticated API. Either bind "
+            f"to loopback or leave PV_REQUIRE_AUTH enabled."
+        )
+
     print(f"Photo Vault -> http://127.0.0.1:{port}   (Ctrl+C to stop)")
     uvicorn.run("api:app", host=host, port=port, reload=False)
 

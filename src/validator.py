@@ -1,11 +1,18 @@
 import urllib.request
 import urllib.error
-from constants import GEMINI_API_KEY, GEMINI_BASE
+from constants import GEMINI_API_KEY, GEMINI_BASE, LM_STUDIO_URL
 
 
-def check_lm_studio(url="http://localhost:1234") -> bool:
+def check_lm_studio(url: str | None = None) -> bool:
+    """Probe LM Studio's OpenAI-compatible /models endpoint. Defaults to
+    constants.LM_STUDIO_URL, which already includes the `/v1` suffix (and is
+    itself overridable via the LM_STUDIO_URL env var, e.g. for a Docker host)
+    — so the check respects the configurable host instead of hardcoding
+    localhost. Pass `url` only if it already includes the `/v1` (or
+    equivalent) suffix; it is not appended here."""
+    base = url if url is not None else LM_STUDIO_URL
     try:
-        urllib.request.urlopen(f"{url}/v1/models", timeout=3)
+        urllib.request.urlopen(f"{base}/models", timeout=3)
         return True
     except Exception:
         return False

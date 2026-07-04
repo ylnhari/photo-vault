@@ -5,7 +5,14 @@ unless overridden at job-start time.
 """
 import json
 import os
+import threading
 from constants import SETTINGS_PATH, DATA_DIR
+
+# Serializes the read-modify-write cycle in update() so two same-process
+# callers (e.g. the API thread and the job worker thread) can't race and
+# lose one caller's patch. Same-process only, per this app's
+# single-user-local-tool scope.
+_lock = threading.Lock()
 
 DEFAULTS: dict = {
     # Vision (captioning)
@@ -59,10 +66,11 @@ def save(settings: dict):
 
 
 def update(patch: dict) -> dict:
-    current = load()
-    current.update(patch)
-    save(current)
-    return current
+    with _lock:
+        current = load()
+        current.update(patch)
+        save(current)
+        return current
 
 
 def vision_model_label(settings: dict) -> str | None:

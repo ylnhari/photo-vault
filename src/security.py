@@ -16,8 +16,18 @@ TOKEN_PATH = os.path.join(DATA_DIR, ".auth_token")
 
 # /api paths reachable without a token even when auth is enabled:
 #  - health: harmless probe
-#  - token: how the dev SPA (served by Vite, no HTML injection) bootstraps
+#  - token: how the dev SPA (served by Vite, no HTML injection) bootstraps —
+#    but see is_loopback_client(): the endpoint itself still refuses to hand
+#    out the real token to a non-loopback caller.
 EXEMPT_API_PATHS = {"/api/health", "/api/token"}
+
+# A real ASGI server (uvicorn) always sets the actual peer address as the ASGI
+# scope's "client" tuple — a live network client can never make that host be
+# anything else. "testclient" is the fixed synthetic host Starlette's/httpx's
+# TestClient uses when no explicit client=(host, port) is passed; it only ever
+# appears inside this test harness, never in real traffic, so treating it as
+# loopback-equivalent doesn't weaken production security.
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 
 _token_cache: str | None = None
 
@@ -73,6 +83,15 @@ def request_authorized(authorization_header: str | None, query_token: str | None
     `_t` query param (used by <img> tags, which can't set headers).
     """
     return check_bearer(authorization_header) or token_matches(query_token)
+
+
+def is_loopback_client(host: str | None) -> bool:
+    """True when a request's ASGI client-address host is loopback (or the
+    test harness's synthetic host — see _LOOPBACK_HOSTS). Used to gate the
+    one-time bootstrap paths (GET /api/token, the token injected into
+    index.html) that would otherwise hand the bearer token to any network
+    client able to reach the app once it's exposed beyond loopback."""
+    return host in _LOOPBACK_HOSTS
 
 
 def is_safe_real_path(path: str) -> str | None:

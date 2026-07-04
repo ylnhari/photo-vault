@@ -25,8 +25,10 @@
 
   // Stop is honored between work items/batches — with slow local models the
   // in-flight batch can take minutes, so show an explicit "stopping" state
-  // instead of a Stop button that looks ignored.
-  let stopRequested = false;
+  // instead of a Stop button that looks ignored. Bindable so the parent can
+  // reset it back to false if the stop request itself fails (otherwise the
+  // button would stay stuck on "Stopping…" forever).
+  export let stopRequested = false;
   $: if (!job.active) stopRequested = false;  // reset once the job halts
   function requestStop() { stopRequested = true; dispatch("stop"); }
 
@@ -76,7 +78,7 @@
 
   {#if job.log?.length}
     <div class="log">
-      {#each job.log.slice(-12) as l (l.id + l.note)}
+      {#each job.log.slice(-12) as l, i (l.id + '-' + l.note + '-' + i)}
         <div class="line {l.kind}">
           <span class="dot">{l.kind === "fail" ? "❌" : l.kind === "cloud" ? "☁️" : "✅"}</span>
           <span class="fn" title={l.id}>{l.file || l.id.slice(0, 12)}</span>

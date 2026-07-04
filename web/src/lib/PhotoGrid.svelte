@@ -1,7 +1,7 @@
 <script>
   import { api } from "./api.js";
   import { lastDeleted } from "./stores.js";
-  import { createEventDispatcher } from "svelte";
+  import { createEventDispatcher, onDestroy } from "svelte";
   export let photos = [];
   export let cols = 5;
   export let selectMode = false;
@@ -11,11 +11,14 @@
   let selected = new Set();
   let lastIndex = -1;
 
-  // Hide photos deleted elsewhere (e.g. from the Lightbox) without requiring
-  // every parent tab to prune its own list.
+  // Hide photos deleted elsewhere (e.g. from the Lightbox, or a batch delete
+  // in another tab) without requiring every parent tab to prune its own list.
+  // lastDeleted is always an array — one id for a single delete, many for a
+  // batch delete — so every id from the most recent delete op gets hidden.
   let hidden = new Set();
-  $: if ($lastDeleted && !hidden.has($lastDeleted)) {
-    hidden = new Set([...hidden, $lastDeleted]);
+  $: if ($lastDeleted && $lastDeleted.length) {
+    const toAdd = $lastDeleted.filter((id) => !hidden.has(id));
+    if (toAdd.length) hidden = new Set([...hidden, ...toAdd]);
   }
   $: visible = photos.filter((p) => !hidden.has(p.id));
 
@@ -137,6 +140,13 @@
     if (dragMoved) suppressClick = true;  // swallow the click that follows a drag
     dragging = false; dragMoved = false;
   }
+
+  // If the component unmounts mid-drag (e.g. switching tabs while marquee-
+  // selecting), the window listeners added in onDown would otherwise leak.
+  onDestroy(() => {
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
+  });
 </script>
 
 {#if visible.length === 0}

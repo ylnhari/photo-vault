@@ -9,7 +9,7 @@ Import this once, early, anywhere a PIL Image.open may run on user files
 import hashlib
 import os
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from constants import THUMB_DIR
 
@@ -65,6 +65,11 @@ def ensure_derivative(src_path: str, out_path: str, max_px: int) -> bool:
         return True
     try:
         with safe_open(src_path) as im:
+            # Bake the EXIF orientation into the pixels now — the source's
+            # rotation tag doesn't survive into the resized WebP otherwise,
+            # so a portrait photo shot with a rotated sensor would render
+            # sideways forever with no metadata left to correct it.
+            im = ImageOps.exif_transpose(im)
             im = im.convert("RGB")
             im.thumbnail((max_px, max_px))
             im.save(out_path, "WEBP", quality=80, method=4)

@@ -35,6 +35,14 @@ def _connect(db_path: str) -> sqlite3.Connection:
         if conn is None:
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
             conn = sqlite3.connect(db_path, check_same_thread=False)
+            # Without this, sqlite3's default ~5s connect timeout means any
+            # contention (e.g. a concurrent writer holding the lock a beat
+            # too long) raises "database is locked" immediately instead of
+            # waiting — and that error used to feed straight into
+            # scanner.load_existing_data()'s catch-all, which treated it as
+            # "empty catalog" and wiped the DB on the next save. Give
+            # concurrent access a real window to wait and retry.
+            conn.execute("PRAGMA busy_timeout = 10000")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS images "

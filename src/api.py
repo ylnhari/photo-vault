@@ -5,8 +5,11 @@ embeddings / vision / faces / tagger). Serves the built Svelte SPA from web/dist
 in production. Run:  uv run uvicorn api:app --app-dir src --port <port>
 """
 
+import json
+import mimetypes
 import os
 import threading
+from contextlib import contextmanager
 from datetime import datetime as _dt
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -15,7 +18,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from PIL import ImageOps
+from pydantic import BaseModel, Field
 
 import imaging  # noqa: F401 — registers HEIF opener + pixel-bomb cap on import
 from imaging import (
@@ -38,7 +42,7 @@ from indexer import Indexer, catalog_path_for, load_catalog_cached
 
 # id is a content hash, so a given id's bytes never change → cache forever.
 _IMMUTABLE_CACHE = {"Cache-Control": "private, max-age=31536000, immutable"}
-from search import search_images, get_available_filter_values
+from search import search_images, get_available_filter_values, SearchUnavailableError
 from vision import (
     list_lm_studio_models,
     list_lm_studio_models_v0,
@@ -67,6 +71,7 @@ from faces import load_face_data, face_index_count, rebuild_face_index
 from validator import service_status
 from jobs import manager, JOB_TYPES
 import clustering
+from clustering import ClusterMembersStaleError
 import albums as albums_mgr
 import folders as folder_mgr
 import settings as settings_mgr
@@ -78,6 +83,15 @@ app = FastAPI(title="Photo Vault", version="1.0")
 # Mutual exclusion between a (synchronous) scan and the background index job:
 # both write to the catalog DB, so they must never run concurrently.
 _scan_active = threading.Event()
+
+# Held for the full duration of a multi-id destructive op (batch delete,
+# orphaned cleanup, trash purge) so a scan can't start mid-loop and resurrect
+# a row the op is in the middle of removing (see _reject_if_writer_active).
+_writer_active = threading.Event()
+
+# Guards atomic check-and-set across _scan_active / _writer_active so two
+# concurrent requests can never both observe "not active" and both proceed.
+_activity_lock = threading.Lock()
 
 # Reject requests whose Host header isn't a loopback name. This is the primary
 # defense against DNS-rebinding: a malicious page can point its domain at
@@ -114,12 +128,22 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
+# FastAPI's auto docs (/docs, /redoc, /openapi.json) don't go through /api/* and
+# would otherwise bypass the bearer-token check entirely — route them through
+# the same auth gate as the API itself when auth is required.
+_DOC_PATHS = {"/docs", "/redoc", "/openapi.json"}
+
+
 @app.middleware("http")
 async def _require_token(request: Request, call_next):
-    """Enforce the bearer token on /api/* when PV_REQUIRE_AUTH=1 (set by serve.py)."""
+    """Enforce the bearer token on /api/* (and the auto-docs routes) when
+    PV_REQUIRE_AUTH=1 (set by serve.py)."""
     if security.auth_enabled():
         path = request.url.path
-        if path.startswith("/api/") and path not in security.EXEMPT_API_PATHS:
+        needs_auth = (
+            path.startswith("/api/") and path not in security.EXEMPT_API_PATHS
+        ) or path in _DOC_PATHS
+        if needs_auth:
             authorized = security.request_authorized(
                 request.headers.get("authorization"),
                 request.query_params.get("_t"),
@@ -213,21 +237,48 @@ def _reject_if_writer_active():
     still can: scan checkpoints do a full sync (upsert its whole in-memory
     catalog + delete anything missing from it), so a scan holding a stale
     in-memory copy of a just-deleted id would write it right back. Refuse
-    instead of risking that."""
-    if _scan_active.is_set() or manager.status().get("active"):
+    instead of risking that. Also refuses while another multi-id destructive
+    op is already in flight (see _writer_guard) — this is a point-in-time
+    check, so callers doing more than one write must hold _writer_guard for
+    the duration rather than relying on this alone."""
+    if _scan_active.is_set() or _writer_active.is_set() or manager.status().get("active"):
         raise HTTPException(
             409, "a scan or indexing job is running; stop it before deleting"
         )
 
 
+@contextmanager
+def _writer_guard():
+    """Reserve exclusive writer access for the full duration of a multi-id
+    destructive operation (batch delete, orphaned cleanup, trash purge), not
+    just at entry. Holding _writer_active for the whole loop — atomically
+    checked-and-set alongside _scan_active — closes the race where a scan
+    starts partway through the loop and resurrects a row already removed by
+    an earlier iteration (see _reject_if_writer_active's docstring)."""
+    with _activity_lock:
+        _reject_if_writer_active()
+        _writer_active.set()
+    try:
+        yield
+    finally:
+        _writer_active.clear()
+
+
 def _chroma_meta(img_id: str) -> dict:
+    """Best-effort metadata lookup. db.collection() always get-or-creates the
+    collection and Chroma's .get() on an unknown id just returns an empty
+    list rather than raising, so there's no distinct "not found" exception to
+    special-case here — any exception reaching this point is a genuine,
+    unexpected failure (corruption, IO error, etc). Log it so it's
+    diagnosable server-side instead of silently and indistinguishably
+    collapsing into "not indexed" for the caller."""
     try:
         col = db.collection()
         res = col.get(ids=[img_id], include=["metadatas"])
         if res["ids"]:
             return res["metadatas"][0]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[api] chroma metadata lookup failed for {img_id}: {e}")
     return {}
 
 
@@ -321,7 +372,11 @@ def get_settings():
 
 @app.put("/api/settings")
 def put_settings(req: SettingsReq):
-    patch = {k: v for k, v in req.model_dump().items() if v is not None}
+    # exclude_unset (not "v is not None") distinguishes "field omitted" from
+    # "field explicitly set to null": an explicit null clears that setting
+    # back to its default/auto behavior, while an omitted field leaves the
+    # existing stored value untouched.
+    patch = req.model_dump(exclude_unset=True)
     return settings_mgr.update(patch)
 
 
@@ -342,33 +397,40 @@ def scan(req: ScanReq):
     """
     if manager.status().get("active"):
         raise HTTPException(409, "a job is running; stop it before scanning")
-    if _scan_active.is_set():
-        raise HTTPException(409, "a scan is already in progress")
 
-    dirs = [d.strip() for d in req.dirs if d.strip()]
+    # Atomic check-and-set: without the lock, two concurrent requests could
+    # both observe _scan_active clear and both proceed past the guard.
+    with _activity_lock:
+        if _writer_active.is_set():
+            raise HTTPException(
+                409, "a delete/cleanup operation is in progress; try again shortly"
+            )
+        if _scan_active.is_set():
+            raise HTTPException(409, "a scan is already in progress")
+        _scan_active.set()
 
-    if not dirs:
-        cfg = folder_mgr.ensure_defaults()
-        if not cfg.get("included"):
-            raise HTTPException(400, "No folders configured. Add a folder first.")
-        try:
-            return manager.start("scan")
-        except RuntimeError as e:
-            raise HTTPException(409, str(e))
-
-    # Explicit dirs: validate they exist on disk, scan synchronously
-    invalid = [d for d in dirs if not os.path.isdir(d)]
-    if invalid:
-        raise HTTPException(400, f"directories not found: {', '.join(invalid)}")
-    idx = Indexer(target_directories=dirs)
-
-    _scan_active.set()
     try:
+        dirs = [d.strip() for d in req.dirs if d.strip()]
+
+        if not dirs:
+            cfg = folder_mgr.ensure_defaults()
+            if not cfg.get("included"):
+                raise HTTPException(400, "No folders configured. Add a folder first.")
+            try:
+                return manager.start("scan")
+            except RuntimeError as e:
+                raise HTTPException(409, str(e))
+
+        # Explicit dirs: validate they exist on disk, scan synchronously
+        invalid = [d for d in dirs if not os.path.isdir(d)]
+        if invalid:
+            raise HTTPException(400, f"directories not found: {', '.join(invalid)}")
+        idx = Indexer(target_directories=dirs)
         summary = idx.scan_only()
         st = _status_dict(idx)
+        return {"summary": summary, **st}
     finally:
         _scan_active.clear()
-    return {"summary": summary, **st}
 
 
 def _status_dict(idx: Indexer = None) -> dict:
@@ -412,10 +474,12 @@ def add_folder(req: FolderReq):
 
 
 @app.delete("/api/folders/include")
-def remove_folder(path: str = Query(...), purge: bool = True):
+def remove_folder(path: str = Query(...), purge: bool = False):
     """
     Remove a folder from the included list.
-    When purge=true (default), also deletes all indexed data for images under that path.
+    When purge=true, also deletes all indexed data (captions/embeddings/faces)
+    for images under that path. Defaults to false — removing a folder from the
+    scan list is not implicitly destructive; pass purge=true to also wipe data.
     Returns {images_purged, config}.
     """
     path = path.strip()
@@ -482,24 +546,28 @@ def get_orphaned():
     }
 
 
-@app.delete("/api/orphaned")
+@app.post("/api/orphaned/cleanup")
 def cleanup_orphaned(req: OrphanedCleanupReq = None):
     """
     Remove orphaned images from the library. If req.ids is empty, removes all orphaned.
     Returns {removed: count}.
-    """
-    _reject_if_writer_active()
-    idx = Indexer()
-    if req and req.ids:
-        target_ids = set(req.ids)
-        to_delete = [
-            img_id for img_id, _ in idx.get_missing_files() if img_id in target_ids
-        ]
-    else:
-        to_delete = [img_id for img_id, _ in idx.get_missing_files()]
 
-    for img_id in to_delete:
-        idx.delete_image(img_id)
+    POST (not DELETE) because this takes a scoped id list in the body — some
+    HTTP clients/proxies strip bodies from DELETE requests, which would
+    silently turn a scoped cleanup into an all-orphaned wipe.
+    """
+    with _writer_guard():
+        idx = Indexer()
+        if req and req.ids:
+            target_ids = set(req.ids)
+            to_delete = [
+                img_id for img_id, _ in idx.get_missing_files() if img_id in target_ids
+            ]
+        else:
+            to_delete = [img_id for img_id, _ in idx.get_missing_files()]
+
+        for img_id in to_delete:
+            idx.delete_image(img_id)
 
     return {"removed": len(to_delete)}
 
@@ -511,6 +579,10 @@ def index_start(req: IndexReq):
         raise HTTPException(400, f"unknown job type: {req.type}")
     if _scan_active.is_set():
         raise HTTPException(409, "a scan is in progress; wait for it to finish")
+    if _writer_active.is_set():
+        raise HTTPException(
+            409, "a delete/cleanup operation is in progress; wait for it to finish"
+        )
     # Compute the vision model label used in caption_history (for model-aware pending queries)
     vml = None
     if req.vision_provider not in ("auto", None) and req.vision_model:
@@ -572,33 +644,70 @@ def filters():
     return get_available_filter_values()
 
 
+# Shared upper bound for any "how many results" query param — generous for a
+# personal-library-scale app while keeping a single malicious/typo'd value
+# from forcing a huge chroma fetch.
+_MAX_RESULT_LIMIT = 500
+
+
+def _search_response(res: dict | None) -> dict:
+    metas = res.get("metadatas", [[]])[0] if res else []
+    ids = res.get("ids", [[]])[0] if res else []
+    out = {"results": [_card(i, m) for i, m in zip(ids, metas)]}
+    if res:
+        if res.get("person_not_found"):
+            out["person_not_found"] = True
+        if res.get("filter_error"):
+            out["filter_error"] = True
+    return out
+
+
 @app.get("/api/search")
 def search(
     q: str = Query(""),
     person: str | None = None,
-    top_k: int = 200,
+    filters: str | None = None,
+    top_k: int = Query(200, ge=1, le=_MAX_RESULT_LIMIT),
 ):
+    # `filters` (GET only): optional JSON-encoded object, e.g.
+    # ?filters={"year":"2024"} — the POST route already accepted a filters
+    # body; GET previously had no way to filter at all.
+    filters_in = {}
+    if filters:
+        try:
+            parsed = json.loads(filters)
+            if isinstance(parsed, dict):
+                filters_in = {k: v for k, v in parsed.items() if v and v != "All"}
+        except json.JSONDecodeError:
+            raise HTTPException(400, "filters must be a JSON object")
     # Pass q through as-is: an empty q with a person set is the person-only
     # browse path (all their photos), which coercing q to "photo" would disable.
-    res = search_images(q, top_k=top_k, person=person or None)
-    metas = res.get("metadatas", [[]])[0] if res else []
-    ids = res.get("ids", [[]])[0] if res else []
-    return {"results": [_card(i, m) for i, m in zip(ids, metas)]}
+    try:
+        res = search_images(q, top_k=top_k, filters=filters_in, person=person or None)
+    except SearchUnavailableError as e:
+        raise HTTPException(503, f"search is temporarily unavailable: {e}")
+    return _search_response(res)
+
+
+class SearchReq(BaseModel):
+    q: str | None = ""
+    person: str | None = None
+    filters: dict = {}
+    top_k: int = Field(200, ge=1, le=_MAX_RESULT_LIMIT)
 
 
 @app.post("/api/search")
-def search_post(body: dict):
-    q = body.get("q") or ""
-    person = body.get("person") or None
+def search_post(body: SearchReq):
+    q = body.q or ""
+    person = body.person or None
     filters_in = {
-        k: v for k, v in (body.get("filters") or {}).items() if v and v != "All"
+        k: v for k, v in (body.filters or {}).items() if v and v != "All"
     }
-    res = search_images(
-        q, top_k=body.get("top_k", 200), filters=filters_in, person=person
-    )
-    metas = res.get("metadatas", [[]])[0] if res else []
-    ids = res.get("ids", [[]])[0] if res else []
-    return {"results": [_card(i, m) for i, m in zip(ids, metas)]}
+    try:
+        res = search_images(q, top_k=body.top_k, filters=filters_in, person=person)
+    except SearchUnavailableError as e:
+        raise HTTPException(503, f"search is temporarily unavailable: {e}")
+    return _search_response(res)
 
 
 def _card(img_id: str, meta: dict) -> dict:
@@ -709,7 +818,7 @@ def albums_remove(album_id: str, req: AlbumItemsReq):
 
 # ── recent / timeline ─────────────────────────────────────────────────────────
 @app.get("/api/recent")
-def recent(limit: int = 60):
+def recent(limit: int = Query(60, ge=1, le=_MAX_RESULT_LIMIT)):
     active = get_active_model()
     if not active:
         return {"results": []}
@@ -800,6 +909,14 @@ def timeline(year: str | None = None, offset: int = 0, limit: int = 60):
     Returning the whole catalog in one response was 2.4 MB / 4.4 s at 25k
     photos (an os.path.exists per photo) — pages keep both bounded.
     """
+    if year is None and offset:
+        # The all-years response is grouped per year (each capped at `limit`
+        # newest photos) — an offset into a flattened cross-year list isn't a
+        # meaningful operation on that shape, and the frontend never sends one
+        # without `year`. Reject rather than silently ignoring it, which used
+        # to make a caller believe pagination was honored when it wasn't.
+        raise HTTPException(400, "offset requires year to be specified")
+
     catalog = load_catalog_cached().get("images", {})
     by_year: dict[str, list] = {}
     for img_id, data in list(catalog.items()):
@@ -850,16 +967,21 @@ def people():
 
 @app.post("/api/people")
 def add_person(req: PersonReq):
-    if not req.name:
+    name = req.name.strip()
+    ref_dir = req.ref_dir.strip()
+    if not name:
         raise HTTPException(400, "name required")
-    if not os.path.isdir(req.ref_dir):
+    if not os.path.isdir(ref_dir):
         raise HTTPException(400, "reference folder not found")
-    faces_found = add_person_reference(req.name, req.ref_dir)
-    if not faces_found:
+    result = add_person_reference(name, ref_dir)
+    if not result.get("registered"):
         raise HTTPException(
             400, "no faces detected in the reference folder — person not registered"
         )
-    return {"ok": True, "name": req.name, "faces": faces_found}
+    out = {"ok": True, "name": name, "faces": result.get("faces_used", 0)}
+    if result.get("skipped_multi_face"):
+        out["skipped_multi_face"] = result["skipped_multi_face"]
+    return out
 
 
 class PersonRenameReq(BaseModel):
@@ -935,7 +1057,7 @@ def faces_cluster(req: ClusterReq):
 
 
 @app.get("/api/faces/clusters")
-def faces_clusters(samples: int = 6):
+def faces_clusters(samples: int = Query(6, ge=1, le=20)):
     """List clusters (excluding ignored) with a few sample faces each for review."""
     data = clustering.load_clusters()
     out = []
@@ -959,7 +1081,14 @@ def faces_name(req: NameClusterReq):
     """Name a cluster → register it as a person from its mean face embedding."""
     if not req.name.strip():
         raise HTTPException(400, "name required")
-    emb = clustering.cluster_mean_embedding(req.cluster_id)
+    try:
+        emb = clustering.cluster_mean_embedding(req.cluster_id)
+    except ClusterMembersStaleError:
+        raise HTTPException(
+            409,
+            "this cluster's photos have changed since it was grouped (re-detect "
+            "faces or re-cluster) — none of its members are valid anymore",
+        )
     if emb is None:
         raise HTTPException(404, "cluster not found or has no faces")
     add_person_embedding(req.name.strip(), emb)
@@ -990,6 +1119,12 @@ def face_crop(image_id: str = Query(...), face_index: int = 0):
         bbox = faces[face_index].get("bbox") or []
         try:
             with safe_open(path) as im:
+                # Apply EXIF orientation BEFORE computing/using the bbox — the
+                # bbox coordinates come from face detection, and must be read
+                # against the same (rotated) coordinate space the detector
+                # used, or a 90/270-degree-rotated photo crops the wrong
+                # region (width/height are swapped between the two spaces).
+                im = ImageOps.exif_transpose(im)
                 im = im.convert("RGB")
                 w, h = im.size
                 x1, y1, x2, y2 = bbox if len(bbox) == 4 else (0, 0, w, h)
@@ -1023,7 +1158,10 @@ def models():
 
 @app.post("/api/models/active")
 def set_model(req: ActiveModelReq):
-    set_active_model(req.model)
+    try:
+        set_active_model(req.model)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return {"active": req.model}
 
 
@@ -1053,6 +1191,31 @@ def _serve_derivative(img_id: str, suffix: str, max_px: int, src_path: str):
     if not ensure_derivative(src_path, out, max_px):
         return None
     return FileResponse(out, media_type="image/webp", headers=_IMMUTABLE_CACHE)
+
+
+_EXT_MIME = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
+
+
+def _guess_media_type(path: str) -> str:
+    """mimetypes.guess_type() can't resolve some extensions (notably .webp) on
+    every system, which used to leave FileResponse defaulting to text/plain
+    and breaking inline rendering. Check a small known-extension map first,
+    then fall back to mimetypes, then a generic binary type."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _EXT_MIME:
+        return _EXT_MIME[ext]
+    return mimetypes.guess_type(path)[0] or "application/octet-stream"
 
 
 def _placeholder_thumb() -> Response:
@@ -1086,11 +1249,15 @@ def image(id: str = Query(...), thumb: bool = False, size: str = "full"):
         raise HTTPException(404, "not an indexed photo, or file missing on disk")
 
     if size == "full":
-        return FileResponse(path, headers=_IMMUTABLE_CACHE)
+        return FileResponse(
+            path, media_type=_guess_media_type(path), headers=_IMMUTABLE_CACHE
+        )
 
     if size == "medium":
         resp = _serve_derivative(id, "_m", _MEDIUM_PX, path)
-        return resp or FileResponse(path, headers=_IMMUTABLE_CACHE)  # original fallback
+        return resp or FileResponse(
+            path, media_type=_guess_media_type(path), headers=_IMMUTABLE_CACHE
+        )  # original fallback
 
     # default: thumb
     resp = _serve_derivative(id, "", _THUMB_PX, path)
@@ -1098,7 +1265,7 @@ def image(id: str = Query(...), thumb: bool = False, size: str = "full"):
 
 
 @app.get("/api/similar")
-def similar(id: str = Query(...), top_k: int = 24):
+def similar(id: str = Query(...), top_k: int = Query(24, ge=1, le=_MAX_RESULT_LIMIT)):
     """Photos most similar to the given one, by its stored caption embedding
     in the active collection ('More like this')."""
     active = get_active_model()
@@ -1159,22 +1326,36 @@ def delete_image(id: str = Query(...), delete_file: bool = False):
 
 @app.post("/api/images/delete")
 def batch_delete(req: BatchDeleteReq):
-    """Soft-delete multiple images (files optionally to the Recycle Bin)."""
+    """Soft-delete multiple images (files optionally to the Recycle Bin).
+
+    Unlike the single-image DELETE (which aborts with a 500 when the on-disk
+    delete fails), a batch keeps soft-deleting the catalog entry even when the
+    file delete failed for one item — aborting the whole batch over one bad
+    file would be worse. `files_failed` surfaces those ids prominently at the
+    top level so a failed disk-delete is never buried in per-item results.
+    """
     if not req.ids:
-        return {"removed": 0, "files_removed": 0}
-    _reject_if_writer_active()
-    idx = Indexer()
-    removed = files_removed = 0
-    for img_id in req.ids:
-        path = idx.image_catalog.get("images", {}).get(img_id, {}).get("path")
-        file_deleted = False
-        if req.delete_file and path and os.path.exists(path):
-            file_deleted = _delete_file_recoverably(path)
-            if file_deleted:
-                files_removed += 1
-        idx.delete_image(img_id, to_trash=True, file_deleted=file_deleted)
-        removed += 1
-    return {"removed": removed, "files_removed": files_removed}
+        return {"removed": 0, "files_removed": 0, "files_failed": []}
+    with _writer_guard():
+        idx = Indexer()
+        removed = files_removed = 0
+        files_failed = []
+        for img_id in req.ids:
+            path = idx.image_catalog.get("images", {}).get(img_id, {}).get("path")
+            file_deleted = False
+            if req.delete_file and path and os.path.exists(path):
+                file_deleted = _delete_file_recoverably(path)
+                if file_deleted:
+                    files_removed += 1
+                else:
+                    files_failed.append(img_id)
+            idx.delete_image(img_id, to_trash=True, file_deleted=file_deleted)
+            removed += 1
+    return {
+        "removed": removed,
+        "files_removed": files_removed,
+        "files_failed": files_failed,
+    }
 
 
 # ── trash ─────────────────────────────────────────────────────────────────────
@@ -1211,18 +1392,24 @@ def trash_restore(req: TrashIdsReq):
     return {"restored": idx.restore_images(ids)}
 
 
-@app.delete("/api/trash")
+@app.post("/api/trash/purge")
 def trash_purge(req: TrashIdsReq = None):
-    """Permanently drop trashed entries (all when ids empty)."""
-    _reject_if_writer_active()
-    idx = Indexer(use_cache=True)  # purge doesn't touch the live catalog
-    return {"purged": idx.purge_trash(req.ids if req and req.ids else None)}
+    """Permanently drop trashed entries (all when ids empty).
+
+    POST (not DELETE) because this takes a scoped id list in the body — some
+    HTTP clients/proxies strip bodies from DELETE requests, which would
+    silently turn a scoped purge into an all-trash wipe.
+    """
+    with _writer_guard():
+        idx = Indexer(use_cache=True)  # purge doesn't touch the live catalog
+        purged = idx.purge_trash(req.ids if req and req.ids else None)
+    return {"purged": purged}
 
 
 # ── duplicates ────────────────────────────────────────────────────────────────
 @app.get("/api/duplicates")
 def duplicates(threshold: int = Query(dupes_mod.DEFAULT_THRESHOLD, ge=0, le=16),
-               limit: int = 100):
+               limit: int = Query(100, ge=1, le=_MAX_RESULT_LIMIT)):
     """Near-duplicate groups from the stored perceptual hashes (run the
     'dhash' job first). Photos in each group are largest-file-first."""
     catalog = load_catalog_cached().get("images", {})
@@ -1322,40 +1509,62 @@ def cleanup_missing():
 
 # ── auth bootstrap ────────────────────────────────────────────────────────────
 @app.get("/api/token")
-def token():
+def token(request: Request):
     """
     Hand the bearer token to the same-origin SPA. Exempt from the token check so
-    the dev SPA (served by Vite, with no HTML injection) can bootstrap. Reading
-    this cross-origin is blocked by the CORS allowlist, and DNS-rebinding by the
-    trusted-host check, so only the loopback SPA can obtain it.
+    the dev SPA (served by Vite, with no HTML injection) can bootstrap.
+
+    That exemption is exactly what makes this endpoint dangerous once the app
+    is reachable beyond loopback (PV_ALLOWED_HOSTS): CORS and the trusted-host
+    check both key off the Host *header*, which any direct (non-browser)
+    client can simply set to an allowed value — they don't stop a raw `curl`
+    from a remote box on the tailnet/LAN from hitting this route and reading
+    the token, defeating auth entirely. So when auth is required, only a
+    client whose actual connection originates from loopback gets the real
+    token; everyone else is refused outright rather than handed a token over
+    the same unauthenticated channel it's meant to protect. A remote client
+    must be provisioned the token some other way (copied in manually, or
+    baked in at build time).
     """
-    return {"token": security.get_token() if security.auth_enabled() else None}
+    if not security.auth_enabled():
+        return {"token": None}
+    client_host = request.client.host if request.client else None
+    if not security.is_loopback_client(client_host):
+        raise HTTPException(
+            403, "token bootstrap is only available to loopback clients"
+        )
+    return {"token": security.get_token()}
 
 
 # ── static SPA (production build) ─────────────────────────────────────────────
 _DIST = os.path.join(PROJECT_ROOT, "web", "dist")
 
 
-def _index_html_with_token() -> str:
+def _index_html_with_token(request: Request) -> str:
     """Read the built index.html and inject the per-install token so the SPA can
-    authenticate same-origin without an extra round-trip."""
+    authenticate same-origin without an extra round-trip. Same loopback
+    restriction as GET /api/token, and for the same reason: a non-loopback
+    request gets the page without the token embedded (the SPA then simply
+    can't bootstrap over /api/token either — see above)."""
     with open(os.path.join(_DIST, "index.html"), encoding="utf-8") as f:
         html = f.read()
     if security.auth_enabled():
-        inject = f"<script>window.__PV_TOKEN__={security.get_token()!r};</script>"
-        html = html.replace("</head>", inject + "</head>", 1)
+        client_host = request.client.host if request.client else None
+        if security.is_loopback_client(client_host):
+            inject = f"<script>window.__PV_TOKEN__={security.get_token()!r};</script>"
+            html = html.replace("</head>", inject + "</head>", 1)
     return html
 
 
 if os.path.isdir(_DIST):
 
     @app.get("/", response_class=HTMLResponse)
-    def _spa_index():
-        return HTMLResponse(_index_html_with_token())
+    def _spa_index(request: Request):
+        return HTMLResponse(_index_html_with_token(request))
 
     @app.get("/index.html", response_class=HTMLResponse)
-    def _spa_index_html():
-        return HTMLResponse(_index_html_with_token())
+    def _spa_index_html(request: Request):
+        return HTMLResponse(_index_html_with_token(request))
 
     # All other static assets (hashed JS/CSS) served verbatim.
     app.mount("/", StaticFiles(directory=_DIST, html=True), name="spa")

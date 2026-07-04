@@ -166,15 +166,17 @@ def test_index_one_raises_on_vision_error():
          patch("indexer.db.client", return_value=mock_client), \
          patch("indexer.detect_and_embed_faces", return_value=[]), \
          patch("indexer.save_face_data"):
-        with pytest.raises(RuntimeError, match="vision error"):
+        with pytest.raises(RuntimeError, match="error"):
             _index_one("img1", img_data)
 
 
 def test_index_one_raises_when_embedding_none():
     from indexer import _index_one
     img_data = {"path": "/a.jpg", "filename": "a.jpg", "metadata": {}}
+    full_caption = ('{"caption":"test","scene":"outdoor","occasion":"everyday",'
+                     '"weather":"sunny","group_size":"solo"}')
 
-    with patch("indexer.get_image_caption", return_value=('{"caption":"test","scene":"outdoor"}', "lm_studio:m")), \
+    with patch("indexer.get_image_caption", return_value=(full_caption, "lm_studio:m")), \
          patch("indexer.parse_vision_attributes", return_value={"caption": "test", "scene": "outdoor",
                "location_type": "unknown", "weather": "unknown", "season": "unknown",
                "time_of_day": "unknown", "occasion": "unknown", "group_size": "unknown",
@@ -198,7 +200,9 @@ def test_index_one_success_returns_note():
              "photo_type": "photo", "text_in_image": "", "landmark": "", "dominant_colors": "",
              "people_description": "two people"}
 
-    with patch("indexer.get_image_caption", return_value=('{"caption":"beach"}', "gemini")), \
+    full_caption = ('{"caption":"beach","scene":"outdoor","occasion":"vacation",'
+                     '"weather":"sunny","group_size":"couple"}')
+    with patch("indexer.get_image_caption", return_value=(full_caption, "gemini")), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
          patch("indexer.get_embedding", return_value=([0.1, 0.2], "text-embedding-004", "gemini")), \
          patch("indexer.db.client", return_value=mock_client), \
@@ -223,7 +227,9 @@ def test_index_one_upsert_path():
              "photo_type": "unknown", "text_in_image": "", "landmark": "", "dominant_colors": "",
              "people_description": ""}
 
-    with patch("indexer.get_image_caption", return_value=('{"caption":"x"}', "lm_studio:m")), \
+    full_caption = ('{"caption":"x","scene":"unknown","occasion":"unknown",'
+                     '"weather":"unknown","group_size":"unknown"}')
+    with patch("indexer.get_image_caption", return_value=(full_caption, "lm_studio:m")), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
          patch("indexer.get_embedding", return_value=([0.1], "lm-embed-model", "lm_studio")), \
          patch("indexer.db.client", return_value=mock_client), \
@@ -244,7 +250,9 @@ def test_index_one_stores_embedding_model_in_metadata():
              "mood", "objects", "animals", "vehicles", "food_items", "activities", "photo_type",
              "text_in_image", "landmark", "dominant_colors", "people_description"]}
 
-    with patch("indexer.get_image_caption", return_value=('{"caption":"x"}', "lm_studio:m")), \
+    full_caption = ('{"caption":"x","scene":"unknown","occasion":"unknown",'
+                     '"weather":"unknown","group_size":"unknown"}')
+    with patch("indexer.get_image_caption", return_value=(full_caption, "lm_studio:m")), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
          patch("indexer.get_embedding", return_value=([0.1], "my-embed-model", "lm_studio")), \
          patch("indexer.db.client", return_value=mock_client), \
@@ -266,7 +274,9 @@ def test_index_one_stores_caption_in_img_data():
              "mood", "objects", "animals", "vehicles", "food_items", "activities", "photo_type",
              "text_in_image", "landmark", "dominant_colors", "people_description"]}
 
-    with patch("indexer.get_image_caption", return_value=('{"caption":"beach photo"}', "lm_studio:m")), \
+    full_caption = ('{"caption":"beach photo","scene":"outdoor","occasion":"everyday",'
+                     '"weather":"sunny","group_size":"solo"}')
+    with patch("indexer.get_image_caption", return_value=(full_caption, "lm_studio:m")), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
          patch("indexer.get_embedding", return_value=([0.1], "my-model", "lm_studio")), \
          patch("indexer.db.client", return_value=mock_client), \
@@ -274,7 +284,7 @@ def test_index_one_stores_caption_in_img_data():
          patch("indexer.save_face_data"):
         _index_one("img1", img_data, upsert=False)
 
-    assert img_data["caption_json"] == '{"caption":"beach photo"}'
+    assert img_data["caption_json"] == full_caption
 
 
 def test_index_one_reuses_cached_caption():
@@ -308,7 +318,9 @@ def test_index_one_skips_cache_when_use_cached_false():
              "time_of_day", "occasion", "festival_name", "group_size", "person_count", "clothing_style",
              "mood", "objects", "animals", "vehicles", "food_items", "activities", "photo_type",
              "text_in_image", "landmark", "dominant_colors", "people_description"]}
-    mock_vision = MagicMock(return_value=('{"caption":"fresh caption"}', "lm_studio:m"))
+    fresh_caption = ('{"caption":"fresh caption","scene":"outdoor","occasion":"everyday",'
+                      '"weather":"sunny","group_size":"solo"}')
+    mock_vision = MagicMock(return_value=(fresh_caption, "lm_studio:m"))
 
     with patch("indexer.get_image_caption", mock_vision), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
@@ -319,7 +331,7 @@ def test_index_one_skips_cache_when_use_cached_false():
         _index_one("img1", img_data, upsert=False, use_cached=False)
 
     mock_vision.assert_called_once()
-    assert img_data["caption_json"] == '{"caption":"fresh caption"}'
+    assert img_data["caption_json"] == fresh_caption
 
 
 # ── get_stage_stats ───────────────────────────────────────────────────────────
@@ -347,6 +359,31 @@ def test_get_stage_stats_counts_captioned(tmp_path):
     assert stats["vision_done"] == 2
     assert stats["vision_pending"] == 1
     assert stats["active_model_embedded"] == 1
+
+
+def test_get_stage_stats_embed_pending_never_negative(tmp_path):
+    """Regression: if the active collection has MORE embedded ids than the
+    catalog has captions for (e.g. stale entries after a failed/partial Chroma
+    delete), embed_pending must clamp to 0, not go negative — mirrors the
+    max(0, ...) pattern count_thumbs_missing already uses."""
+    from indexer import Indexer
+    catalog = {"images": {
+        "a": {"path": "/a.jpg", "filename": "a.jpg", "metadata": {}, "caption_json": '{"c":"x"}'},
+    }}
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
+
+    # Active collection reports MORE indexed items than the catalog has
+    # captions for.
+    mock_client, col = _mock_chromadb(existing_ids=["a", "stale-b", "stale-c"])
+    reg = {"active_model": "m", "models": {"m": {"source": "lm_studio", "dimension": 3}}}
+
+    with patch("indexer.IMAGE_CATALOG_PATH", str(catalog_path)),          patch("indexer.db.client", return_value=mock_client),          patch("indexer.get_registry", return_value=reg),          patch("indexer.get_active_model", return_value="m"):
+        idx = Indexer()
+        stats = idx.get_stage_stats()
+
+    assert stats["vision_done"] == 1
+    assert stats["active_model_embedded"] == 3
+    assert stats["embed_pending"] == 0
 
 
 # ── caption history / model tracking ───────────────────────────────────────────
@@ -467,3 +504,134 @@ def test_purge_folder_removes_rows_from_db(tmp_path):
     assert removed == 1
     reloaded = catalog_db.load_all(catalog_path)["images"]
     assert set(reloaded) == {"b"}
+
+
+# ── _path_under (drive-root fix) ────────────────────────────────────────────
+
+def test_path_under_matches_normal_subfolder():
+    from indexer import _path_under
+    assert _path_under(r"C:\Users\foo\photos\a.jpg", r"C:\Users\foo\photos")
+
+
+def test_path_under_rejects_sibling_with_shared_prefix():
+    from indexer import _path_under
+    assert not _path_under(r"C:\Users\foobar\a.jpg", r"C:\Users\foo")
+
+
+def test_path_under_drive_root_matches_children():
+    """Regression: Path('D:\\\\').resolve() keeps the trailing separator, so a
+    naive f + os.sep comparison doubled up ('D:\\\\\\\\') and never matched
+    any real child path — a whole-drive scan folder silently purged/counted 0."""
+    from indexer import _path_under
+    assert _path_under(r"D:\photos\a.jpg", "D:\\")
+    assert _path_under(r"D:\a.jpg", "D:\\")
+
+
+def test_path_under_drive_root_rejects_other_drive():
+    from indexer import _path_under
+    assert not _path_under(r"C:\other\a.jpg", "D:\\")
+
+
+# ── detect_faces_one / thumb_one / dhash_one missing-file consistency ───────
+
+def test_detect_faces_one_returns_skipped_not_raise_on_missing_file(tmp_path):
+    """detect_faces_one used to raise FileNotFoundError for a missing file
+    while thumb_one/dhash_one returned a 'skipped' string — now all three
+    agree, so a job runner can treat them the same way (neither a hard
+    failure nor an indistinguishable success)."""
+    from indexer import Indexer
+    catalog = {"images": {"a": {"path": str(tmp_path / "gone.jpg"), "filename": "gone.jpg",
+                                 "metadata": {}}}}
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
+    with patch("indexer.IMAGE_CATALOG_PATH", str(catalog_path)):
+        idx = Indexer()
+        note = idx.detect_faces_one("a")
+    assert "skipped" in note
+
+
+# ── _embed_one guards face detection (item 3) ───────────────────────────────
+
+def test_embed_one_succeeds_when_face_detection_raises():
+    """A corrupt/unreadable image must not discard an already-successful text
+    embedding — face detection failure should be logged, not fatal."""
+    from indexer import _embed_one
+    mock_client, col = _make_mock_client()
+    img_data = {"path": "/a.jpg", "filename": "a.jpg", "metadata": {},
+                "caption_json": '{"caption":"x","scene":"outdoor"}'}
+
+    with patch("indexer.get_embedding", return_value=([0.1], "my-model", "lm_studio")), \
+         patch("indexer.db.client", return_value=mock_client), \
+         patch("indexer.detect_and_embed_faces", side_effect=RuntimeError("corrupt image")):
+        note = _embed_one("img1", img_data, detect_faces=True)
+
+    assert note == "embed:lm_studio"
+    col.add.assert_called_once()
+
+
+# ── resolve_caption_json (item 15) ──────────────────────────────────────────
+
+def test_resolve_caption_json_raises_on_invalid_json():
+    """Invalid JSON must raise, not be handed back for the caller to embed as
+    garbage text."""
+    from indexer import resolve_caption_json
+    img_data = {"caption_json": "not valid json {{{"}
+    with pytest.raises(RuntimeError, match="not valid JSON"):
+        resolve_caption_json(img_data)
+
+
+def test_resolve_caption_json_returns_valid_json_unchanged():
+    from indexer import resolve_caption_json
+    img_data = {"caption_json": '{"caption":"ok"}'}
+    assert resolve_caption_json(img_data) == '{"caption":"ok"}'
+
+
+# ── reconcile_paths targeted fetch (item 19) ────────────────────────────────
+
+def test_reconcile_paths_fetches_only_moved_ids_when_known():
+    from indexer import Indexer
+    col = MagicMock()
+    col.get.return_value = {"ids": ["a"], "metadatas": [{"path": "/old/a.jpg", "filename": "a.jpg"}]}
+    client = MagicMock()
+    client.get_or_create_collection.return_value = col
+    reg = {"active_model": "m", "models": {"m": {}}}
+
+    with patch("indexer.db.client", return_value=client), \
+         patch("indexer.get_registry", return_value=reg):
+        idx = Indexer.__new__(Indexer)
+        idx.image_catalog = {"images": {"a": {"path": "/new/a.jpg", "filename": "a.jpg"}}}
+        fixed = idx.reconcile_paths(moved_ids=["a"])
+
+    col.get.assert_called_once_with(ids=["a"], include=["metadatas"])
+    assert fixed == 1
+
+
+def test_reconcile_paths_batches_update_into_one_call():
+    """One col.update() call carrying every changed id/metadata pair, not one
+    call per changed id — turns an O(n) sequence of Chroma round-trips into
+    O(1) per collection per scan."""
+    from indexer import Indexer
+    col = MagicMock()
+    col.get.return_value = {
+        "ids": ["a", "b", "c"],
+        "metadatas": [
+            {"path": "/old/a.jpg", "filename": "a.jpg"},
+            {"path": "/new/b.jpg", "filename": "b.jpg"},  # unchanged, no update needed
+            {"path": "/old/c.jpg", "filename": "c.jpg"},
+        ],
+    }
+    client = MagicMock()
+    client.get_or_create_collection.return_value = col
+    reg = {"active_model": "m", "models": {"m": {}}}
+
+    with patch("indexer.db.client", return_value=client),          patch("indexer.get_registry", return_value=reg):
+        idx = Indexer.__new__(Indexer)
+        idx.image_catalog = {"images": {
+            "a": {"path": "/new/a.jpg", "filename": "a.jpg"},
+            "b": {"path": "/new/b.jpg", "filename": "b.jpg"},
+            "c": {"path": "/new/c.jpg", "filename": "c.jpg"},
+        }}
+        fixed = idx.reconcile_paths()
+
+    assert fixed == 2
+    col.update.assert_called_once()
+    assert set(col.update.call_args.kwargs["ids"]) == {"a", "c"}

@@ -75,7 +75,15 @@
         while (y.photos.length < y.count) {
           const existing = y.photos.filter((p) => p.exists !== false);
           if (monthGroups(existing).some((g) => g.key === jumpMonth)) break;
+          const before = y.photos.length;
           await loadMore(y);
+          if (y.photos.length === before) {
+            // loadMore() came back with no new photos despite y.count
+            // claiming there should be more — the count is stale. Bail
+            // instead of looping forever.
+            err = "Could not load all photos for this year — the count may be out of date.";
+            break;
+          }
         }
       }
       await tick();

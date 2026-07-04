@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import json
@@ -41,14 +42,25 @@ def _ratio_to_float(r) -> float:
 
 
 def _gps_to_decimal(values, ref) -> float | None:
-    """Convert EXIF GPS DMS rationals + hemisphere ref to a signed decimal degree."""
+    """Convert EXIF GPS DMS rationals + hemisphere ref to a signed decimal degree.
+    Returns None (instead of a garbage value) if malformed EXIF produces a
+    decimal degree outside the valid range for the axis (lat: [-90,90],
+    lon: [-180,180]) or a non-finite value — bad GPS should never silently
+    flow into geocoding."""
     try:
         vals = values.values if hasattr(values, "values") else values
         d, m, s = (_ratio_to_float(vals[0]), _ratio_to_float(vals[1]), _ratio_to_float(vals[2]))
         dec = d + m / 60.0 + s / 3600.0
-        if str(ref).upper().startswith(("S", "W")):
+        ref_up = str(ref).upper()
+        if ref_up.startswith(("S", "W")):
             dec = -dec
-        return round(dec, 6)
+        dec = round(dec, 6)
+        if not math.isfinite(dec):
+            return None
+        axis_limit = 90.0 if ref_up.startswith(("N", "S")) else 180.0
+        if abs(dec) > axis_limit:
+            return None
+        return dec
     except Exception:
         return None
 
@@ -106,8 +118,11 @@ def content_uid(path) -> str:
 
 
 def _sig(stat) -> str:
-    """Cheap change-signature so unchanged files are skipped without re-hashing."""
-    return f"{stat.st_size}:{int(stat.st_mtime)}"
+    """Cheap change-signature so unchanged files are skipped without re-hashing.
+    Uses sub-second mtime precision (rounded to milliseconds for stable
+    comparison) — truncating to whole seconds would miss a same-second edit
+    that leaves size unchanged."""
+    return f"{stat.st_size}:{round(stat.st_mtime, 3)}"
 
 
 def _build_excluded_set(excluded_paths) -> set[str]:
@@ -134,16 +149,47 @@ def _iter_images(root: Path, excluded: set[str]):
     Yield image Paths under root, skipping excluded dirs and handling
     errors gracefully (broken symlinks, permission errors, circular symlinks).
     Uses os.walk so we can skip entire subtrees efficiently.
+
+    Two things require resolving each directory the walk visits to its real
+    (symlink-free, canonical) path, the same way `excluded` was built:
+      - excluded-dir matching: comparing raw os.walk paths (normcase only)
+        against fully resolved excluded paths lets a symlink/junction,
+        trailing separator, or casing difference slip an excluded folder
+        through unpruned.
+      - cycle prevention: os.walk(followlinks=True) will traverse a
+        self-referential directory symlink/junction forever unless we track
+        which real directories we've already descended into and refuse to
+        re-enter them (broken-symlink skipping alone does not catch this).
     """
+    visited_real_dirs: set[str] = set()
     root_str = str(root)
     for dirpath, dirnames, filenames in os.walk(root_str, followlinks=True, onerror=None):
-        dir_norm = os.path.normcase(dirpath)
+        try:
+            real_dir = os.path.normcase(str(Path(dirpath).resolve()))
+        except OSError:
+            real_dir = None
 
-        # Prune excluded directories in-place so os.walk doesn't descend into them
-        dirnames[:] = [
-            d for d in dirnames
-            if not _is_excluded(os.path.normcase(os.path.join(dirpath, d)), excluded)
-        ]
+        if real_dir is not None:
+            if real_dir in visited_real_dirs:
+                # Already descended into this real directory in this scan —
+                # a symlink/junction cycle. Don't recurse further.
+                dirnames[:] = []
+                continue
+            visited_real_dirs.add(real_dir)
+
+        # Prune excluded directories in-place so os.walk doesn't descend into
+        # them. Resolve each candidate child the same way the excluded set
+        # was built so the comparison is apples-to-apples.
+        kept = []
+        for d in dirnames:
+            try:
+                d_real = os.path.normcase(str(Path(dirpath, d).resolve()))
+            except OSError:
+                kept.append(d)  # can't resolve — err on the side of walking it
+                continue
+            if not _is_excluded(d_real, excluded):
+                kept.append(d)
+        dirnames[:] = kept
 
         for fname in filenames:
             p = Path(dirpath) / fname
@@ -156,13 +202,17 @@ def _iter_images(root: Path, excluded: set[str]):
 
 
 def load_existing_data(output_file):
-    """Load catalog. Returns (images_by_uid, folders)."""
-    try:
-        data = catalog_db.load_all(output_file)
-        return data.get("images", {}), data.get("folders", {})
-    except Exception as e:
-        print(f"Warning: could not load catalog ({e}). Starting fresh.")
-        return {}, {}
+    """Load catalog. Returns (images_by_uid, folders).
+
+    Deliberately does NOT catch-and-return-empty on a load failure (locked
+    DB, one corrupted row, transient I/O). scan_directory()'s checkpoint save
+    is a full sync that deletes every catalog row absent from the in-memory
+    dict — if a transient read failure were silently treated as "empty
+    catalog", the very next checkpoint would wipe the entire catalog. Let the
+    exception propagate so the scan aborts loudly instead; a scan can simply
+    be retried once the transient issue (e.g. a momentary lock) clears."""
+    data = catalog_db.load_all(output_file)
+    return data.get("images", {}), data.get("folders", {})
 
 
 def save_data(images, folders, output_file):
@@ -202,8 +252,20 @@ def scan_directory(
         return {"added": 0, "moved": 0, "unchanged": 0, "total": len(images), "scanned": 0}
 
     excluded = _build_excluded_set(excluded_paths)
-    by_path = {d.get("path"): uid for uid, d in images.items()}
+    by_path: dict = {}
+    for uid, d in images.items():
+        p = d.get("path")
+        prior_uid = by_path.get(p)
+        if prior_uid is not None and prior_uid != uid:
+            # Two catalog rows claim the same path — the dict comprehension
+            # this replaced would silently let one overwrite the other with
+            # no trace. Surface it; the underlying data-model limitation
+            # (one physical path can only map to one uid) is documented on
+            # the duplicate-path handling below.
+            print(f"Warning: catalog path collision for '{p}' — uids {prior_uid!r} and {uid!r} both claim it; keeping {uid!r}.")
+        by_path[p] = uid
     added = moved = unchanged = seen = 0
+    moved_ids: list[str] = []
 
     print(f"Scanning: {root_dir}")
     for path in _iter_images(root, excluded):
@@ -242,12 +304,29 @@ def scan_directory(
 
         if uid in images:
             entry = images[uid]
-            if entry.get("path") != str_path:
-                moved += 1
-                entry["path"] = str_path
-                entry["filename"] = path.name
-            else:
+            old_path = entry.get("path")
+            if old_path == str_path:
                 unchanged += 1
+            else:
+                old_exists = bool(old_path) and os.path.exists(old_path)
+                if old_exists and str_path >= old_path:
+                    # Byte-identical duplicate: two live paths hash to the
+                    # same content uid. This is a real data-model limitation
+                    # — the catalog only tracks one path per uid, so one
+                    # physical copy is always left untracked. Rather than
+                    # flip-flopping to "whichever path os.walk visited last"
+                    # (walk order isn't stable across rescans), deterministically
+                    # keep the lexicographically-first path so the same copy
+                    # stays "the tracked one" run after run.
+                    unchanged += 1
+                else:
+                    # Either a genuine move (old_path no longer exists) or a
+                    # duplicate where the new path sorts first — both are the
+                    # right cases to adopt the new path.
+                    moved += 1
+                    moved_ids.append(uid)
+                    entry["path"] = str_path
+                    entry["filename"] = path.name
             entry["sig"] = sig
             entry["size_bytes"] = stats.st_size
         else:
@@ -282,6 +361,7 @@ def scan_directory(
         "unchanged": unchanged,
         "total": len(images),
         "scanned": seen,
+        "moved_ids": moved_ids,
     }
     print(f"Scan complete: {summary}")
     return summary
