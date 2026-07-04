@@ -162,7 +162,8 @@ def test_embed_job_batches_one_request(monkeypatch):
 
     assert s["ok"] == 2 and s["fail"] == 0
     assert geb.call_count == 1
-    assert geb.call_args[0][0] == ['{"caption":"one"}', '{"caption":"two"}']
+    # embedding text is now the natural-language caption, not the raw JSON blob
+    assert geb.call_args[0][0] == ["one", "two"]
     assert col.upsert.call_count == 1
     assert col.upsert.call_args[1]["ids"] == ["a", "b"]
 

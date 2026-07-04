@@ -2,6 +2,7 @@ import json
 import os
 import pytest
 from unittest.mock import patch, MagicMock, call
+import catalog_db
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -11,6 +12,14 @@ def _make_catalog(image_ids):
         img_id: {"path": f"/photos/{img_id}.jpg", "filename": f"{img_id}.jpg", "metadata": {}}
         for img_id in image_ids
     }}
+
+
+def _seed_catalog_db(tmp_path, catalog: dict) -> str:
+    """Seed a temp SQLite catalog file with catalog ({'images': {...}}) and
+    return its path, for patching indexer.IMAGE_CATALOG_PATH in tests."""
+    path = str(tmp_path / "catalog.db")
+    catalog_db.save_all(path, catalog.get("images", {}), catalog.get("folders", {}))
+    return path
 
 
 def _mock_chromadb(existing_ids=None, metadata_rows=None):
@@ -31,8 +40,7 @@ def _mock_chromadb(existing_ids=None, metadata_rows=None):
 def test_get_missing_all_new(tmp_path):
     from indexer import Indexer
     catalog = _make_catalog(["a", "b", "c"])
-    catalog_path = tmp_path / "images.json"
-    catalog_path.write_text(json.dumps(catalog))
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
 
     mock_client, _ = _mock_chromadb(existing_ids=[])
 
@@ -49,8 +57,7 @@ def test_get_missing_all_new(tmp_path):
 def test_get_missing_none_when_all_indexed(tmp_path):
     from indexer import Indexer
     catalog = _make_catalog(["a", "b"])
-    catalog_path = tmp_path / "images.json"
-    catalog_path.write_text(json.dumps(catalog))
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
 
     mock_client, _ = _mock_chromadb(existing_ids=["a", "b"])
 
@@ -66,8 +73,7 @@ def test_get_missing_none_when_all_indexed(tmp_path):
 def test_get_missing_partial(tmp_path):
     from indexer import Indexer
     catalog = _make_catalog(["a", "b", "c"])
-    catalog_path = tmp_path / "images.json"
-    catalog_path.write_text(json.dumps(catalog))
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
 
     mock_client, _ = _mock_chromadb(existing_ids=["a"])
 
@@ -90,8 +96,7 @@ def test_get_missing_files_detects_deleted(tmp_path):
         "real": {"path": str(real), "filename": "real.jpg", "metadata": {}},
         "gone": {"path": str(tmp_path / "gone.jpg"), "filename": "gone.jpg", "metadata": {}},
     }}
-    catalog_path = tmp_path / "images.json"
-    catalog_path.write_text(json.dumps(catalog))
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
 
     with patch("indexer.IMAGE_CATALOG_PATH", str(catalog_path)):
         idx = Indexer()
@@ -105,8 +110,7 @@ def test_get_missing_files_detects_deleted(tmp_path):
 def test_get_missing_attributes_all_stale(tmp_path):
     from indexer import Indexer
     catalog = _make_catalog(["a", "b"])
-    catalog_path = tmp_path / "images.json"
-    catalog_path.write_text(json.dumps(catalog))
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
 
     stale_meta = [{"weather": "unknown", "occasion": "unknown", "location_type": "unknown",
                    "scene": "unknown", "mood": "unknown"}] * 2
@@ -124,8 +128,7 @@ def test_get_missing_attributes_all_stale(tmp_path):
 def test_get_missing_attributes_none_when_rich(tmp_path):
     from indexer import Indexer
     catalog = _make_catalog(["a"])
-    catalog_path = tmp_path / "images.json"
-    catalog_path.write_text(json.dumps(catalog))
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
 
     rich_meta = [{"weather": "sunny", "occasion": "vacation", "location_type": "beach",
                   "scene": "outdoor", "mood": "happy"}]
@@ -189,8 +192,11 @@ def test_index_one_success_returns_note():
     img_data = {"path": "/a.jpg", "filename": "a.jpg", "metadata": {"date": "2024-01-01"}}
     attrs = {"caption": "beach", "scene": "outdoor", "location_type": "beach",
              "weather": "sunny", "season": "summer", "time_of_day": "afternoon",
-             "occasion": "vacation", "group_size": "couple", "clothing_style": "swimwear",
-             "mood": "happy", "objects": "umbrella", "people_description": "two people"}
+             "occasion": "vacation", "festival_name": "", "group_size": "couple", "person_count": 2,
+             "clothing_style": "swimwear", "mood": "happy", "objects": "umbrella",
+             "animals": "", "vehicles": "", "food_items": "", "activities": "",
+             "photo_type": "photo", "text_in_image": "", "landmark": "", "dominant_colors": "",
+             "people_description": "two people"}
 
     with patch("indexer.get_image_caption", return_value=('{"caption":"beach"}', "gemini")), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
@@ -211,8 +217,11 @@ def test_index_one_upsert_path():
     img_data = {"path": "/a.jpg", "filename": "a.jpg", "metadata": {}}
     attrs = {"caption": "", "scene": "unknown", "location_type": "unknown",
              "weather": "unknown", "season": "unknown", "time_of_day": "unknown",
-             "occasion": "unknown", "group_size": "unknown", "clothing_style": "unknown",
-             "mood": "unknown", "objects": "", "people_description": ""}
+             "occasion": "unknown", "festival_name": "", "group_size": "unknown", "person_count": 0,
+             "clothing_style": "unknown", "mood": "unknown", "objects": "",
+             "animals": "", "vehicles": "", "food_items": "", "activities": "",
+             "photo_type": "unknown", "text_in_image": "", "landmark": "", "dominant_colors": "",
+             "people_description": ""}
 
     with patch("indexer.get_image_caption", return_value=('{"caption":"x"}', "lm_studio:m")), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
@@ -231,7 +240,9 @@ def test_index_one_stores_embedding_model_in_metadata():
     mock_client, col = _make_mock_client()
     img_data = {"path": "/a.jpg", "filename": "a.jpg", "metadata": {}}
     attrs = {k: "unknown" for k in ["caption", "scene", "location_type", "weather", "season",
-             "time_of_day", "occasion", "group_size", "clothing_style", "mood", "objects", "people_description"]}
+             "time_of_day", "occasion", "festival_name", "group_size", "person_count", "clothing_style",
+             "mood", "objects", "animals", "vehicles", "food_items", "activities", "photo_type",
+             "text_in_image", "landmark", "dominant_colors", "people_description"]}
 
     with patch("indexer.get_image_caption", return_value=('{"caption":"x"}', "lm_studio:m")), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
@@ -251,7 +262,9 @@ def test_index_one_stores_caption_in_img_data():
     mock_client, col = _make_mock_client()
     img_data = {"path": "/a.jpg", "filename": "a.jpg", "metadata": {}}
     attrs = {k: "unknown" for k in ["caption", "scene", "location_type", "weather", "season",
-             "time_of_day", "occasion", "group_size", "clothing_style", "mood", "objects", "people_description"]}
+             "time_of_day", "occasion", "festival_name", "group_size", "person_count", "clothing_style",
+             "mood", "objects", "animals", "vehicles", "food_items", "activities", "photo_type",
+             "text_in_image", "landmark", "dominant_colors", "people_description"]}
 
     with patch("indexer.get_image_caption", return_value=('{"caption":"beach photo"}', "lm_studio:m")), \
          patch("indexer.parse_vision_attributes", return_value=attrs), \
@@ -270,7 +283,9 @@ def test_index_one_reuses_cached_caption():
     img_data = {"path": "/a.jpg", "filename": "a.jpg", "metadata": {},
                 "caption_json": '{"caption":"cached caption"}'}
     attrs = {k: "unknown" for k in ["caption", "scene", "location_type", "weather", "season",
-             "time_of_day", "occasion", "group_size", "clothing_style", "mood", "objects", "people_description"]}
+             "time_of_day", "occasion", "festival_name", "group_size", "person_count", "clothing_style",
+             "mood", "objects", "animals", "vehicles", "food_items", "activities", "photo_type",
+             "text_in_image", "landmark", "dominant_colors", "people_description"]}
     mock_vision = MagicMock(return_value='{"caption":"fresh"}')
 
     with patch("indexer.get_image_caption", mock_vision), \
@@ -290,7 +305,9 @@ def test_index_one_skips_cache_when_use_cached_false():
     img_data = {"path": "/a.jpg", "filename": "a.jpg", "metadata": {},
                 "caption_json": '{"caption":"old cached caption"}'}
     attrs = {k: "unknown" for k in ["caption", "scene", "location_type", "weather", "season",
-             "time_of_day", "occasion", "group_size", "clothing_style", "mood", "objects", "people_description"]}
+             "time_of_day", "occasion", "festival_name", "group_size", "person_count", "clothing_style",
+             "mood", "objects", "animals", "vehicles", "food_items", "activities", "photo_type",
+             "text_in_image", "landmark", "dominant_colors", "people_description"]}
     mock_vision = MagicMock(return_value=('{"caption":"fresh caption"}', "lm_studio:m"))
 
     with patch("indexer.get_image_caption", mock_vision), \
@@ -314,8 +331,7 @@ def test_get_stage_stats_counts_captioned(tmp_path):
         "b": {"path": "/b.jpg", "filename": "b.jpg", "metadata": {}},
         "c": {"path": "/c.jpg", "filename": "c.jpg", "metadata": {}, "caption_json": '{"c":"y"}'},
     }}
-    catalog_path = tmp_path / "images.json"
-    catalog_path.write_text(json.dumps(catalog))
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
 
     mock_client, col = _mock_chromadb(existing_ids=["a"])
     reg = {"active_model": "m", "models": {"m": {"source": "lm_studio", "dimension": 3}}}
@@ -360,8 +376,7 @@ def test_record_caption_history_replaces_same_model():
 def test_vision_one_raises_on_error_json(tmp_path):
     from indexer import Indexer
     catalog = _make_catalog(["a"])
-    catalog_path = tmp_path / "images.json"
-    catalog_path.write_text(json.dumps(catalog))
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
 
     with patch("indexer.IMAGE_CATALOG_PATH", str(catalog_path)), \
          patch("indexer.get_image_caption", return_value=(json.dumps({"error": "down"}), "error")), \
@@ -374,14 +389,81 @@ def test_vision_one_raises_on_error_json(tmp_path):
 def test_vision_one_stores_and_returns_model(tmp_path):
     from indexer import Indexer
     catalog = _make_catalog(["a"])
-    catalog_path = tmp_path / "images.json"
-    catalog_path.write_text(json.dumps(catalog))
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
 
+    full_caption = json.dumps({
+        "caption": "ok", "scene": "outdoor", "occasion": "everyday",
+        "weather": "sunny", "group_size": "solo",
+    })
     with patch("indexer.IMAGE_CATALOG_PATH", str(catalog_path)), \
-         patch("indexer.get_image_caption", return_value=('{"caption":"ok"}', "gemini")), \
+         patch("indexer.get_image_caption", return_value=(full_caption, "gemini")), \
          patch("indexer.Indexer._save_catalog"):
         idx = Indexer()
         note = idx.vision_one("a", force_provider="gemini")
 
     assert note == "vision:gemini"
     assert idx.image_catalog["images"]["a"]["caption_model"] == "gemini"
+
+
+# ── dirty-tracking / incremental catalog saves ─────────────────────────────────
+
+def test_save_catalog_only_writes_dirty_rows(tmp_path):
+    """_save_catalog must upsert only the touched id(s), not rewrite every row
+    in the catalog — the whole point of the SQLite migration (images.json was
+    rewritten in full on every job batch)."""
+    from indexer import Indexer
+    catalog = _make_catalog(["a", "b", "c"])
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
+
+    full_caption = json.dumps({
+        "caption": "x", "scene": "outdoor", "occasion": "everyday",
+        "weather": "sunny", "group_size": "solo",
+    })
+    with patch("indexer.IMAGE_CATALOG_PATH", catalog_path), \
+         patch("indexer.get_image_caption", return_value=(full_caption, "lm_studio:m")):
+        idx = Indexer()
+        idx.vision_one("a")
+
+    # Reload straight from the DB (bypassing the in-memory copy) to prove the
+    # write actually landed, and that b/c were never touched.
+    reloaded = catalog_db.load_all(catalog_path)["images"]
+    assert reloaded["a"].get("caption_json")
+    assert "caption_json" not in reloaded["b"]
+    assert "caption_json" not in reloaded["c"]
+
+
+def test_delete_image_removes_row_from_db_not_just_memory(tmp_path):
+    from indexer import Indexer
+    catalog = _make_catalog(["a", "b"])
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
+
+    with patch("indexer.IMAGE_CATALOG_PATH", catalog_path), \
+         patch("indexer.Indexer._drop_from_collections"):
+        idx = Indexer()
+        idx.delete_image("a", to_trash=False)
+
+    reloaded = catalog_db.load_all(catalog_path)["images"]
+    assert set(reloaded) == {"b"}
+
+
+def test_purge_folder_removes_rows_from_db(tmp_path):
+    from indexer import Indexer
+    sub = tmp_path / "sub"
+    other = tmp_path / "other"
+    catalog = {"images": {
+        "a": {"path": str(sub / "a.jpg"), "filename": "a.jpg", "metadata": {}},
+        "b": {"path": str(other / "b.jpg"), "filename": "b.jpg", "metadata": {}},
+    }}
+    catalog_path = _seed_catalog_db(tmp_path / "cat", catalog)
+    mock_client, _ = _mock_chromadb(existing_ids=[])
+
+    with patch("indexer.IMAGE_CATALOG_PATH", catalog_path), \
+         patch("indexer.db.client", return_value=mock_client), \
+         patch("indexer.get_registry", return_value={"active_model": None, "models": {}}), \
+         patch("indexer._remove_derived_files"):
+        idx = Indexer()
+        removed = idx.purge_folder(str(sub))
+
+    assert removed == 1
+    reloaded = catalog_db.load_all(catalog_path)["images"]
+    assert set(reloaded) == {"b"}

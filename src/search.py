@@ -27,6 +27,13 @@ def build_where_clause(filters: dict) -> dict | None:
     clauses = []
     for key, value in filters.items():
         if value and value != "All":
+            # person_count is stored as an int in Chroma metadata; the UI
+            # sends filter values as strings, so $eq needs the same type.
+            if key == "person_count":
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    continue
             clauses.append({key: {"$eq": value}})
     if not clauses:
         return None
@@ -107,17 +114,20 @@ def get_available_filter_values() -> dict:
         ):
             return _filter_values_cache["data"]
         result = collection.get(include=["metadatas"])
-        attrs = ["weather", "occasion", "scene", "group_size", "clothing_style",
-                 "mood", "location_type", "season", "time_of_day", "year"]
+        attrs = ["weather", "occasion", "festival_name", "scene", "group_size", "person_count",
+                 "clothing_style", "mood", "location_type", "season", "time_of_day",
+                 "photo_type", "year", "month", "place"]
         values = {}
         for attr in attrs:
             seen = set()
             for meta in result["metadatas"]:
                 val = meta.get(attr, "")
-                if val and val not in ("unknown", "", None):
+                if val not in ("unknown", "", None):
                     seen.add(str(val))
             if seen:
-                values[attr] = sorted(seen)
+                values[attr] = (
+                    sorted(seen, key=int) if attr == "person_count" else sorted(seen)
+                )
         _filter_values_cache.update({"key": key, "at": time.time(), "data": values})
         return values
     except Exception:

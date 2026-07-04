@@ -5,6 +5,7 @@ import hashlib
 import exifread
 from pathlib import Path
 from datetime import datetime
+import catalog_db
 
 # Supported image formats
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.webp', '.bmp'}
@@ -156,28 +157,21 @@ def _iter_images(root: Path, excluded: set[str]):
 
 def load_existing_data(output_file):
     """Load catalog. Returns (images_by_uid, folders)."""
-    images, folders = {}, {}
-    if os.path.exists(output_file):
-        try:
-            with open(output_file, 'r') as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                images = data.get("images", {})
-                folders = data.get("folders", {})
-        except Exception as e:
-            print(f"Warning: could not load catalog ({e}). Starting fresh.")
-    return images, folders
+    try:
+        data = catalog_db.load_all(output_file)
+        return data.get("images", {}), data.get("folders", {})
+    except Exception as e:
+        print(f"Warning: could not load catalog ({e}). Starting fresh.")
+        return {}, {}
 
 
 def save_data(images, folders, output_file):
-    """Atomically save catalog as {images: {uid: data}, folders: {root: meta}}."""
-    temp = output_file + ".tmp"
+    """Save catalog (SQLite-backed — see catalog_db.py). Upserts every row
+    currently in `images`/`folders`; scan checkpoints are infrequent (every
+    `checkpoint_interval` files) so dirty-tracking isn't worth the complexity
+    here, unlike the per-batch saves in the job loop (indexer.py)."""
     try:
-        # Ensure data directory exists
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        with open(temp, 'w') as f:
-            json.dump({"images": images, "folders": folders}, f, indent=2)
-        os.replace(temp, output_file)
+        catalog_db.save_all(output_file, images, folders)
     except Exception as e:
         print(f"Error saving catalog: {e}")
 

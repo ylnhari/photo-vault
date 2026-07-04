@@ -14,20 +14,35 @@ _PROMPT = (
     "Analyze this photo and respond ONLY with valid JSON (no markdown, no explanation). "
     "Use these exact keys and allowed values:\n"
     "{\n"
-    '  "caption": "one sentence description",\n'
+    '  "caption": "2-3 detailed sentences mentioning all salient people, animals, objects, activities, and setting",\n'
     '  "scene": "indoor" or "outdoor",\n'
     '  "location_type": one of [home, beach, restaurant, park, office, travel, street, gym, school, unknown],\n'
     '  "weather": one of [sunny, cloudy, rainy, snowy, indoor, unknown],\n'
     '  "season": one of [spring, summer, autumn, winter, unknown],\n'
     '  "time_of_day": one of [morning, afternoon, evening, night, unknown],\n'
     '  "occasion": one of [birthday, wedding, vacation, everyday, sports, festival, graduation, family, unknown],\n'
+    '  "festival_name": specific named holiday/festival if recognizable (e.g. Diwali, Christmas, Halloween, Holi, Eid, New Year), else "",\n'
     '  "group_size": one of [solo, couple, small_group, large_group, no_people],\n'
+    '  "person_count": exact integer number of people visible (0 if none, your best count if partially obscured/crowded),\n'
     '  "clothing_style": one of [formal, casual, sports, traditional, swimwear, unknown],\n'
     '  "mood": one of [happy, celebration, relaxed, adventurous, serious, romantic, unknown],\n'
     '  "objects": ["list", "of", "key", "objects"],\n'
+    '  "animals": ["list", "of", "animal/pet", "types", "present"],\n'
+    '  "vehicles": ["list", "of", "vehicle", "types", "present"],\n'
+    '  "food_items": ["list", "of", "visible", "food/drink", "items"],\n'
+    '  "activities": ["list", "of", "activities/actions", "happening"],\n'
+    '  "photo_type": one of [photo, screenshot, document, meme, selfie, artwork, unknown],\n'
+    '  "text_in_image": "short transcription of any prominent visible text/sign, else empty string",\n'
+    '  "landmark": "named landmark/monument/building if recognizable, else empty string",\n'
+    '  "dominant_colors": ["1-3", "dominant", "colors"],\n'
     '  "people_description": "brief description of people if present, else empty string"\n'
     "}"
 )
+
+# List-valued keys: parse_vision_attributes joins these into a comma-separated
+# string (Chroma metadata only accepts scalar values) — same treatment as the
+# original "objects" field.
+_LIST_KEYS = ("objects", "animals", "vehicles", "food_items", "activities", "dominant_colors")
 
 _lm_client = None
 
@@ -78,8 +93,36 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
+def _lm_studio_host() -> str:
+    """LM_STUDIO_URL is the OpenAI-compat base (…/v1); LM Studio's own native
+    API lives at the same host under /api/v0, not /v1."""
+    return LM_STUDIO_URL[:-3] if LM_STUDIO_URL.endswith("/v1") else LM_STUDIO_URL
+
+
+def list_lm_studio_models_v0() -> list[dict]:
+    """LM Studio's native REST API (not OpenAI-compat): reports the REAL model
+    type ('vlm'/'embeddings'/'llm') and REAL loaded state ('loaded'/'not-loaded'),
+    unlike /v1/models which lists every JIT-loadable model with no state info.
+    Returns [] if unreachable (older LM Studio, or offline) — callers should
+    fall back to the name-heuristic path in that case."""
+    try:
+        url = f"{_lm_studio_host()}/api/v0/models"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        return data.get("data", [])
+    except Exception:
+        return []
+
+
 def _lm_model_id() -> str:
-    """Best-effort id of the currently loaded LM Studio model. Falls back to 'lm_studio'."""
+    """Best-effort id of the currently loaded LM Studio vision model. Prefers
+    the v0 API's real 'loaded' vlm; falls back to the first /v1/models entry
+    (which may not actually be the resident model) if v0 is unavailable."""
+    v0 = list_lm_studio_models_v0()
+    for m in v0:
+        if m.get("state") == "loaded" and m.get("type") == "vlm":
+            return f"lm_studio:{m['id']}"
     try:
         client = _get_lm_client()
         models = client.models.list()
@@ -89,7 +132,9 @@ def _lm_model_id() -> str:
 
 
 def list_lm_studio_models() -> list[str]:
-    """All model ids currently loaded in LM Studio (vision + embedding mixed)."""
+    """All model ids LM Studio knows about (loaded + JIT-loadable), vision +
+    embedding mixed. Use classify_lm_studio_model()/list_lm_studio_models_v0()
+    for type/loaded-state — this list alone doesn't tell you which is resident."""
     try:
         client = _get_lm_client()
         return [m.id for m in client.models.list().data]
@@ -126,26 +171,45 @@ _EMBED_NAME_PATTERNS = (
 )
 
 
-def classify_lm_studio_model(model_id: str) -> dict:
-    """Heuristic type for an LM Studio model from its name.
-    Returns {type: 'vision'|'embed'|'unknown', warning: str|None}"""
+_V0_TYPE_MAP = {"vlm": "vision", "embeddings": "embed", "llm": "text-only"}
+
+
+def classify_lm_studio_model(model_id: str, v0_info: dict = None) -> dict:
+    """Type + live-loaded state for an LM Studio model.
+    When v0_info (from list_lm_studio_models_v0()) is available, uses LM Studio's
+    own reported type/state — authoritative, not a guess. Otherwise falls back to
+    a name-pattern heuristic (older LM Studio versions without the v0 API).
+    Returns {type: 'vision'|'embed'|'text-only'|'unknown', state: 'loaded'|'not-loaded'|None, warning: str|None}"""
+    if v0_info is not None:
+        t = _V0_TYPE_MAP.get(v0_info.get("type"), "unknown")
+        state = v0_info.get("state")
+        warning = None
+        if t == "embed":
+            warning = "Embedding model — not suitable for image analysis"
+        elif t == "text-only":
+            warning = "Text-only model — cannot analyze images"
+        return {"type": t, "state": state, "warning": warning}
+
     lower = model_id.lower()
     is_embed = any(p in lower for p in _EMBED_NAME_PATTERNS)
     is_vision = any(p in lower for p in _VISION_NAME_PATTERNS)
     if is_embed and not is_vision:
         return {
             "type": "embed",
+            "state": None,
             "warning": "Embedding model — not suitable for image analysis",
         }
     if is_vision and not is_embed:
-        return {"type": "vision", "warning": None}
+        return {"type": "vision", "state": None, "warning": None}
     if is_vision and is_embed:
         return {
             "type": "unknown",
+            "state": None,
             "warning": "Name matches both vision and embed patterns — verify model type",
         }
     return {
         "type": "unknown",
+        "state": None,
         "warning": "Cannot determine model type from name — image output may be unreliable",
     }
 
@@ -227,13 +291,43 @@ def _call_lm_studio(base64_image: str, model: str = "vision-model") -> str:
                 ],
             }
         ],
-        max_tokens=800,
+        max_tokens=1400,
     )
     return _strip_markdown(response.choices[0].message.content.strip())
 
 
+# Gemini has no public "remaining quota" endpoint — the closest real signal is
+# observing 429s ourselves. Track a short cooldown per model so the picker (and
+# the dropdown, via gemini_cooldowns()) can skip/flag a model that just got
+# rate-limited instead of hammering it again immediately.
+_gemini_cooldown: dict[str, float] = {}
+_RATE_LIMIT_COOLDOWN_SEC = 90
+
+
+def _mark_rate_limited(model: str, retry_after: str | None = None):
+    delay = _RATE_LIMIT_COOLDOWN_SEC
+    if retry_after:
+        try:
+            delay = max(delay, int(retry_after))
+        except ValueError:
+            pass
+    _gemini_cooldown[model] = time.time() + delay
+
+
+def gemini_cooldowns() -> dict[str, float]:
+    """{model: seconds_remaining} for models currently in a post-429 cooldown."""
+    now = time.time()
+    return {
+        m: round(until - now, 1)
+        for m, until in _gemini_cooldown.items()
+        if until > now
+    }
+
+
 def _call_gemini(base64_image: str, model: str = None) -> tuple[str, str]:
-    """Returns (caption_json, model_used)."""
+    """Returns (caption_json, model_used). Tries `model` first if given, then
+    falls through the dynamically-known vision model list on 429/404/503 —
+    a pinned model no longer means "no fallback if it's rate-limited"."""
     if not GEMINI_API_KEY:
         raise RuntimeError(
             "GEMINI_API_KEY not set — LM Studio is offline and no fallback available"
@@ -254,11 +348,26 @@ def _call_gemini(base64_image: str, model: str = None) -> tuple[str, str]:
                     ]
                 }
             ],
-            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 800},
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 1400,
+                "response_mime_type": "application/json",
+            },
         }
     ).encode("utf-8")
 
-    candidates = [model] if model else GEMINI_VISION_MODELS
+    # GEMINI_VISION_MODELS is deliberately ordered by rate-limit friendliness
+    # (cheapest/highest-quota first) — keep that order for the fallback pool
+    # rather than the API's arbitrary listing order, and don't spend an extra
+    # network call on every single image just to re-fetch it.
+    if model:
+        candidates = [model] + [m for m in GEMINI_VISION_MODELS if m != model]
+    else:
+        candidates = GEMINI_VISION_MODELS
+
+    now = time.time()
+    candidates = [m for m in candidates if _gemini_cooldown.get(m, 0) <= now] or candidates
+
     last_err = None
     for m in candidates:
         url = f"{GEMINI_BASE}/models/{m}:generateContent?key={GEMINI_API_KEY}"
@@ -273,6 +382,8 @@ def _call_gemini(base64_image: str, model: str = None) -> tuple[str, str]:
             return _strip_markdown(text), m
         except urllib.error.HTTPError as e:
             if e.code in (429, 404, 503):
+                if e.code == 429:
+                    _mark_rate_limited(m, e.headers.get("Retry-After") if e.headers else None)
                 last_err = f"{m}:{e.code}"
                 continue
             raise RuntimeError(f"Gemini {e.code} ({m}): {e.read()[:200]}")
@@ -340,17 +451,72 @@ def parse_vision_attributes(caption_json: str) -> dict:
         "season": "unknown",
         "time_of_day": "unknown",
         "occasion": "unknown",
+        "festival_name": "",
         "group_size": "unknown",
+        "person_count": 0,
         "clothing_style": "unknown",
         "mood": "unknown",
         "objects": [],
+        "animals": [],
+        "vehicles": [],
+        "food_items": [],
+        "activities": [],
+        "photo_type": "unknown",
+        "text_in_image": "",
+        "landmark": "",
+        "dominant_colors": [],
         "people_description": "",
     }
     try:
         data = json.loads(caption_json)
         defaults.update({k: v for k, v in data.items() if k in defaults})
-        if isinstance(defaults["objects"], list):
-            defaults["objects"] = ", ".join(defaults["objects"])
+        if not isinstance(defaults["person_count"], int):
+            try:
+                defaults["person_count"] = int(defaults["person_count"])
+            except (TypeError, ValueError):
+                defaults["person_count"] = 0
+        for key in _LIST_KEYS:
+            val = defaults[key]
+            if isinstance(val, list):
+                defaults[key] = ", ".join(str(v) for v in val)
+            elif not isinstance(val, str):
+                defaults[key] = ""
     except Exception:
         pass
     return defaults
+
+
+def build_embedding_text(attrs: dict) -> str:
+    """Natural-language text for the embedding model. Embedding the raw
+    caption_json (braces/keys/quotes) feeds noise tokens to a text-embedding
+    model and measurably hurts semantic search — this assembles plain
+    sentences from the same parsed attributes instead."""
+    parts = []
+    if attrs.get("caption"):
+        parts.append(attrs["caption"])
+    if attrs.get("people_description"):
+        parts.append(attrs["people_description"])
+    for label, key in (
+        ("Animals", "animals"), ("Vehicles", "vehicles"), ("Food", "food_items"),
+        ("Activities", "activities"), ("Objects", "objects"),
+    ):
+        if attrs.get(key):
+            parts.append(f"{label}: {attrs[key]}.")
+    if attrs.get("text_in_image"):
+        parts.append(f"Visible text: {attrs['text_in_image']}.")
+    if attrs.get("landmark"):
+        parts.append(f"Landmark: {attrs['landmark']}.")
+    if attrs.get("festival_name"):
+        parts.append(f"Festival: {attrs['festival_name']}.")
+    tags = [
+        attrs[k] for k in (
+            "occasion", "mood", "weather", "season", "time_of_day",
+            "location_type", "clothing_style", "group_size", "photo_type",
+        )
+        if attrs.get(k) and attrs[k] != "unknown"
+    ]
+    if tags:
+        parts.append("Tags: " + ", ".join(tags) + ".")
+    if attrs.get("dominant_colors"):
+        parts.append(f"Colors: {attrs['dominant_colors']}.")
+    return " ".join(parts)

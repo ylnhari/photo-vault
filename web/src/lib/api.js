@@ -75,6 +75,7 @@ export const api = {
   timeline: () => j("GET", "/api/timeline"),
   timelineYear: (year, offset = 0, limit = 120) =>
     j("GET", `/api/timeline?year=${encodeURIComponent(year)}&offset=${offset}&limit=${limit}`),
+  timelineSummary: () => j("GET", "/api/timeline/summary"),
   mapPhotos: () => j("GET", "/api/map"),
 
   // People

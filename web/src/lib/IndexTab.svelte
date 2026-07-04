@@ -1,9 +1,10 @@
 <script>
   import { api } from "./api.js";
   import { onMount, onDestroy, createEventDispatcher } from "svelte";
-  import { health, status, models, refreshHealth, refreshStatus, refreshModels } from "./stores.js";
+  import { health, status, models, refreshHealth, refreshStatus, refreshModels, jobStatus } from "./stores.js";
   import StatusPill from "./StatusPill.svelte";
   import JobPanel from "./JobPanel.svelte";
+  import SectionHead from "./SectionHead.svelte";
   const dispatch = createEventDispatcher();
 
   // ── job / poll state ────────────────────────────────────────────────────────
@@ -14,7 +15,7 @@
   let rechecking = false;
 
   // ── provider model catalogue ─────────────────────────────────────────────────
-  let pmodels = { lm_studio: [], lm_studio_types: {}, gemini_vision: [], gemini_embed: [] };
+  let pmodels = { lm_studio: [], lm_studio_types: {}, gemini_vision: [], gemini_embed: [], gemini_cooldowns: {} };
 
   // ── app settings ─────────────────────────────────────────────────────────────
   let settings = {
@@ -44,6 +45,12 @@
     ["lm_studio", "LM Studio"],
     ["gemini", "Gemini"],
   ];
+
+  // Human titles for the "blocked — X is running" messages below, mirrors
+  // JobPanel's own TITLES map so the two never disagree on wording.
+  const TITLES_BY_TYPE = { vision: "Vision analysis", embed: "Embedding",
+    full: "Full index", reanalyze: "Re-analyze", faces: "Face detection",
+    thumbs: "Thumbnails", dhash: "Duplicate scan", scan: "Scanning folders" };
 
   onMount(async () => {
     if (!$health.loaded) refreshHealth();
@@ -75,15 +82,23 @@
   // ── settings derivations ─────────────────────────────────────────────────────
   $: lmTypes = pmodels.lm_studio_types || {};
 
+  // Loaded-in-memory models first (from LM Studio's native v0 API when
+  // available — real state, not a guess), then alphabetical.
+  function byLoadedFirst(a, b) {
+    const la = lmTypes[a]?.state === "loaded" ? 0 : 1;
+    const lb = lmTypes[b]?.state === "loaded" ? 0 : 1;
+    return la - lb || a.localeCompare(b);
+  }
+
   // LM Studio models filtered by type
   $: lmVisionModels = pmodels.lm_studio.filter(m => {
     const t = lmTypes[m]?.type;
     return t === "vision" || t === "unknown";
-  });
+  }).sort(byLoadedFirst);
   $: lmEmbedModels = pmodels.lm_studio.filter(m => {
     const t = lmTypes[m]?.type;
     return t === "embed" || t === "unknown";
-  });
+  }).sort(byLoadedFirst);
 
   // Dropdown options for current provider selection
   $: visionModelOpts = settings.vision_provider === "lm_studio" ? lmVisionModels
@@ -165,6 +180,30 @@
   $: running = job && job.active;
   $: scanRunning = running && job.type === "scan";
   $: st = $status;
+
+  // Catch up when a job was started from elsewhere (another tab, another
+  // session) while this tab was sitting idle: this component's own `job`
+  // only updates via its 1s poll, which only starts if a job was ALREADY
+  // active when this tab mounted. The global jobStatus store (App.svelte)
+  // polls continuously regardless — when it flips to active and we're not
+  // already tracking it, pull the real progress and start local polling so
+  // buttons/hints/JobPanel reflect reality within one global-poll interval
+  // instead of requiring a manual page refresh.
+  // (Plain store subscription, not a `$:` block — assigning `job` from a
+  // reactive statement that also reads `job` via `running` is a cyclical
+  // dependency as far as Svelte's compiler is concerned.)
+  let syncingFromGlobal = false;
+  const unsubJobStatus = jobStatus.subscribe(($js) => {
+    if ($js.active && !(job && job.active) && !syncingFromGlobal) {
+      syncingFromGlobal = true;
+      api.indexProgress().then((j) => {
+        job = j;
+        if (j.active) startPolling();
+        syncingFromGlobal = false;
+      }).catch(() => { syncingFromGlobal = false; });
+    }
+  });
+  onDestroy(unsubJobStatus);
 
   async function start(type) {
     err = "";
@@ -322,8 +361,20 @@
 
   function modelTypeLabel(id, provider) {
     if (provider === "lm_studio") {
-      const t = lmTypes[id]?.type;
-      return t === "embed" ? "[EMBED ONLY]" : t === "unknown" ? "[?]" : "";
+      const info = lmTypes[id] || {};
+      const typeTag = info.type === "embed" ? "[EMBED ONLY]"
+                    : info.type === "text-only" ? "[TEXT ONLY]"
+                    : info.type === "unknown" ? "[?]" : "";
+      // state is only meaningful when we got real data from LM Studio's v0
+      // API (undefined/null means we fell back to the name-guess heuristic,
+      // which can't tell loaded from not-loaded).
+      const stateTag = info.state === "loaded" ? "● loaded"
+                     : info.state === "not-loaded" ? "○ not loaded" : "";
+      return [typeTag, stateTag].filter(Boolean).join("  ");
+    }
+    if (provider === "gemini") {
+      const cooldown = pmodels.gemini_cooldowns?.[id];
+      return cooldown ? `⏳ rate-limited (${Math.ceil(cooldown)}s)` : "";
     }
     return "";
   }
@@ -504,7 +555,7 @@
           <select bind:value={settings.embed_model} on:change={markDirty}>
             <option value={null}>— auto-pick —</option>
             {#each embedModelOpts as m}
-              <option value={m}>{m}</option>
+              <option value={m}>{m} {modelTypeLabel(m, settings.embed_provider)}</option>
             {/each}
           </select>
         {:else}
@@ -556,7 +607,7 @@
 
 <!-- A: Folder Management -->
 <div class="card">
-  <div class="section-label" id="sec-scan">A · Folder Management</div>
+  <SectionHead icon="📂" color="#3b82f6" title="A · Folder Management" id="sec-scan" />
   <p class="hint">Manages which directories are scanned. Photos are tracked by content — moves and renames within scanned folders are detected automatically.</p>
 
   <div class="subsection-label">Included folders</div>
@@ -629,7 +680,7 @@
     {#if jobIs(job, "scan")}
       <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
     {:else if running}
-      <p class="hint">Another job is running — stop it first.</p>
+      <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
     {:else}
       <button class="primary" on:click={scan}
               disabled={folderConfig.included.length === 0}>
@@ -641,9 +692,9 @@
 
 <!-- B: Vision analysis -->
 <div class="card">
-  <div class="section-label" id="sec-vision">B · Vision analysis
-    <span class="hint">(image → caption + 12 attributes)</span>
-  </div>
+  <SectionHead icon="👁" color="#6366f1" title="B · Vision analysis" id="sec-vision">
+    <span class="hint" style="font-weight:400">(image → caption + 12 attributes)</span>
+  </SectionHead>
   {#if selectedVisionLabel}
     <p class="hint">Running with: <code>{selectedVisionLabel}</code>
       · {visionPending} image{visionPending === 1 ? "" : "s"} pending for this model</p>
@@ -659,7 +710,7 @@
       <p class="hint">No photos scanned yet — start with section A.</p>
     {/if}
   {:else if running}
-    <p class="hint">Another job is running — stop it first.</p>
+    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
   {:else}
     <button class="primary" on:click={() => start("vision")} disabled={noServices}>
       ▶ Caption {visionPending} photo{visionPending === 1 ? "" : "s"}
@@ -669,9 +720,9 @@
 
 <!-- C: Embed -->
 <div class="card">
-  <div class="section-label" id="sec-embed">C · Embed
-    <span class="hint">(caption → searchable vector)</span>
-  </div>
+  <SectionHead icon="🧬" color="#8b5cf6" title="C · Embed" id="sec-embed">
+    <span class="hint" style="font-weight:400">(caption → searchable vector)</span>
+  </SectionHead>
   {#if settings.caption_source_model}
     <p class="hint">Source: captions from <code>{settings.caption_source_model}</code>
       → embed model: <code>{settings.embed_model || "auto"}</code>
@@ -686,7 +737,7 @@
   {:else if embedPending === 0}
     <p class="hint">Run vision analysis first (B).</p>
   {:else if running}
-    <p class="hint">Another job is running — stop it first.</p>
+    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
   {:else}
     <button class="primary" on:click={() => start("embed")} disabled={noServices}>
       ▶ Embed {embedPending} photo{embedPending === 1 ? "" : "s"}
@@ -696,9 +747,9 @@
 
 <!-- C2: Face detection (separate, user-controlled stage) -->
 <div class="card">
-  <div class="section-label">Face detection
-    <span class="hint">(detect + embed faces for person search)</span>
-  </div>
+  <SectionHead icon="🙂" color="#ec4899" title="Face detection">
+    <span class="hint" style="font-weight:400">(detect + embed faces for person search)</span>
+  </SectionHead>
   <p class="hint">{facesDone} done · {facesPending} pending.
     {settings.faces_during_embed ? "Also runs automatically during embedding." : "Runs only when you start it here."}</p>
   {#if jobIs(job, "faces")}
@@ -710,7 +761,7 @@
       <p class="hint">No photos scanned yet — start with section A.</p>
     {/if}
   {:else if running}
-    <p class="hint">Another job is running — stop it first.</p>
+    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
   {:else}
     <button class="primary" on:click={() => start("faces")}>
       ▶ Detect faces in {facesPending} photo{facesPending === 1 ? "" : "s"}
@@ -720,9 +771,9 @@
 
 <!-- Thumbnails: pregenerate grid previews -->
 <div class="card">
-  <div class="section-label">Thumbnails
-    <span class="hint">(pregenerate grid previews so browsing never waits)</span>
-  </div>
+  <SectionHead icon="🖼" color="#f59e0b" title="Thumbnails">
+    <span class="hint" style="font-weight:400">(pregenerate grid previews so browsing never waits)</span>
+  </SectionHead>
   <p class="hint">{thumbsPending} photo{thumbsPending === 1 ? "" : "s"} without a thumbnail.
     Missing ones are still generated on demand — this just does it ahead of time.</p>
   {#if jobIs(job, "thumbs")}
@@ -734,7 +785,7 @@
       <p class="hint">No photos scanned yet — start with section A.</p>
     {/if}
   {:else if running}
-    <p class="hint">Another job is running — stop it first.</p>
+    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
   {:else}
     <button class="primary" on:click={() => start("thumbs")}>
       ▶ Generate {thumbsPending} thumbnail{thumbsPending === 1 ? "" : "s"}
@@ -744,15 +795,15 @@
 
 <!-- Duplicates -->
 <div class="card">
-  <div class="section-label">Duplicates
-    <span class="hint">(find near-identical photos — resaves, bursts, WhatsApp copies)</span>
-  </div>
+  <SectionHead icon="🔍" color="#06b6d4" title="Duplicates">
+    <span class="hint" style="font-weight:400">(find near-identical photos — resaves, bursts, WhatsApp copies)</span>
+  </SectionHead>
   {#if jobIs(job, "dhash")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if dhashPending > 0}
     <p class="hint">{dhashPending} photo{dhashPending === 1 ? "" : "s"} not fingerprinted yet.</p>
     {#if running}
-      <p class="hint">Another job is running — stop it first.</p>
+      <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
     {:else}
       <button class="primary" on:click={() => start("dhash")}>
         ▶ Fingerprint {dhashPending} photo{dhashPending === 1 ? "" : "s"}
@@ -837,7 +888,9 @@
 
 <!-- D: Full index -->
 <div class="card">
-  <div class="section-label">D · Full index <span class="hint">(caption + embed in one pass)</span></div>
+  <SectionHead icon="⚡" color="#22c55e" title="D · Full index">
+    <span class="hint" style="font-weight:400">(caption + embed in one pass)</span>
+  </SectionHead>
   {#if jobIs(job, "full")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if missingFull === 0}
@@ -847,7 +900,7 @@
       <p class="hint">No photos scanned yet — start with section A.</p>
     {/if}
   {:else if running}
-    <p class="hint">Another job is running — stop it first.</p>
+    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
   {:else}
     <p class="hint">First-time setup: runs B then C for everything not yet indexed.</p>
     <button class="primary" on:click={() => start("full")} disabled={noServices}>
@@ -858,7 +911,9 @@
 
 <!-- E: Re-analyze -->
 <div class="card">
-  <div class="section-label">E · Re-analyze <span class="hint">(refresh captions + re-embed)</span></div>
+  <SectionHead icon="🔄" color="#fb923c" title="E · Re-analyze">
+    <span class="hint" style="font-weight:400">(refresh captions + re-embed)</span>
+  </SectionHead>
   {#if jobIs(job, "reanalyze")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if missingAttrs === 0}
@@ -868,7 +923,7 @@
       <p class="hint">No photos scanned yet — start with section A.</p>
     {/if}
   {:else if running}
-    <p class="hint">Another job is running — stop it first.</p>
+    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
   {:else}
     <button on:click={() => start("reanalyze")} disabled={noServices}>
       🔄 Re-analyze {missingAttrs} stale photo{missingAttrs === 1 ? "" : "s"}
@@ -901,7 +956,15 @@
 
 <style>
   .card { background: var(--surface); border: 1px solid var(--border);
-    border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+    border-radius: var(--radius-lg); padding: 18px; margin-bottom: 14px;
+    box-shadow: var(--shadow-1); transition: box-shadow .2s, border-color .2s; }
+  .card:hover { box-shadow: var(--shadow-2); }
+  .blocked-row {
+    display: flex; align-items: center; gap: 6px; font-size: 13px;
+    color: var(--muted); background: var(--surface2); border-radius: 8px;
+    padding: 9px 12px; width: fit-content;
+  }
+  .blocked-row b { color: var(--text); font-weight: 600; }
   .warn-card { border-color: color-mix(in srgb, var(--warn) 50%, var(--border)); }
   .note-card { background: var(--surface); border: 1px solid var(--warn);
     border-radius: 10px; padding: 12px 16px; margin-bottom: 14px; color: var(--warn);

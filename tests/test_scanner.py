@@ -44,16 +44,17 @@ def test_in_place_edit_retires_old_uid(tmp_path):
     """Editing a file in place (same path, new bytes) must replace the old
     catalog entry, not leave a stale duplicate that never shows as orphaned."""
     from scanner import scan_directory
-    import json, os, time
+    import catalog_db
+    import os, time
     root = tmp_path / "photos"
     root.mkdir()
     f = root / "a.jpg"
     f.write_bytes(b"original-bytes-1")
-    out = str(tmp_path / "images.json")
+    out = str(tmp_path / "catalog.db")
     scan_directory(str(root), out)
     # rewrite with different content (and nudge mtime so the sig changes)
     f.write_bytes(b"edited-bytes-22222")
     os.utime(f, (time.time() + 5, time.time() + 5))
     scan_directory(str(root), out)
-    images = json.load(open(out))["images"]
+    images = catalog_db.load_all(out)["images"]
     assert len(images) == 1, f"stale duplicate left behind: {list(images)}"

@@ -4,7 +4,9 @@ import hashlib
 import time
 from pathlib import Path
 import db
-from vision import get_image_caption, parse_vision_attributes
+import geocode
+import catalog_db
+from vision import get_image_caption, parse_vision_attributes, validate_vision_output, build_embedding_text
 from embeddings import get_embedding, collection_name_for, get_active_model, get_registry
 from faces import detect_and_embed_faces, save_face_data, index_faces, delete_faces_for_image
 from scanner import scan_directory
@@ -48,17 +50,13 @@ _missing_files_cache: dict = {"key": None, "at": 0.0, "data": []}
 
 
 def load_catalog_cached() -> dict:
-    """Return a shared read-only catalog snapshot, reloaded only when the file changes."""
-    try:
-        key = (IMAGE_CATALOG_PATH, os.path.getmtime(IMAGE_CATALOG_PATH))
-    except OSError:
-        return {"images": {}}
+    """Return a shared read-only catalog snapshot, reloaded only when this
+    process has written to the catalog since the last read (in-process write
+    counter — see catalog_db.py for why this isn't mtime-keyed)."""
+    key = (IMAGE_CATALOG_PATH, catalog_db.version(IMAGE_CATALOG_PATH))
     if _catalog_cache["key"] != key or _catalog_cache["data"] is None:
         try:
-            with open(IMAGE_CATALOG_PATH) as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                data = {"images": {}}
+            data = catalog_db.load_all(IMAGE_CATALOG_PATH)
             _catalog_cache["data"] = data
             _catalog_cache["key"] = key
         except Exception:
@@ -104,22 +102,35 @@ class Indexer:
         """
         self.target_directories = target_directories or []
         self.image_catalog = load_catalog_cached() if use_cache else self._load_image_catalog()
+        # ids touched since the last _save_catalog() call. Mutating methods
+        # mark ids here instead of every save rewriting the whole catalog —
+        # see catalog_db.py for why (images.json was a full-file rewrite on
+        # every batch of every job, ~6000+ times over one vision run).
+        self._dirty_ids: set[str] = set()
+        self._deleted_ids: set[str] = set()
 
     def _load_image_catalog(self):
-        if os.path.exists(IMAGE_CATALOG_PATH):
-            with open(IMAGE_CATALOG_PATH, "r") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-            if isinstance(data, list):
-                return {"images": {img["path"]: img for img in data if "path" in img}}
-        return {"images": {}}
+        return catalog_db.load_all(IMAGE_CATALOG_PATH)
+
+    def _mark_dirty(self, img_id: str):
+        self._dirty_ids.add(img_id)
+        self._deleted_ids.discard(img_id)
+
+    def _mark_deleted(self, img_id: str):
+        self._deleted_ids.add(img_id)
+        self._dirty_ids.discard(img_id)
 
     def _save_catalog(self):
-        tmp = IMAGE_CATALOG_PATH + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.image_catalog, f, indent=2)
-        os.replace(tmp, IMAGE_CATALOG_PATH)
+        if self._deleted_ids:
+            catalog_db.delete_images(IMAGE_CATALOG_PATH, self._deleted_ids)
+            self._deleted_ids.clear()
+        if self._dirty_ids:
+            images = self.image_catalog.get("images", {})
+            dirty = {iid: images[iid] for iid in self._dirty_ids if iid in images}
+            catalog_db.upsert_images(IMAGE_CATALOG_PATH, dirty)
+            self._dirty_ids.clear()
+        if self.image_catalog.get("folders"):
+            catalog_db.save_folders(IMAGE_CATALOG_PATH, self.image_catalog["folders"])
 
     def _collection(self, model_name: str = None):
         return db.collection(model_name)
@@ -453,11 +464,15 @@ class Indexer:
         )
         if _caption_has_error(text):
             raise RuntimeError(json.loads(text).get("error", "vision failed"))
+        validation = validate_vision_output(text)
+        if not validation["valid"]:
+            raise RuntimeError(validation["warning"])
         return vmodel, text
 
     def record_caption(self, img_id: str, vmodel: str, text: str):
         """Apply a computed caption to the catalog in memory (caller persists)."""
         _record_caption_history(self.image_catalog["images"][img_id], vmodel, text)
+        self._mark_dirty(img_id)
 
     def vision_one(self, img_id: str, force_provider: str = "auto", model: str = None,
                    persist: bool = True) -> str:
@@ -489,6 +504,7 @@ class Indexer:
                           vision_provider=vision_provider, vision_model=vision_model,
                           embed_provider=embed_provider, embed_model=embed_model,
                           caption_source_model=caption_source_model, detect_faces=detect_faces)
+        self._mark_dirty(img_id)
         if persist:
             self._save_catalog()
         return note
@@ -538,6 +554,7 @@ class Indexer:
             # Face data
             _remove_derived_files(img_id)
             del self.image_catalog["images"][img_id]
+            self._mark_deleted(img_id)
 
         self._save_catalog()
         return len(to_remove)
@@ -578,6 +595,7 @@ class Indexer:
             if to_trash:
                 trash_mod.add(img_id, entry, file_deleted=file_deleted)
             del self.image_catalog["images"][img_id]
+            self._mark_deleted(img_id)
             self._save_catalog()
 
         if not to_trash:
@@ -593,6 +611,8 @@ class Indexer:
         if not entries:
             return 0
         self.image_catalog.setdefault("images", {}).update(entries)
+        for iid in entries:
+            self._mark_dirty(iid)
         self._save_catalog()
         return len(entries)
 
@@ -622,6 +642,7 @@ class Indexer:
         if not os.path.exists(path):
             return "dhash:skipped (file missing)"
         data["dhash"] = dhash(path)
+        self._mark_dirty(img_id)
         return "dhash:ok"
 
 
@@ -658,7 +679,11 @@ def build_embed_payload(img_data: dict, caption_json: str,
     """ChromaDB metadata payload for one embedded image."""
     attrs = parse_vision_attributes(caption_json)
     meta = img_data.get("metadata", {})
-    year = meta.get("date", "")[:4] if meta.get("date", "") else "unknown"
+    date = meta.get("date", "")
+    year = date[:4] if date else "unknown"
+    month = date[5:7] if len(date) >= 7 else "unknown"
+    lat, lon = meta.get("gps_lat"), meta.get("gps_lon")
+    place = geocode.place_for(lat, lon) if lat is not None and lon is not None else None
     return {
         "path": img_data["path"],
         "filename": img_data["filename"],
@@ -669,12 +694,24 @@ def build_embed_payload(img_data: dict, caption_json: str,
         "season": attrs["season"],
         "time_of_day": attrs["time_of_day"],
         "occasion": attrs["occasion"],
+        "festival_name": attrs["festival_name"],
         "group_size": attrs["group_size"],
+        "person_count": attrs["person_count"],
         "clothing_style": attrs["clothing_style"],
         "mood": attrs["mood"],
         "objects": attrs["objects"],
+        "animals": attrs["animals"],
+        "vehicles": attrs["vehicles"],
+        "food_items": attrs["food_items"],
+        "activities": attrs["activities"],
+        "photo_type": attrs["photo_type"],
+        "text_in_image": attrs["text_in_image"],
+        "landmark": attrs["landmark"],
+        "dominant_colors": attrs["dominant_colors"],
         "people_description": attrs["people_description"],
         "year": year,
+        "month": month,
+        "place": place or "unknown",
         "metadata_json": json.dumps(meta),
         "embedding_source": embed_source,
         "embedding_model": model_name,
@@ -691,9 +728,10 @@ def _embed_one(img_id: str, img_data: dict, upsert: bool = False,
     detect_faces: when True, also run + persist face detection inline.
     """
     caption_json = resolve_caption_json(img_data, caption_source_model)
+    embedding_text = build_embedding_text(parse_vision_attributes(caption_json))
 
     embedding, model_name, embed_source = get_embedding(
-        caption_json, force_provider=embed_provider, model=embed_model
+        embedding_text, force_provider=embed_provider, model=embed_model
     )
     if embedding is None:
         raise RuntimeError("embedding failed (LM Studio and Gemini both unavailable)")

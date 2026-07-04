@@ -41,9 +41,11 @@ _IMMUTABLE_CACHE = {"Cache-Control": "private, max-age=31536000, immutable"}
 from search import search_images, get_available_filter_values
 from vision import (
     list_lm_studio_models,
+    list_lm_studio_models_v0,
     classify_lm_studio_model,
     list_gemini_vision_models,
     validate_vision_output,
+    gemini_cooldowns,
 )
 from embeddings import (
     get_registry,
@@ -74,7 +76,7 @@ os.makedirs(THUMB_DIR, exist_ok=True)
 app = FastAPI(title="Photo Vault", version="1.0")
 
 # Mutual exclusion between a (synchronous) scan and the background index job:
-# both rewrite the whole images.json, so they must never run concurrently.
+# both write to the catalog DB, so they must never run concurrently.
 _scan_active = threading.Event()
 
 # Reject requests whose Host header isn't a loopback name. This is the primary
@@ -205,9 +207,13 @@ class AlbumItemsReq(BaseModel):
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 def _reject_if_writer_active():
-    """Deletes/purges rewrite images.json from a private Indexer copy. If a scan
-    or index job is mid-flight (each holds its own copy), whichever saves last
-    silently resurrects what the other removed — so refuse instead."""
+    """Deletes/purges write to the catalog DB from a private Indexer copy. A
+    concurrent vision/embed job's incremental saves can't resurrect a deleted
+    row (they only touch ids they themselves changed), but a concurrent SCAN
+    still can: scan checkpoints do a full sync (upsert its whole in-memory
+    catalog + delete anything missing from it), so a scan holding a stale
+    in-memory copy of a just-deleted id would write it right back. Refuse
+    instead of risking that."""
     if _scan_active.is_set() or manager.status().get("active"):
         raise HTTPException(
             409, "a scan or indexing job is running; stop it before deleting"
@@ -527,13 +533,19 @@ def index_start(req: IndexReq):
 @app.get("/api/provider-models")
 def provider_models():
     """Models available per provider for the run-config dropdowns.
-    Gemini lists only include verified models — no hardcoded fallback."""
+    Gemini lists only include verified models — no hardcoded fallback.
+    LM Studio type/loaded-state comes from its native v0 API when reachable
+    (authoritative), falling back to a name-pattern guess otherwise."""
     lm_models = list_lm_studio_models()
+    v0_by_id = {m["id"]: m for m in list_lm_studio_models_v0()}
     return {
         "lm_studio": lm_models,
-        "lm_studio_types": {m: classify_lm_studio_model(m) for m in lm_models},
+        "lm_studio_types": {
+            m: classify_lm_studio_model(m, v0_by_id.get(m)) for m in lm_models
+        },
         "gemini_vision": list_gemini_vision_models(fallback=False),
         "gemini_embed": list_gemini_embed_models(fallback=False),
+        "gemini_cooldowns": gemini_cooldowns(),
     }
 
 
@@ -749,6 +761,37 @@ def map_photos():
     return {"points": points}
 
 
+def _resolve_photo_date(data: dict) -> str:
+    """EXIF date if present, else the file timestamp (WhatsApp strips EXIF,
+    screenshots never had it) — most of the library lands in a real
+    year/month instead of one giant "Unknown" bucket."""
+    date = data.get("metadata", {}).get("date", "")
+    if not date or len(date) < 4:
+        ts = data.get("created_at")
+        if ts:
+            try:
+                date = _dt.fromtimestamp(ts).strftime("%Y:%m:%d %H:%M:%S")
+            except (OSError, OverflowError, ValueError):
+                date = ""
+    return date
+
+
+@app.get("/api/timeline/summary")
+def timeline_summary():
+    """Cheap year -> month -> count map for quick-jump navigation. No
+    per-photo os.path.exists check (that's what makes /api/timeline itself
+    expensive at scale) — just a date tally, safe to call eagerly."""
+    catalog = load_catalog_cached().get("images", {})
+    summary: dict[str, dict[str, int]] = {}
+    for data in catalog.values():
+        date = _resolve_photo_date(data)
+        y = date[:4] if date and len(date) >= 4 else "Unknown"
+        m = date[5:7] if y != "Unknown" and len(date) >= 7 else "00"
+        year_bucket = summary.setdefault(y, {})
+        year_bucket[m] = year_bucket.get(m, 0) + 1
+    return {"summary": summary}
+
+
 @app.get("/api/timeline")
 def timeline(year: str | None = None, offset: int = 0, limit: int = 60):
     """
@@ -760,17 +803,7 @@ def timeline(year: str | None = None, offset: int = 0, limit: int = 60):
     catalog = load_catalog_cached().get("images", {})
     by_year: dict[str, list] = {}
     for img_id, data in list(catalog.items()):
-        date = data.get("metadata", {}).get("date", "")
-        if not date or len(date) < 4:
-            # No EXIF date (WhatsApp strips it, screenshots never had it) —
-            # fall back to the file timestamp so most of the library lands in
-            # a real year instead of one giant "Unknown" bucket.
-            ts = data.get("created_at")
-            if ts:
-                try:
-                    date = _dt.fromtimestamp(ts).strftime("%Y:%m:%d %H:%M:%S")
-                except (OSError, OverflowError, ValueError):
-                    date = ""
+        date = _resolve_photo_date(data)
         y = date[:4] if date and len(date) >= 4 else "Unknown"
         by_year.setdefault(y, []).append((date, img_id, data))
 
@@ -981,7 +1014,11 @@ def face_crop(image_id: str = Query(...), face_index: int = 0):
 @app.get("/api/models")
 def models():
     reg = get_registry()
-    return {"active": reg.get("active_model"), "models": reg.get("models", {})}
+    models_out = {
+        name: {**info, "indexed_count": db.collection(name).count()}
+        for name, info in reg.get("models", {}).items()
+    }
+    return {"active": reg.get("active_model"), "models": models_out}
 
 
 @app.post("/api/models/active")

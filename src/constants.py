@@ -4,7 +4,7 @@ import json
 # Base paths
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-IMAGE_CATALOG_PATH = os.path.join(DATA_DIR, "images.json")
+IMAGE_CATALOG_PATH = os.path.join(DATA_DIR, "catalog.db")
 CHROMA_DB_PATH = os.path.join(DATA_DIR, "chroma_db")
 FACE_DIR = os.path.join(DATA_DIR, "faces")
 THUMB_DIR = os.path.join(DATA_DIR, "thumbs")
@@ -51,12 +51,17 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 # Prefer highest-rate-limit models first; escalate only if 429/404/503
+# Ordered by verified free-tier daily quota on this account (AI Studio ->
+# Rate Limit, 2026-07-04) — gemini-2.0-flash* variants showed 0/0 (unavailable
+# on this project/tier) and were dropped; gemini-3.1-flash-lite has by far the
+# best quota (RPD 500 vs 20 for the rest) plus the cleanest JSON-mode output
+# in testing, so it goes first.
 GEMINI_VISION_MODELS = [
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
+    "gemini-3.1-flash-lite",
     "gemini-2.5-flash-lite",
+    "gemini-3-flash",
     "gemini-2.5-flash",
-    "gemini-2.0-flash-exp",
+    "gemini-3.5-flash",
 ]
 
 EMBEDDING_REGISTRY_PATH = os.path.join(DATA_DIR, "embedding_registry.json")

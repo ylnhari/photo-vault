@@ -17,6 +17,7 @@ VALID_JSON = json.dumps({
     "time_of_day": "afternoon",
     "occasion": "vacation",
     "group_size": "couple",
+    "person_count": 2,
     "clothing_style": "swimwear",
     "mood": "happy",
     "objects": ["umbrella", "towel"],
@@ -158,7 +159,8 @@ def test_get_image_caption_uses_lm_studio_first(tmp_path):
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_response
 
-    with patch("vision._get_lm_client", return_value=mock_client):
+    with patch("vision._get_lm_client", return_value=mock_client), \
+         patch("vision.list_lm_studio_models_v0", return_value=[]):
         result = get_image_caption(str(img_path))
 
     assert result == VALID_JSON
@@ -174,6 +176,7 @@ def test_get_image_caption_falls_back_on_connection_error(tmp_path):
     mock_client.chat.completions.create.side_effect = ConnectionRefusedError("refused")
 
     with patch("vision._get_lm_client", return_value=mock_client), \
+         patch("vision.list_lm_studio_models_v0", return_value=[]), \
          patch("vision._call_gemini", return_value=(VALID_JSON, "gemini-2.0-flash-lite")) as mock_gemini:
         result = get_image_caption(str(img_path))
 
@@ -190,6 +193,7 @@ def test_get_image_caption_no_fallback_on_non_connection_error(tmp_path):
     mock_client.chat.completions.create.side_effect = ValueError("bad model name")
 
     with patch("vision._get_lm_client", return_value=mock_client), \
+         patch("vision.list_lm_studio_models_v0", return_value=[]), \
          patch("vision._call_gemini") as mock_gemini:
         result = get_image_caption(str(img_path))
 
@@ -214,7 +218,8 @@ def test_get_image_caption_with_model_returns_tuple(tmp_path):
     mock_client.chat.completions.create.return_value = mock_response
     mock_client.models.list.return_value.data = [MagicMock(id="qwen2-vl")]
 
-    with patch("vision._get_lm_client", return_value=mock_client):
+    with patch("vision._get_lm_client", return_value=mock_client), \
+         patch("vision.list_lm_studio_models_v0", return_value=[]):
         text, label = get_image_caption(str(img_path), with_model=True)
 
     assert text == VALID_JSON
@@ -292,6 +297,25 @@ def test_parse_valid_json():
     assert attrs["scene"] == "outdoor"
     assert attrs["weather"] == "sunny"
     assert attrs["mood"] == "happy"
+    assert attrs["person_count"] == 2
+
+
+def test_parse_person_count_defaults_to_zero_when_missing():
+    from vision import parse_vision_attributes
+    attrs = parse_vision_attributes(json.dumps({"caption": "hello"}))
+    assert attrs["person_count"] == 0
+
+
+def test_parse_person_count_coerces_numeric_string():
+    from vision import parse_vision_attributes
+    attrs = parse_vision_attributes(json.dumps({"person_count": "3"}))
+    assert attrs["person_count"] == 3
+
+
+def test_parse_person_count_falls_back_to_zero_on_garbage():
+    from vision import parse_vision_attributes
+    attrs = parse_vision_attributes(json.dumps({"person_count": "a lot"}))
+    assert attrs["person_count"] == 0
 
 
 def test_parse_objects_list_to_string():
@@ -322,6 +346,71 @@ def test_parse_ignores_unknown_keys():
     data = json.dumps({"caption": "test", "unknown_key": "value"})
     attrs = parse_vision_attributes(data)
     assert "unknown_key" not in attrs
+
+
+def test_parse_list_fields_join_to_comma_string():
+    from vision import parse_vision_attributes
+    data = json.dumps({"animals": ["dog", "cat"], "vehicles": ["car"], "dominant_colors": ["red", "blue"]})
+    attrs = parse_vision_attributes(data)
+    assert attrs["animals"] == "dog, cat"
+    assert attrs["vehicles"] == "car"
+    assert attrs["dominant_colors"] == "red, blue"
+
+
+def test_parse_list_fields_default_empty_string_when_missing():
+    from vision import parse_vision_attributes
+    attrs = parse_vision_attributes(json.dumps({"caption": "x"}))
+    assert attrs["animals"] == ""
+    assert attrs["food_items"] == ""
+    assert attrs["activities"] == ""
+
+
+def test_parse_list_field_garbage_type_falls_back_to_empty():
+    from vision import parse_vision_attributes
+    attrs = parse_vision_attributes(json.dumps({"animals": {"weird": "dict"}}))
+    assert attrs["animals"] == ""
+
+
+def test_parse_new_scalar_fields():
+    from vision import parse_vision_attributes
+    data = json.dumps({
+        "festival_name": "Diwali", "photo_type": "selfie",
+        "text_in_image": "SALE 50%", "landmark": "Taj Mahal",
+    })
+    attrs = parse_vision_attributes(data)
+    assert attrs["festival_name"] == "Diwali"
+    assert attrs["photo_type"] == "selfie"
+    assert attrs["text_in_image"] == "SALE 50%"
+    assert attrs["landmark"] == "Taj Mahal"
+
+
+# ── build_embedding_text ─────────────────────────────────────────────────────
+
+def test_build_embedding_text_is_plain_sentences_not_json():
+    from vision import parse_vision_attributes, build_embedding_text
+    attrs = parse_vision_attributes(VALID_JSON)
+    text = build_embedding_text(attrs)
+    assert "{" not in text and "}" not in text and '"' not in text
+    assert "A sunny beach day" in text
+
+
+def test_build_embedding_text_includes_animals_and_activities():
+    from vision import parse_vision_attributes, build_embedding_text
+    data = json.dumps({
+        "caption": "A dog runs on the beach.",
+        "animals": ["dog"], "activities": ["running", "swimming"],
+    })
+    attrs = parse_vision_attributes(data)
+    text = build_embedding_text(attrs)
+    assert "dog" in text
+    assert "running, swimming" in text
+
+
+def test_build_embedding_text_skips_unknown_and_empty_fields():
+    from vision import parse_vision_attributes, build_embedding_text
+    attrs = parse_vision_attributes(json.dumps({"caption": "x"}))
+    text = build_embedding_text(attrs)
+    assert "unknown" not in text.lower()
 
 
 def test_encode_image_converts_rgba_png(tmp_path):

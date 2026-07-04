@@ -116,9 +116,16 @@ def test_models(client):
         "active_model": "m1",
         "models": {"m1": {"source": "lm_studio", "dimension": 768}},
     }
-    with patch("api.get_registry", return_value=reg):
+    fake_col = MagicMock()
+    fake_col.count.return_value = 42
+    with (
+        patch("api.get_registry", return_value=reg),
+        patch("api.db.collection", return_value=fake_col),
+    ):
         r = client.get("/api/models")
-    assert r.json()["active"] == "m1"
+    body = r.json()
+    assert body["active"] == "m1"
+    assert body["models"]["m1"]["indexed_count"] == 42
 
 
 def test_delete_image(client):

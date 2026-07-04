@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import settings as settings_mod
 from indexer import Indexer, resolve_caption_json, build_embed_payload
+from vision import parse_vision_attributes, build_embedding_text
 
 JOB_TYPES = ("vision", "embed", "full", "reanalyze", "faces", "thumbs",
              "dhash", "scan")
@@ -234,7 +235,7 @@ class JobManager:
                     if img_data is None:
                         raise RuntimeError("not in catalog")
                     cj = resolve_caption_json(img_data, csm)
-                    texts.append(cj)
+                    texts.append(build_embedding_text(parse_vision_attributes(cj)))
                     members.append((iid, img_data, cj))
                 except Exception as e:
                     consecutive += 1

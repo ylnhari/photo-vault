@@ -48,6 +48,17 @@ def test_where_three_filters():
     assert len(result["$and"]) == 3
 
 
+def test_where_coerces_person_count_to_int():
+    from search import build_where_clause
+    result = build_where_clause({"person_count": "2"})
+    assert result == {"person_count": {"$eq": 2}}
+
+
+def test_where_skips_unparseable_person_count():
+    from search import build_where_clause
+    assert build_where_clause({"person_count": "many"}) is None
+
+
 # ── search_images ─────────────────────────────────────────────────────────────
 
 def _mock_collection(count=0, query_result=None):

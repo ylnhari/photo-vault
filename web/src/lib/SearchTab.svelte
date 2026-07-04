@@ -68,10 +68,22 @@
   }
 
   const FILTER_ORDER = [
-    ["year", "Year"], ["weather", "Weather"], ["occasion", "Occasion"],
-    ["scene", "Scene"], ["group_size", "Group"], ["clothing_style", "Clothing"],
+    ["year", "Year"], ["month", "Month"], ["place", "Place"], ["weather", "Weather"],
+    ["occasion", "Occasion"], ["festival_name", "Festival"], ["scene", "Scene"],
+    ["group_size", "Group"], ["person_count", "People"], ["clothing_style", "Clothing"],
     ["mood", "Mood"], ["location_type", "Location"], ["season", "Season"],
+    ["photo_type", "Type"],
   ];
+
+  const MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June",
+                       "July", "August", "September", "October", "November", "December"];
+  function filterOptionLabel(key, v) {
+    if (key === "month") {
+      const n = parseInt(v, 10);
+      return n >= 1 && n <= 12 ? MONTH_NAMES[n] : v;
+    }
+    return v;
+  }
 
   // React to indexedCount instead of checking it once in onMount: at first
   // page load this component mounts before /api/status resolves (indexedCount
@@ -130,7 +142,7 @@
               <span class="muted" style="font-size:12px">{label}</span>
               <select bind:value={selected[key]}>
                 <option value="All">All</option>
-                {#each filterVals[key] as v}<option>{v}</option>{/each}
+                {#each filterVals[key] as v}<option value={v}>{filterOptionLabel(key, v)}</option>{/each}
               </select>
             </label>
           {/if}
