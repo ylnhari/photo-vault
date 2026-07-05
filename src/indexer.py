@@ -144,7 +144,13 @@ class Indexer:
             catalog_db.save_folders(IMAGE_CATALOG_PATH, self.image_catalog["folders"])
 
     def _collection(self, model_name: str = None):
-        return db.collection(model_name)
+        # allow_default: these are read-only "what's already embedded" checks
+        # (get_missing, get_missing_attributes, get_embed_pending) that must
+        # degrade to "nothing embedded yet" before any model has ever been
+        # selected, not raise — db.collection() otherwise raises ValueError
+        # here specifically to stop embedding code from silently writing
+        # into an ungoverned fallback collection.
+        return db.collection(model_name, allow_default=True)
 
     # ── Scanning ──────────────────────────────────────────────────────────────
 

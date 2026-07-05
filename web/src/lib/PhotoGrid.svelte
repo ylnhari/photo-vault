@@ -163,7 +163,13 @@
           {#if p.exists === false}
             <div class="gone">🚫<br /><small>{p.filename}</small></div>
           {:else}
-            <img src={api.thumbUrl(p.id)} alt={p.filename} loading="lazy" decoding="async"
+            <!-- Not loading="lazy": native lazy-loading unreliably stops
+                 fetching images entirely after enough client-side tab
+                 switches (Svelte destroys/remounts this grid on every {#if
+                 tab === ...} navigation) — reproduced live, recoverable only
+                 by a full page reload. Grids are capped (~200 items) and
+                 thumbnails are small cached WebP, so eager loading is cheap. -->
+            <img src={api.thumbUrl(p.id)} alt={p.filename} decoding="async"
                  draggable="false" on:load={(e) => onImgLoad(e, p)} />
             {#if p.caption}<div class="cap">{p.caption}</div>{/if}
             {#if selectMode || selected.has(p.id)}

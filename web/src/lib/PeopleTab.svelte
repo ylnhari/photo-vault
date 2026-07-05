@@ -176,7 +176,7 @@
                    on:click={() => dispatch("select", { id: s.image_id, ids: c.samples.map((x) => x.image_id) })}
                    on:keydown={(e) => onActivateKey(e, () => dispatch("select", { id: s.image_id, ids: c.samples.map((x) => x.image_id) }))}>
                 <img class="face" src={api.faceCropUrl(s.image_id, s.face_index)} alt="face"
-                     loading="lazy" decoding="async" />
+                     decoding="async" />
               </span>
             {/each}
           </div>

@@ -190,7 +190,7 @@
                      on:click={() => openSimilar(s)}
                      on:keydown={(e) => onActivateKey(e, () => openSimilar(s))}>
                   <img class="simthumb" src={api.thumbUrl(s.id)} alt={s.filename}
-                       loading="lazy" decoding="async" />
+                       decoding="async" />
                 </span>
               {/each}
             </div>

@@ -867,7 +867,7 @@
               <div class="dupe-cell" class:keeper={pi === 0} title={p.path} role="button" tabindex="0"
                    on:click={() => dispatch("select", { id: p.id, ids: g.photos.map((x) => x.id) })}
                    on:keydown={(e) => onActivateKey(e, () => dispatch("select", { id: p.id, ids: g.photos.map((x) => x.id) }))}>
-                <img src={api.thumbUrl(p.id)} alt={p.filename} loading="lazy" decoding="async" />
+                <img src={api.thumbUrl(p.id)} alt={p.filename} decoding="async" />
                 {#if pi === 0}<span class="keep-badge">keep</span>{/if}
               </div>
             {/each}

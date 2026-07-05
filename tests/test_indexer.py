@@ -86,6 +86,28 @@ def test_get_missing_partial(tmp_path):
     assert {img_id for img_id, _ in missing} == {"b", "c"}
 
 
+def test_get_missing_degrades_gracefully_with_no_active_model(tmp_path):
+    """db.collection() raises ValueError when no active embedding model is
+    configured (so embedding/indexing writes can't silently land in an
+    ungoverned fallback collection) — but read-only "what's already
+    embedded" checks like get_missing/get_missing_attributes/
+    get_embed_pending must still degrade to "nothing embedded yet" for a
+    fresh install, not 500. Regression test for that exact crash."""
+    from indexer import Indexer
+    catalog = _make_catalog(["a", "b"])
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
+
+    mock_client, _ = _mock_chromadb(existing_ids=[])
+
+    with patch("indexer.db.client", return_value=mock_client), \
+         patch("indexer.IMAGE_CATALOG_PATH", str(catalog_path)), \
+         patch("db.get_active_model", return_value=None):
+        idx = Indexer()
+        missing = idx.get_missing()
+
+    assert {img_id for img_id, _ in missing} == {"a", "b"}
+
+
 # ── Indexer.get_missing_files ──────────────────────────────────────────────────
 
 def test_get_missing_files_detects_deleted(tmp_path):

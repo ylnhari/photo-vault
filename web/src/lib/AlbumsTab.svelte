@@ -92,7 +92,7 @@
              role="button" tabindex="0">
           <div class="cover">
             {#if a.cover}
-              <img src={api.thumbUrl(a.cover)} alt={a.name} loading="lazy" decoding="async" />
+              <img src={api.thumbUrl(a.cover)} alt={a.name} decoding="async" />
             {:else}
               <div class="empty">📁</div>
             {/if}

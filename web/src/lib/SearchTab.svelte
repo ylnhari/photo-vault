@@ -15,6 +15,8 @@
   let loading = false;
   let initialLoading = false;
   let err = "";
+  let personNotFound = false;
+  let filterError = false;
 
   // Multi-select / batch state
   let selectMode = false;
@@ -115,15 +117,28 @@
   }
 
   async function doSearch() {
-    loading = true; err = "";
+    loading = true; err = ""; personNotFound = false; filterError = false;
     try {
       const filters = {};
       for (const k in selected) if (selected[k] && selected[k] !== "All") filters[k] = selected[k];
-      results = (await api.search(q, filters, person)).results;
+      const res = await api.search(q, filters, person);
+      results = res.results;
+      personNotFound = !!res.person_not_found;
+      filterError = !!res.filter_error;
     } catch (e) { err = e.message; }
     loading = false;
   }
-  function clear() { results = null; q = ""; person = ""; selected = {}; }
+  function clear() {
+    results = null; q = ""; person = "";
+    // Reset each key to the literal "All" rather than an empty object.
+    // bind:value={selected[key]} against a genuinely missing key resolves
+    // to undefined, and re-assigning a <select> already showing a real
+    // option back to undefined leaves it unmatched (blank) instead of
+    // falling back to the "All" option — reproduced by Clear after any
+    // filter had been touched.
+    selected = Object.fromEntries(FILTER_ORDER.map(([k]) => [k, "All"]));
+    personNotFound = false; filterError = false;
+  }
 </script>
 
 {#if indexedCount === 0}
@@ -200,6 +215,16 @@
 
       {#if results !== null}
         <div class="section-label">{results.length} results</div>
+        {#if personNotFound}
+          <p class="warn-text" style="font-size:13px; margin:4px 0 10px">
+            No one named "{person}" is registered yet — register them in the People tab, or check the spelling.
+          </p>
+        {/if}
+        {#if filterError}
+          <p class="warn-text" style="font-size:13px; margin:4px 0 10px">
+            One of your filters couldn't be applied and was ignored for this search — the results below are unfiltered.
+          </p>
+        {/if}
         <PhotoGrid photos={results} {selectMode} {resetToken}
                    on:select={(e) => dispatch("select", e.detail)}
                    on:selectionchange={onSelectionChange} />
@@ -227,4 +252,5 @@
   .sm { padding: 5px 10px; font-size: 13px; }
   .ghost.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   .danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+  .warn-text { color: var(--warn); }
 </style>
