@@ -414,6 +414,45 @@ def test_vision_job_tallies_models_used():
     }
 
 
+def test_vision_9router_waits_out_cooldown_instead_of_failing_batches():
+    """A 9Router post-429 cooldown must pause the job (pools refill), not let
+    every batch insta-fail its way into the consecutive-failure abort."""
+    mgr = JobManager()
+    fake = _fake_indexer(["a", "b", "c"], lambda *a, **k: None)
+    fake.compute_caption.side_effect = lambda *a, **k: ("9router:m", '{"caption":"ok"}')
+    cooldown = {"9router:m-model": 0.3}
+    calls = []
+    def fake_cooldowns():
+        calls.append(1)
+        # cooldown active on the first check, expired afterwards
+        if len(calls) == 1:
+            return dict(cooldown)
+        return {}
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("vision.ninerouter_cooldowns", side_effect=fake_cooldowns):
+        mgr.start("vision", vision_provider="9router",
+                  vision_model="9router:m-model")
+        s = _wait_idle(mgr)
+    assert s["ok"] == 3 and s["fail"] == 0
+    assert s["aborted"] is False
+    assert len(calls) >= 2  # actually consulted the cooldown table
+
+
+def test_vision_9router_stop_during_cooldown_wait_stops_cleanly():
+    mgr = JobManager()
+    fake = _fake_indexer(["a", "b"], lambda *a, **k: None)
+    fake.compute_caption.side_effect = lambda *a, **k: ("9router:m", '{"caption":"ok"}')
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("vision.ninerouter_cooldowns", return_value={"9router:m-model": 60.0}):
+        mgr.start("vision", vision_provider="9router",
+                  vision_model="9router:m-model")
+        time.sleep(0.1)          # let the worker enter the cooldown wait
+        mgr.stop()
+        s = _wait_idle(mgr)
+    assert s["stopped"] is True
+    assert s["fail"] == 0 and s["done"] == 0  # nothing burned during the wait
+
+
 def test_model_counts_reset_between_jobs():
     mgr = JobManager()
     fake = _fake_indexer(["a"], lambda *a, **k: None)

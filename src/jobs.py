@@ -249,6 +249,22 @@ class JobManager:
                 if self._stop.is_set():
                     self._update(stopped=True)
                     break
+                # A 9Router 429 means every pooled key/account for the model is
+                # momentarily dry — but pools refill (per-minute windows, key
+                # rotation), so a batch submitted during the cooldown would just
+                # burn the consecutive-failure budget on guaranteed skips and
+                # abort a job that could finish. Wait the cooldown out instead;
+                # Stop stays responsive via the 1s ticks.
+                if vp == "9router" and vm:
+                    from vision import ninerouter_cooldowns
+                    while not self._stop.is_set():
+                        wait = ninerouter_cooldowns().get(vm, 0)
+                        if wait <= 0:
+                            break
+                        time.sleep(min(1.0, wait))
+                    if self._stop.is_set():
+                        self._update(stopped=True)
+                        break
                 batch = ids[i:i + conc]
                 i += len(batch)
                 futures = {
