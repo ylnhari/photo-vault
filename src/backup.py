@@ -46,16 +46,22 @@ def _label(src: str) -> str:
 
 
 def backup_roots() -> list[tuple[str, str]]:
-    """[(src, dest)] pairs to mirror: every included scan folder under
-    <dest>/library/, plus data/ under <dest>/photo-vault-data."""
+    """[(src, dest)] pairs to mirror: every included scan folder lands at
+    <dest>/<its basename> (so C:\\Users\\ylnha\\Pictures backed up to D:\\
+    becomes simply D:\\Pictures — Hari's requested layout), plus data/ under
+    <dest>/photo-vault-data so captions/faces/index restore along with the
+    pixels. If two included folders share a basename, the full sanitized
+    path label is used for both to keep them apart."""
     dest = get_dest()
     if not dest:
         return []
     from folders import get_effective_scan_dirs
-    pairs = [
-        (src, os.path.join(dest, "library", _label(src)))
-        for src in get_effective_scan_dirs()
-    ]
+    dirs = get_effective_scan_dirs()
+    basenames = [os.path.basename(os.path.normpath(d)) or _label(d) for d in dirs]
+    pairs = []
+    for src, base in zip(dirs, basenames):
+        sub = base if basenames.count(base) == 1 else _label(src)
+        pairs.append((src, os.path.join(dest, sub)))
     pairs.append((DATA_DIR, os.path.join(dest, "photo-vault-data")))
     return pairs
 
@@ -151,8 +157,20 @@ def backup_one(src: str) -> str:
     if not os.path.isdir(src):
         return "skipped (source folder missing)"
     os.makedirs(dst, exist_ok=True)
+    # Photo folders: /E without purge, and video files invisible to robocopy
+    # (/XF) — videos are out of the app's scope for now (Hari, 2026-07-10:
+    # "keep them wherever they are"), and some live INSIDE the destination
+    # photo tree on the drive; a /MIR would delete them as extras. No purge
+    # also means a photo deleted on the laptop lingers in the backup — the
+    # safer failure mode until video handling lands and strict mirroring
+    # returns. photo-vault's own data/ DOES use /MIR: it has no videos, and
+    # stale ChromaDB segment files from older runs must never mix into a
+    # restore.
+    video_globs = ["*.mp4", "*.mov", "*.m4v", "*.avi", "*.mkv", "*.webm",
+                   "*.3gp", "*.mts", "*.m2ts", "*.wmv"]
+    mode = ["/MIR"] if src == DATA_DIR else (["/E", "/XF"] + video_globs)
     cmd = [
-        "robocopy", src, dst, "/MIR", "/R:1", "/W:1",
+        "robocopy", src, dst, *mode, "/R:1", "/W:1",
         # /FFT: FAT-style 2-second timestamp granularity, /DST: tolerate DST
         # offsets — without these an NTFS→exFAT mirror (the SD card is exFAT)
         # sees every file as "changed" and re-copies the whole library each run.

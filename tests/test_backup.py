@@ -26,12 +26,25 @@ def test_backup_roots_maps_folders_and_data(env):
     tmp_path, pics = env
     roots = backup.backup_roots()
     srcs = [s for s, _ in roots]
-    dests = [d for _, d in roots]
+    dests = dict(roots)
     assert str(pics) in srcs
     assert backup.DATA_DIR in srcs
-    assert any(d.endswith("photo-vault-data") for d in dests)
-    # library folders live under <dest>/library/<path-derived label>
-    assert any(os.sep + "library" + os.sep in d for d in dests)
+    assert dests[backup.DATA_DIR].endswith("photo-vault-data")
+    # a scan folder mirrors to <dest>/<its basename>: …\Pictures → …\Pictures
+    assert dests[str(pics)].endswith(os.sep + "Pictures")
+
+
+def test_backup_roots_same_basename_falls_back_to_full_label(tmp_path, monkeypatch):
+    import settings, folders
+    monkeypatch.setattr(backup, "STATE_PATH", str(tmp_path / "s.json"))
+    monkeypatch.setattr(settings, "load", lambda: {"backup_dest": str(tmp_path / "sd")})
+    a = tmp_path / "one" / "Pictures"
+    b = tmp_path / "two" / "Pictures"
+    a.mkdir(parents=True); b.mkdir(parents=True)
+    monkeypatch.setattr(folders, "get_effective_scan_dirs", lambda: [str(a), str(b)])
+    dests = dict(backup.backup_roots())
+    # both are named "Pictures" — they must NOT collide on the destination
+    assert dests[str(a)] != dests[str(b)]
 
 
 def test_status_reports_unconfigured(monkeypatch, tmp_path):
@@ -60,16 +73,28 @@ _SUMMARY = """
 """
 
 
-def test_backup_one_success_parses_summary_and_records(env):
+def test_backup_one_photo_root_copies_without_purge_and_skips_videos(env):
     tmp_path, pics = env
     proc = MagicMock(returncode=3, stdout=_SUMMARY)
     with patch("backup.subprocess.run", return_value=proc) as run:
         note = backup.backup_one(str(pics))
     cmd = run.call_args[0][0]
-    assert cmd[0] == "robocopy" and "/MIR" in cmd
-    assert cmd[1] == str(pics)
-    assert "5 copied" in note and "115 unchanged" in note and "2 removed" in note
+    assert cmd[0] == "robocopy" and cmd[1] == str(pics)
+    # photo roots: additive copy (no /MIR — drive-side videos must survive)
+    # with video files invisible to robocopy entirely
+    assert "/MIR" not in cmd and "/E" in cmd
+    assert "/XF" in cmd and "*.mp4" in cmd
+    assert "5 copied" in note and "115 unchanged" in note
     assert backup.status()["last_backup_at"] is not None
+
+
+def test_backup_one_data_root_uses_strict_mirror(env):
+    tmp_path, pics = env
+    proc = MagicMock(returncode=1, stdout=_SUMMARY)
+    with patch("backup.subprocess.run", return_value=proc) as run:
+        backup.backup_one(backup.DATA_DIR)
+    cmd = run.call_args[0][0]
+    assert "/MIR" in cmd and "/XF" not in cmd
 
 
 def test_backup_one_failure_raises(env):

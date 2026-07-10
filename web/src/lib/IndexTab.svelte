@@ -6,6 +6,7 @@
   import JobPanel from "./JobPanel.svelte";
   import SectionHead from "./SectionHead.svelte";
   import FolderPicker from "./FolderPicker.svelte";
+  import ErrLine from "./ErrLine.svelte";
   import { onActivateKey } from "./keyboard.js";
   const dispatch = createEventDispatcher();
 
@@ -13,7 +14,16 @@
   let job = null;
   let poll = null;
   let busy = {};
+  // One error at a time, SCOPED to the section whose action raised it —
+  // rendered inline there via <ErrLine>, not in a page-top banner the user
+  // may have scrolled away from. errAt = "" means global (top banner).
   let err = "";
+  let errAt = "";
+  const TYPE_SCOPE = { scan: "folders", ingest: "import", backup: "backup",
+                       dhash: "dupes", dedupe: "dupes" };
+  const typeScope = (t) => TYPE_SCOPE[t] || t || "";
+  function fail(scope, msg) { err = msg; errAt = scope; }
+  function clearErr() { err = ""; errAt = ""; }
   let rechecking = false;
   let stopRequesting = false;  // bound into JobPanel; reset on stop() failure so the button doesn't stick
 
@@ -119,7 +129,7 @@
     if (which === "ingest_dest") {
       settings.ingest_dest = path;
       await saveSettings();               // server validates; err shows reason
-      if (err) await loadSettings();      // revert the rejected value
+      if (err) { errAt = "import"; await loadSettings(); }  // show where the user acted
       if (stagingPath) validateSource(stagingPath);
     }
     if (which === "backup_dest") {
@@ -178,7 +188,7 @@
       if (job.active) startPolling();
     } catch (e) {
       console.error("indexProgress failed on mount", e);
-      err = "Could not load job status.";
+      fail("", "Could not load job status.");
     }
     await Promise.all([
       loadSettings(),
@@ -264,12 +274,12 @@
   function markDirty() { settingsDirty = true; }
 
   async function saveSettings() {
-    settingsSaving = true; err = "";
+    settingsSaving = true; clearErr();
     try {
       settings = normalizeRateLimits(await api.saveSettings(settings));
       settingsDirty = false;
       await refreshStatus();
-    } catch (e) { err = e.message; }
+    } catch (e) { fail("settings", e.message); }
     settingsSaving = false;
   }
 
@@ -365,14 +375,14 @@
   onDestroy(unsubJobStatus);
 
   async function start(type, extra = {}) {
-    err = "";
+    clearErr();
     // Save settings first if dirty
     if (settingsDirty) await saveSettings();
     try {
       job = await api.indexStart({ ...buildCfg(type), ...extra });
       if (job.active) startPolling();
       else { await refreshStatus(); dispatch("indexed"); }
-    } catch (e) { err = e.message; }
+    } catch (e) { fail(typeScope(type), e.message); }
   }
   async function stop() {
     try {
@@ -381,24 +391,25 @@
       // Return the button to a clickable state instead of leaving it stuck
       // on "Stopping…" forever after a transient failure.
       stopRequesting = false;
-      err = e.message;
+      fail(typeScope(job?.type), e.message);
     }
   }
   async function retry() {
     const type = job.type;
-    err = "";
+    clearErr();
     try {
       await api.indexReset();
       job = await api.indexStart(buildCfg(type));
       if (job.active) startPolling();
-    } catch (e) { err = e.message; }
+    } catch (e) { fail(typeScope(type), e.message); }
   }
   async function clearJob() {
-    err = "";
+    const scope = typeScope(job?.type);
+    clearErr();
     try {
       await api.indexReset();
       job = await api.indexProgress();
-    } catch (e) { err = e.message; }
+    } catch (e) { fail(scope, e.message); }
   }
 
   async function recheckHealth() {
@@ -427,20 +438,20 @@
   let dupesBusy = false;
   let dupeDeleteFiles = false;
   async function loadDupes() {
-    dupesBusy = true; err = "";
-    try { dupes = await api.duplicates(); } catch (e) { err = e.message; }
+    dupesBusy = true; clearErr();
+    try { dupes = await api.duplicates(); } catch (e) { fail("dupes", e.message); }
     dupesBusy = false;
   }
   async function removeDupeGroup(g) {
     const ids = g.photos.slice(1).map((p) => p.id);  // keep the largest file
-    busy = { ...busy, dupes: true }; err = "";
+    busy = { ...busy, dupes: true }; clearErr();
     try {
       await api.batchDelete(ids, dupeDeleteFiles);
       dupes.groups = dupes.groups.filter((x) => x !== g);
       dupes.total_groups -= 1;
       dupes = dupes;
       refreshStatus();
-    } catch (e) { err = e.message; }
+    } catch (e) { fail("dupes", e.message); }
     busy = { ...busy, dupes: false };
   }
 
@@ -455,28 +466,28 @@
     if (showTrash && trashItems === null) await loadTrash();
   }
   async function restoreTrash(ids = []) {
-    err = "";
+    clearErr();
     try {
       await api.trashRestore(ids);
       await Promise.all([loadTrash(), refreshStatus()]);
-    } catch (e) { err = e.message; }
+    } catch (e) { fail("trash", e.message); }
   }
   async function emptyTrash() {
-    err = "";
+    clearErr();
     try {
       await api.trashPurge([]);
       await Promise.all([loadTrash(), refreshStatus()]);
-    } catch (e) { err = e.message; }
+    } catch (e) { fail("trash", e.message); }
   }
 
   // ── folder actions ────────────────────────────────────────────────────────────
   async function addFolder() {
     const path = newFolderPath.trim(); if (!path) return;
-    busy = { ...busy, addFolder: true }; err = "";
+    busy = { ...busy, addFolder: true }; clearErr();
     try {
       const res = await api.addIncludedFolder(path);
-      if (res.status === "redundant") err = `Already covered by "${res.covered_by}".`;
-      else if (res.status === "duplicate") err = "Folder already in list.";
+      if (res.status === "redundant") fail("folders", `Already covered by "${res.covered_by}".`);
+      else if (res.status === "duplicate") fail("folders", "Folder already in list.");
       else { newFolderPath = ""; await loadFolderConfig(); }
     } catch (e) { err = e.message; }
     busy = { ...busy, addFolder: false };
@@ -488,42 +499,42 @@
   function requestRemoveFolder(f) { confirmRemove = { path: f.path, imageCount: f.image_count || 0 }; }
   async function confirmRemoveFolder() {
     if (!confirmRemove) return;
-    busy = { ...busy, removeFolder: true }; err = "";
+    busy = { ...busy, removeFolder: true }; clearErr();
     try {
       await api.removeIncludedFolder(confirmRemove.path, true);
       confirmRemove = null;
       await Promise.all([loadFolderConfig(), loadOrphaned(), refreshStatus()]);
-    } catch (e) { err = e.message; }
+    } catch (e) { fail("folders", e.message); }
     busy = { ...busy, removeFolder: false };
   }
   async function addExclude() {
     const path = newExcludePath.trim(); if (!path) return;
-    busy = { ...busy, addExclude: true }; err = "";
+    busy = { ...busy, addExclude: true }; clearErr();
     try {
       const res = await api.addExcludedFolder(path);
-      if (res.status === "duplicate") err = "Already excluded.";
+      if (res.status === "duplicate") fail("folders", "Already excluded.");
       else { newExcludePath = ""; await loadFolderConfig(); }
-    } catch (e) { err = e.message; }
+    } catch (e) { fail("folders", e.message); }
     busy = { ...busy, addExclude: false };
   }
   async function removeExclude(path) {
     busy = { ...busy, removeExclude: path };
     try { await api.removeExcludedFolder(path); await loadFolderConfig(); }
-    catch (e) { err = e.message; }
+    catch (e) { fail("folders", e.message); }
     busy = { ...busy, removeExclude: null };
   }
 
   // ── orphaned ──────────────────────────────────────────────────────────────────
   async function removeOrphanedAll() {
-    orphanedBusy = true; err = "";
+    orphanedBusy = true; clearErr();
     try { await api.cleanupOrphaned([]); await Promise.all([loadOrphaned(), refreshStatus()]); }
-    catch (e) { err = e.message; }
+    catch (e) { fail("orphaned", e.message); }
     orphanedBusy = false;
   }
   async function removeOrphanedOne(id) {
     busy = { ...busy, [id]: true };
     try { await api.cleanupOrphaned([id]); await Promise.all([loadOrphaned(), refreshStatus()]); }
-    catch (e) { err = e.message; }
+    catch (e) { fail("orphaned", e.message); }
     busy = { ...busy, [id]: false };
   }
 
@@ -568,8 +579,8 @@
   }
 </script>
 
-{#if err}
-  <div class="note-card">{err} <button class="ghost sm" on:click={() => err = ""}>×</button></div>
+{#if err && !errAt}
+  <div class="note-card">{err} <button class="ghost sm" on:click={clearErr}>×</button></div>
 {/if}
 
 {#if confirmRemove}
@@ -677,6 +688,7 @@
       {/each}
     </div>
   {/if}
+  <ErrLine {err} at={errAt} scope="orphaned" onclear={clearErr} />
 </div>
 {/if}
 
@@ -843,6 +855,7 @@
       <p class="hint" style="margin-top:6px">{rlSuggestNote}</p>
     {/if}
   </div>
+  <ErrLine {err} at={errAt} scope="settings" onclear={clearErr} />
 </div>
 
 <!-- A: Folder Management -->
@@ -928,6 +941,7 @@
       </button>
     {/if}
   </div>
+  <ErrLine {err} at={errAt} scope="folders" onclear={clearErr} />
 </div>
 
 <!-- Import & consolidate -->
@@ -975,6 +989,7 @@
       </button>
     </div>
   {/if}
+  <ErrLine {err} at={errAt} scope="import" onclear={clearErr} />
 </div>
 
 <!-- B: Vision analysis -->
@@ -1007,6 +1022,7 @@
       <p class="warn-text hint">Blocked: 9Router is selected for vision but no model is chosen.</p>
     {/if}
   {/if}
+  <ErrLine {err} at={errAt} scope="vision" onclear={clearErr} />
 </div>
 
 <!-- C: Embed -->
@@ -1051,6 +1067,7 @@
       <p class="warn-text hint">Blocked: 9Router is selected for embedding but no model is chosen.</p>
     {/if}
   {/if}
+  <ErrLine {err} at={errAt} scope="embed" onclear={clearErr} />
 </div>
 
 <!-- C2: Face detection (separate, user-controlled stage) -->
@@ -1075,6 +1092,7 @@
       ▶ Detect faces in {facesPending} photo{facesPending === 1 ? "" : "s"}
     </button>
   {/if}
+  <ErrLine {err} at={errAt} scope="faces" onclear={clearErr} />
 </div>
 
 <!-- Thumbnails: pregenerate grid previews -->
@@ -1099,6 +1117,7 @@
       ▶ Generate {thumbsPending} thumbnail{thumbsPending === 1 ? "" : "s"}
     </button>
   {/if}
+  <ErrLine {err} at={errAt} scope="thumbs" onclear={clearErr} />
 </div>
 
 <!-- Duplicates -->
@@ -1190,6 +1209,7 @@
   {:else if dupes}
     <p class="ok-text" style="margin-top:8px">✓ No duplicate groups found.</p>
   {/if}
+  <ErrLine {err} at={errAt} scope="dupes" onclear={clearErr} />
 </div>
 
 <!-- Trash -->
@@ -1218,6 +1238,7 @@
     <p class="hint" style="margin-top:6px">Restored photos keep their caption and
       reappear as embed-pending (run C to make them searchable again).</p>
   {/if}
+  <ErrLine {err} at={errAt} scope="trash" onclear={clearErr} />
 </div>
 {/if}
 
@@ -1246,6 +1267,7 @@
       <p class="warn-text hint">Blocked: 9Router is selected but no model is chosen (Run configuration).</p>
     {/if}
   {/if}
+  <ErrLine {err} at={errAt} scope="full" onclear={clearErr} />
 </div>
 
 <!-- E: Re-analyze -->
@@ -1269,6 +1291,7 @@
       🔄 Re-analyze {missingAttrs} stale photo{missingAttrs === 1 ? "" : "s"}
     </button>
   {/if}
+  <ErrLine {err} at={errAt} scope="reanalyze" onclear={clearErr} />
 </div>
 
 <!-- F: Active search model -->
@@ -1337,6 +1360,7 @@
   {:else}
     <p class="hint">Set a destination folder above (on the SD card) to enable backups.</p>
   {/if}
+  <ErrLine {err} at={errAt} scope="backup" onclear={clearErr} />
 </div>
 
 <FolderPicker open={picker !== null}
