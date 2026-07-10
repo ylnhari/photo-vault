@@ -120,6 +120,96 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
+# ── Token-budget robustness ───────────────────────────────────────────────────
+# A caption call can come back truncated when the model runs past maxOutputTokens
+# before finishing the JSON. The usual cause is NOT verbosity: "thinking" models
+# (gemini-2.5/3.x-flash) spend hidden reasoning tokens that ALSO count against
+# the cap, so a stingy budget gets eaten by reasoning and the visible JSON is cut
+# mid-field (observed: fails at 51–334 visible tokens under a 1400 cap; a 4096
+# cap fixed 12/12). maxOutputTokens only CAPS output — you're billed for tokens
+# actually produced, so a generous default is free for normal images. The default
+# is user-overridable (settings 'vision_max_tokens') and, on top of that, a
+# truncated response auto-escalates the budget so a one-off huge caption still
+# completes without anyone touching a setting.
+_DEFAULT_MAX_TOKENS = 4096
+_MAX_TOKENS_CEILING = 16384   # auto-escalation stops here, then fails loudly
+# finish_reason values that mean "cut off at the token cap", across providers:
+# OpenAI/LM Studio say "length"; 9Router/Gemini-compat say "max_tokens"; Gemini
+# native REST says "MAX_TOKENS". Compared lower-cased.
+_TRUNCATED_FINISH = {"length", "max_tokens", "model_length"}
+
+
+def _vision_max_tokens() -> int:
+    """User-set caption token budget (settings 'vision_max_tokens'), or the
+    generous default. Read per-call so a Settings change takes effect on the
+    next image without a restart."""
+    try:
+        import settings as _settings
+        v = int(_settings.load().get("vision_max_tokens") or 0)
+        return v if v > 0 else _DEFAULT_MAX_TOKENS
+    except Exception:
+        return _DEFAULT_MAX_TOKENS
+
+
+def _is_truncated_finish(finish_reason) -> bool:
+    return str(finish_reason or "").lower() in _TRUNCATED_FINISH
+
+
+def _salvage_json(text: str) -> str | None:
+    """Recover a parseable JSON object from a response that may be wrapped in
+    markdown fences or padded with prose, else None. Truncated (incomplete)
+    JSON has no matching close brace, so it correctly returns None — which the
+    escalation loop reads as 'still truncated, give it more room'."""
+    t = _strip_markdown(text)
+    try:
+        json.loads(t)
+        return t
+    except Exception:
+        pass
+    i, j = t.find("{"), t.rfind("}")
+    if 0 <= i < j:
+        cand = t[i:j + 1]
+        try:
+            json.loads(cand)
+            return cand
+        except Exception:
+            return None
+    return None
+
+
+class VisionTruncated(RuntimeError):
+    """Caption was cut at the token cap and still couldn't be salvaged even
+    after escalating the budget to the ceiling. Carries an actionable message
+    (raise vision_max_tokens / use a terser model). The image stays pending and
+    is retried on the next pass — never silently dropped."""
+
+
+def _caption_with_escalation(call, label: str) -> str:
+    """Run a caption call that returns (raw_text, finish_reason), salvaging
+    minor JSON noise and, on token-cap truncation, retrying with a doubled
+    budget up to the ceiling. `call` takes the max-token budget as its only arg
+    and may itself raise (429/404/etc.) — those propagate untouched so a
+    provider's own fallback logic still runs. Returns clean JSON text."""
+    budget = _vision_max_tokens()
+    while True:
+        raw, finish_reason = call(budget)
+        salvaged = _salvage_json(raw or "")
+        if salvaged is not None:
+            return salvaged
+        if _is_truncated_finish(finish_reason) and budget < _MAX_TOKENS_CEILING:
+            budget = min(budget * 2, _MAX_TOKENS_CEILING)
+            continue
+        if _is_truncated_finish(finish_reason):
+            raise VisionTruncated(
+                f"{label}: caption still truncated at the {budget}-token ceiling — "
+                f"this model keeps producing output (often hidden 'thinking' tokens) "
+                f"past the cap. Raise 'vision_max_tokens' in Settings, or switch to a "
+                f"terser model such as a -flash-lite variant."
+            )
+        # Not a token-cap cut — the model returned genuinely unparseable output.
+        raise RuntimeError(f"{label}: model returned unparseable (non-JSON) output")
+
+
 def _lm_studio_host() -> str:
     """LM_STUDIO_URL is the OpenAI-compat base (…/v1); LM Studio's own native
     API lives at the same host under /api/v0, not /v1."""
@@ -348,30 +438,39 @@ def _call_9router(base64_image: str, model: str) -> tuple[str, str]:
         raise ValueError("9Router requires an explicit vision model id")
     if _9r_cooldown.get(model, 0) > time.time():
         raise RuntimeError(f"9Router model {model} in post-429 cooldown — skipping")
-    ratelimit.acquire("9router")
     client = _get_9router_client()
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            stream=False,  # 9Router defaults to streaming; be explicit
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": _PROMPT},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-                        },
-                    ],
-                }
-            ],
-            max_tokens=1400,
-        )
-    except Exception as e:
-        if "429" in str(e):
-            _9r_cooldown[model] = time.time() + _RATE_LIMIT_COOLDOWN_SEC
-        raise
+    served_name = {"model": None}
+
+    def _one(max_tok):
+        # One acquire per attempt: an escalation retry is its own request.
+        ratelimit.acquire("9router")
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                stream=False,  # 9Router defaults to streaming; be explicit
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": _PROMPT},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=max_tok,
+            )
+        except Exception as e:
+            if "429" in str(e):
+                _9r_cooldown[model] = time.time() + _RATE_LIMIT_COOLDOWN_SEC
+            raise
+        served_name["model"] = getattr(response, "model", None)
+        choice = response.choices[0]
+        return choice.message.content.strip(), choice.finish_reason
+
+    text = _caption_with_escalation(_one, f"9Router:{model}")
     # 9Router may serve the request with a different upstream model than asked
     # (its own tiered fallback / provider-side aliasing — observed live:
     # gc/gemini-2.5-flash-lite answered by gemini-3.1-flash-lite). The caption
@@ -380,11 +479,11 @@ def _call_9router(base64_image: str, model: str) -> tuple[str, str]:
     # per-model bookkeeping must not lie). When the served name just echoes
     # the requested id (usually without the provider prefix), keep the
     # requested id — it carries strictly more information.
-    served = getattr(response, "model", None)
+    served = served_name["model"]
     used = model if (not served or served in model) else served
     if used is not model:
         print(f"[vision] 9Router served {model} via {served}")
-    return _strip_markdown(response.choices[0].message.content.strip()), used
+    return text, used
 
 
 _REQUIRED_VISION_KEYS = ("caption", "scene", "occasion", "weather", "group_size")
@@ -412,25 +511,30 @@ def validate_vision_output(text: str) -> dict:
 
 
 def _call_lm_studio(base64_image: str, model: str = "vision-model") -> str:
-    ratelimit.acquire("lm_studio")
     client = _get_lm_client()
-    response = client.chat.completions.create(
-        model=model or "vision-model",
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _PROMPT},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-                    },
-                ],
-            }
-        ],
-        max_tokens=1400,
-    )
-    return _strip_markdown(response.choices[0].message.content.strip())
+
+    def _one(max_tok):
+        ratelimit.acquire("lm_studio")
+        response = client.chat.completions.create(
+            model=model or "vision-model",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _PROMPT},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                        },
+                    ],
+                }
+            ],
+            max_tokens=max_tok,
+        )
+        choice = response.choices[0]
+        return choice.message.content.strip(), choice.finish_reason
+
+    return _caption_with_escalation(_one, "LM Studio")
 
 
 # Gemini has no public "remaining quota" endpoint — the closest real signal is
@@ -470,28 +574,29 @@ def _call_gemini(base64_image: str, model: str = None) -> tuple[str, str]:
             "GEMINI_API_KEY not set — LM Studio is offline and no fallback available"
         )
 
-    payload = json.dumps(
-        {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": _PROMPT},
-                        {
-                            "inline_data": {
-                                "mime_type": "image/jpeg",
-                                "data": base64_image,
-                            }
-                        },
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 1400,
-                "response_mime_type": "application/json",
-            },
-        }
-    ).encode("utf-8")
+    def _payload(max_tok):
+        return json.dumps(
+            {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": _PROMPT},
+                            {
+                                "inline_data": {
+                                    "mime_type": "image/jpeg",
+                                    "data": base64_image,
+                                }
+                            },
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": max_tok,
+                    "response_mime_type": "application/json",
+                },
+            }
+        ).encode("utf-8")
 
     # GEMINI_VISION_MODELS is deliberately ordered by rate-limit friendliness
     # (cheapest/highest-quota first) — keep that order for the fallback pool
@@ -507,19 +612,30 @@ def _call_gemini(base64_image: str, model: str = None) -> tuple[str, str]:
 
     last_err = None
     for m in candidates:
-        # One acquire per attempt, not per _call_gemini: a 429/404/503 retry
-        # against the next model is its own request as far as Gemini counts.
-        ratelimit.acquire("gemini")
-        url = f"{GEMINI_BASE}/models/{m}:generateContent?key={GEMINI_API_KEY}"
-        req = urllib.request.Request(
-            url, data=payload, headers={"Content-Type": "application/json"}
-        )
-        try:
+        def _one(max_tok, _m=m):
+            # One acquire per attempt, not per _call_gemini: a 429/404/503 retry
+            # against the next model — and an escalation retry — is its own
+            # request as far as Gemini counts.
+            ratelimit.acquire("gemini")
+            url = f"{GEMINI_BASE}/models/{_m}:generateContent?key={GEMINI_API_KEY}"
+            req = urllib.request.Request(
+                url, data=_payload(max_tok), headers={"Content-Type": "application/json"}
+            )
             with urllib.request.urlopen(req, timeout=30) as r:
                 result = json.loads(r.read())
-            text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+            cand = result["candidates"][0]
+            finish_reason = cand.get("finishReason")
+            # A MAX_TOKENS cut can leave the candidate with no content parts at
+            # all — read the finish reason first, default text to "" so the
+            # escalation loop sees "empty + truncated" and grows the budget.
+            parts = cand.get("content", {}).get("parts", [])
+            text = parts[0]["text"].strip() if parts else ""
+            return text, finish_reason
+
+        try:
+            text = _caption_with_escalation(_one, f"gemini:{m}")
             print(f"[vision] Gemini model used: {m}")
-            return _strip_markdown(text), m
+            return text, m
         except urllib.error.HTTPError as e:
             if e.code in (429, 404, 503):
                 if e.code == 429:

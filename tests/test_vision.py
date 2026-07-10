@@ -108,6 +108,68 @@ def test_strip_markdown_does_not_eat_leading_json_content():
     assert _strip_markdown('```\n{"caption":"nice"}\n```') == '{"caption":"nice"}'
 
 
+# ── _salvage_json ─────────────────────────────────────────────────────────────
+
+def test_salvage_json_extracts_from_preamble_and_postamble():
+    from vision import _salvage_json
+    assert _salvage_json('Here you go:\n{"a":1}\nHope that helps') == '{"a":1}'
+
+
+def test_salvage_json_returns_none_on_truncated():
+    from vision import _salvage_json
+    # cut mid-object: no matching close brace → unrecoverable (escalation signal)
+    assert _salvage_json('{"caption":"a long ca') is None
+
+
+def test_salvage_json_passthrough_clean():
+    from vision import _salvage_json
+    assert _salvage_json('{"a":1}') == '{"a":1}'
+
+
+# ── token-budget escalation ───────────────────────────────────────────────────
+
+def test_escalation_grows_budget_on_truncation_then_succeeds():
+    from vision import _caption_with_escalation
+    seen = []
+    def call(budget):
+        seen.append(budget)
+        # truncated at the first (default) budget, complete at the next
+        if len(seen) == 1:
+            return ('{"caption":"cut off mid fie', "max_tokens")
+        return ('{"caption":"done"}', "stop")
+    out = _caption_with_escalation(call, "test")
+    assert out == '{"caption":"done"}'
+    assert seen[1] == seen[0] * 2  # budget doubled on truncation
+
+
+def test_escalation_raises_actionable_error_at_ceiling():
+    from vision import _caption_with_escalation, VisionTruncated, _MAX_TOKENS_CEILING
+    def call(budget):
+        return ("{", "max_tokens")  # always truncated
+    with pytest.raises(VisionTruncated, match="vision_max_tokens"):
+        _caption_with_escalation(call, "test")
+
+
+def test_escalation_no_retry_when_not_truncated():
+    from vision import _caption_with_escalation
+    calls = []
+    def call(budget):
+        calls.append(budget)
+        return ("this is not json at all", "stop")
+    with pytest.raises(RuntimeError, match="unparseable"):
+        _caption_with_escalation(call, "test")
+    assert len(calls) == 1  # a non-truncation malformation is not retried
+
+
+def test_escalation_http_error_propagates_for_provider_fallback():
+    import urllib.error
+    from vision import _caption_with_escalation
+    def call(budget):
+        raise urllib.error.HTTPError("u", 429, "quota", {}, None)
+    with pytest.raises(urllib.error.HTTPError):
+        _caption_with_escalation(call, "test")
+
+
 # ── _call_gemini ──────────────────────────────────────────────────────────────
 
 def test_call_gemini_tries_lite_first():

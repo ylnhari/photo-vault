@@ -205,6 +205,7 @@ class SettingsReq(BaseModel):
     caption_source_model: str | None = None
     max_fail: int | None = None
     vision_concurrency: int | None = None
+    vision_max_tokens: int | None = None
     faces_during_embed: bool | None = None
     face_cluster_eps: float | None = None
     face_cluster_min_samples: int | None = None

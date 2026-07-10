@@ -35,6 +35,16 @@ DEFAULTS: dict = {
     # network-bound (LM Studio / Gemini), so concurrency gives a big speedup.
     "vision_concurrency": 4,
 
+    # Max output tokens per caption request. Only a CEILING — providers bill
+    # for tokens actually produced, so a generous value is free for normal
+    # images but leaves headroom for "thinking" models (gemini-2.5/3.x-flash)
+    # that spend hidden reasoning tokens against this same budget before
+    # emitting the JSON. Too low → JSON cut mid-field → the caption fails to
+    # parse. A truncated response also auto-escalates this budget per-image up
+    # to vision._MAX_TOKENS_CEILING, so raising this is rarely needed; it's the
+    # knob the truncation error message points at. 0 → the code default (4096).
+    "vision_max_tokens": 4096,
+
     # Whether the embed stage also runs face detection inline. Turn off to keep
     # face detection a fully separate, user-triggered stage (the "faces" job).
     "faces_during_embed": True,

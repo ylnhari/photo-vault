@@ -833,6 +833,15 @@
              on:change={markDirty} style="width:60px" />
       consecutive failures
     </label>
+    <label class="row" style="gap:8px; font-size:13px; flex-wrap:wrap">
+      Max caption tokens
+      <input type="number" bind:value={settings.vision_max_tokens} min="256" max="16384" step="256"
+             on:change={markDirty} style="width:80px" />
+      <span class="hint">Output ceiling per caption. Raise it if captions fail with a
+        “truncated at the token ceiling” error — “thinking” models (gemini-2.5/3.x-flash)
+        spend hidden reasoning tokens against this budget. Truncated captions also grow the
+        budget automatically, so this is rarely needed.</span>
+    </label>
     <label class="row" style="gap:8px; font-size:13px">
       <input type="checkbox" bind:checked={settings.faces_during_embed}
              on:change={markDirty} style="width:auto" />
