@@ -48,8 +48,10 @@ from vision import (
     list_lm_studio_models_v0,
     classify_lm_studio_model,
     list_gemini_vision_models,
+    list_9router_vision_models,
     validate_vision_output,
     gemini_cooldowns,
+    ninerouter_cooldowns,
 )
 from embeddings import (
     get_registry,
@@ -57,6 +59,8 @@ from embeddings import (
     set_active_model,
     collection_name_for,
     list_gemini_embed_models,
+    list_9router_embed_models,
+    ninerouter_embed_cooldowns,
 )
 from tagger import (
     add_person_reference,
@@ -201,6 +205,9 @@ class SettingsReq(BaseModel):
     faces_during_embed: bool | None = None
     face_cluster_eps: float | None = None
     face_cluster_min_samples: int | None = None
+    # {provider: {rps|rpm|rph|rpd: int}} — client-side request ceilings,
+    # 0 = unlimited. See settings.DEFAULTS["rate_limits"] / ratelimit.py.
+    rate_limits: dict | None = None
 
 
 class ClusterReq(BaseModel):
@@ -583,9 +590,21 @@ def index_start(req: IndexReq):
         raise HTTPException(
             409, "a delete/cleanup operation is in progress; wait for it to finish"
         )
-    # Compute the vision model label used in caption_history (for model-aware pending queries)
+    # 9Router has no LM-Studio-style auto-detect and the design rule is "only
+    # the user-chosen model, never a silent auto-pick" — refuse to start a job
+    # that would need one. Only checked for the stages this job type actually
+    # runs, so e.g. a faces job isn't blocked by an incomplete embed setting.
+    uses_vision = req.type in ("vision", "full", "reanalyze")
+    uses_embed = req.type in ("embed", "full", "reanalyze")
+    if uses_vision and req.vision_provider == "9router" and not req.vision_model:
+        raise HTTPException(422, "9Router requires an explicit vision model — pick one in Run configuration")
+    if uses_embed and req.embed_provider == "9router" and not req.embed_model:
+        raise HTTPException(422, "9Router requires an explicit embedding model — pick one in Run configuration")
+    # Compute the vision model label used in caption_history (for model-aware
+    # pending queries). None for auto AND 9router — see settings.vision_model_label,
+    # which jobs.start recomputes as the trusted value anyway.
     vml = None
-    if req.vision_provider not in ("auto", None) and req.vision_model:
+    if req.vision_provider not in ("auto", "9router", None) and req.vision_model:
         vml = f"{req.vision_provider}:{req.vision_model}"
     try:
         return manager.start(
@@ -607,7 +626,8 @@ def provider_models():
     """Models available per provider for the run-config dropdowns.
     Gemini lists only include verified models — no hardcoded fallback.
     LM Studio type/loaded-state comes from its native v0 API when reachable
-    (authoritative), falling back to a name-pattern guess otherwise."""
+    (authoritative), falling back to a name-pattern guess otherwise.
+    9Router lists come from the live gateway ([] when it's offline)."""
     lm_models = list_lm_studio_models()
     v0_by_id = {m["id"]: m for m in list_lm_studio_models_v0()}
     return {
@@ -618,6 +638,12 @@ def provider_models():
         "gemini_vision": list_gemini_vision_models(fallback=False),
         "gemini_embed": list_gemini_embed_models(fallback=False),
         "gemini_cooldowns": gemini_cooldowns(),
+        "ninerouter_vision": list_9router_vision_models(),
+        "ninerouter_embed": list_9router_embed_models(),
+        "ninerouter_cooldowns": {
+            **ninerouter_cooldowns(),
+            **ninerouter_embed_cooldowns(),
+        },
     }
 
 

@@ -40,6 +40,26 @@ SERVER_PORT = _load_port()
 # (e.g. http://host.docker.internal:1234/v1).
 LM_STUDIO_URL = os.environ.get("LM_STUDIO_URL", "http://localhost:1234/v1")
 
+
+def _load_9router_url(default_port: int = 20128) -> str:
+    """9Router (local OpenAI-compatible LLM gateway) base URL. Resolution order
+    mirrors _load_port: NINEROUTER_URL env → sibling ports.json registry
+    (registry.9router.port) → default. Loopback only, per house rule."""
+    env_url = os.environ.get("NINEROUTER_URL")
+    if env_url:
+        return env_url.rstrip("/")
+    port = default_port
+    registry = os.path.join(os.path.dirname(PROJECT_ROOT), "ports.json")
+    try:
+        with open(registry) as f:
+            port = int(json.load(f)["registry"]["9router"]["port"])
+    except Exception:
+        pass  # ports.json missing/malformed → default port; same spirit as _load_port
+    return f"http://127.0.0.1:{port}/v1"
+
+
+NINEROUTER_URL = _load_9router_url()
+
 # Gemini fallback — loaded from .env in project root
 def _load_env():
     env_path = os.path.join(PROJECT_ROOT, ".env")

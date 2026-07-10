@@ -14,6 +14,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import ratelimit
 import settings as settings_mod
 from indexer import Indexer, resolve_caption_json, build_embed_payload
 from vision import parse_vision_attributes, build_embedding_text
@@ -36,6 +37,12 @@ class JobManager:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._state = self._idle_state()
+        # Let Stop interrupt a rate-limit sleep inside a provider call — a
+        # full rpm/rpd window could otherwise hold the worker for minutes to
+        # hours after the user pressed Stop. Providers raise
+        # ratelimit.Cancelled when this fires mid-wait; the runners treat it
+        # as "stopped", never as a per-image failure.
+        ratelimit.set_cancel_event(self._stop)
 
     @staticmethod
     def _idle_state() -> dict:
@@ -43,7 +50,8 @@ class JobManager:
             "active": False, "type": None, "total": 0, "done": 0,
             "ok": 0, "fail": 0, "skipped": 0, "failed_ids": [], "log": [],
             "aborted": False, "stopped": False, "finished": False, "error": None,
-            "started_at": None, "max_fail": 5,
+            "started_at": None, "max_fail": 5, "model_counts": {},
+            "substitution": None,
             "vision_provider": "auto", "vision_model": None,
             "embed_provider": "auto", "embed_model": None,
             "caption_source_model": None,
@@ -144,6 +152,22 @@ class JobManager:
             s = dict(self._state)
             s["log"] = list(s["log"][-30:])
             s["failed_ids"] = list(s["failed_ids"])
+            s["model_counts"] = dict(s["model_counts"])
+            # ETA from the cumulative average rate so far. Deliberately
+            # includes time spent waiting on rate limits — an ETA that
+            # ignored the throttle would read absurdly optimistic the moment
+            # a window fills.
+            s["eta_seconds"] = None
+            s["rate_per_min"] = None
+            if s["active"] and s["done"] and s["started_at"]:
+                elapsed = time.time() - s["started_at"]
+                if elapsed > 0:
+                    rate = s["done"] / elapsed
+                    s["eta_seconds"] = round(max(0, s["total"] - s["done"]) / rate)
+                    s["rate_per_min"] = round(rate * 60, 1)
+            # Which providers (if any) are currently sleeping on a rate-limit
+            # window, so the UI can say WHY the bar froze.
+            s["rate_wait"] = ratelimit.waiting() if s["active"] else {}
             return s
 
     def reset(self):
@@ -217,17 +241,27 @@ class JobManager:
                     bid = futures[fut]
                     try:
                         done[bid] = (fut.result(), None)
+                    except ratelimit.Cancelled:
+                        # Stop pressed while this item waited on a rate-limit
+                        # slot — it never reached the provider. (None, None)
+                        # marks it "still pending": not ok, not failed, not
+                        # done. The stop check at the top of the next loop
+                        # iteration ends the job.
+                        done[bid] = (None, None)
                     except Exception as e:
                         done[bid] = (None, str(e))
                 for bid in batch:
                     result, errm = done[bid]
+                    if result is None and errm is None:
+                        continue
                     fname = idx.image_catalog["images"].get(bid, {}).get("filename", "")
                     if errm is None:
                         vmodel, text = result
                         idx.record_caption(bid, vmodel, text)
                         consecutive = 0
                         icon = "cloud" if vmodel and "gemini" in vmodel.lower() else "ok"
-                        self._update(ok=1, done=1, log=(icon, bid, f"vision:{vmodel}", fname))
+                        self._update(ok=1, done=1, model_used=vmodel,
+                                     log=(icon, bid, f"vision:{vmodel}", fname))
                     else:
                         consecutive += 1
                         self._update(fail=1, done=1, failed_id=bid, log=("fail", bid, errm, fname))
@@ -248,7 +282,13 @@ class JobManager:
         per-batch on this thread. The dedicated 'embed' job path — 'full' and
         'reanalyze' still run item-by-item via _run_sequential.
         """
-        from embeddings import get_embeddings_batch, collection_name_for
+        from embeddings import (
+            get_embeddings_batch,
+            collection_name_for,
+            last_embed_error,
+            last_substitution,
+            resolve_9router_embed_id,
+        )
         import db
 
         ep, em = cfg["embed_provider"], cfg["embed_model"]
@@ -301,15 +341,37 @@ class JobManager:
                     break
                 continue
 
-            vectors, model_name, source = get_embeddings_batch(
-                texts, force_provider=ep, model=em
-            )
+            try:
+                vectors, model_name, source = get_embeddings_batch(
+                    texts, force_provider=ep, model=em
+                )
+            except ratelimit.Cancelled:
+                # Stop pressed during a rate-limit wait — the chunk never
+                # reached the provider; its items stay pending, not failed.
+                self._update(stopped=True)
+                break
             if vectors is None:
+                # Surface the real provider error in the job log — "9Router
+                # substituted embedding model (X → Y)" tells the user to
+                # restart with a different model, while a connection error
+                # just means the service needs to come back first.
+                reason = last_embed_error() or "all embedding providers unavailable"
+                sub = last_substitution()
+                if sub:
+                    # Structured record so the UI can offer one-click
+                    # recovery: switch the embed model to what 9Router
+                    # actually serves and re-run. "suggested" is the full
+                    # selectable id (served names come back prefix-stripped).
+                    with self._lock:
+                        self._state["substitution"] = {
+                            **sub,
+                            "suggested": resolve_9router_embed_id(
+                                sub["served"], sub["requested"]),
+                        }
                 for iid, img_data, _ in members:
                     consecutive += 1
                     self._update(fail=1, done=1, failed_id=iid,
-                                 log=("fail", iid,
-                                      "embedding failed (LM Studio and Gemini both unavailable)",
+                                 log=("fail", iid, f"embedding failed — {reason}",
                                       img_data.get("filename", "")))
                 if consecutive >= max_fail:
                     self._update(aborted=True)
@@ -432,6 +494,10 @@ class JobManager:
                     consecutive = 0
                     icon = "cloud" if "gemini" in note.lower() else "ok"
                     self._update(ok=1, done=1, log=(icon, img_id, note, fname))
+            except ratelimit.Cancelled:
+                # Stop during a rate-limit wait: the item stays pending.
+                self._update(stopped=True)
+                break
             except Exception as e:
                 consecutive += 1
                 self._update(fail=1, done=1, failed_id=img_id,
@@ -446,12 +512,18 @@ class JobManager:
             idx._save_catalog()
 
     def _update(self, ok=0, fail=0, skipped=0, done=0, failed_id=None, log=None,
-                stopped=False, aborted=False):
+                stopped=False, aborted=False, model_used=None):
         with self._lock:
             self._state["ok"] += ok
             self._state["fail"] += fail
             self._state["skipped"] += skipped
             self._state["done"] += done
+            if model_used:
+                # Per-model tally for the run summary — with 9Router the
+                # gateway can substitute serving models mid-run, so one run
+                # can legitimately produce captions from several models.
+                mc = self._state["model_counts"]
+                mc[model_used] = mc.get(model_used, 0) + 1
             if failed_id is not None:
                 self._state["failed_ids"].append(failed_id)
             if log is not None:

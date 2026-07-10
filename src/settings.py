@@ -42,7 +42,30 @@ DEFAULTS: dict = {
     # DBSCAN face-clustering parameters (advanced).
     "face_cluster_eps": 0.5,
     "face_cluster_min_samples": 3,
+
+    # Client-side request ceilings per provider — 0 = unlimited. Providers
+    # (Gemini free tier especially) throttle requests per second/minute/day;
+    # setting these at or under the published quota makes jobs pace themselves
+    # instead of burning quota on 429s and tripping model cooldowns. Enforced
+    # by ratelimit.acquire() before every provider inference call; counters
+    # are in-memory sliding windows that reset on server restart.
+    "rate_limits": {
+        "lm_studio": {"rps": 0, "rpm": 0, "rph": 0, "rpd": 0},
+        "gemini":    {"rps": 0, "rpm": 0, "rph": 0, "rpd": 0},
+        "9router":   {"rps": 0, "rpm": 0, "rph": 0, "rpd": 0},
+    },
 }
+
+
+def _merge_rate_limits(saved_rl: dict | None) -> dict:
+    """rate_limits is nested one level deeper than everything else — a plain
+    {**DEFAULTS, **saved} would let a partial saved dict (e.g. only "gemini")
+    silently drop the other providers' entries. Merge per provider instead."""
+    merged = {p: dict(lims) for p, lims in DEFAULTS["rate_limits"].items()}
+    for prov, lims in (saved_rl or {}).items():
+        if isinstance(lims, dict):
+            merged[prov] = {**merged.get(prov, {}), **lims}
+    return merged
 
 
 def load() -> dict:
@@ -50,10 +73,16 @@ def load() -> dict:
         try:
             with open(SETTINGS_PATH) as f:
                 saved = json.load(f)
-            return {**DEFAULTS, **saved}
+            merged = {**DEFAULTS, **saved}
+            merged["rate_limits"] = _merge_rate_limits(saved.get("rate_limits"))
+            return merged
         except Exception:
             pass
-    return dict(DEFAULTS)
+    # deep-copy the nested rate_limits so callers mutating the returned dict
+    # can't corrupt DEFAULTS
+    fresh = dict(DEFAULTS)
+    fresh["rate_limits"] = _merge_rate_limits(None)
+    return fresh
 
 
 def save(settings: dict):
@@ -76,11 +105,15 @@ def update(patch: dict) -> dict:
 def vision_model_label(settings: dict) -> str | None:
     """
     The model label key used in caption_history (e.g. "lm_studio:qwen2-vl-7b").
-    Returns None when provider/model is "auto" (label can't be predicted without
-    knowing what's loaded in LM Studio at runtime).
+    Returns None when the label can't be predicted before the call:
+      - "auto": depends on what's loaded in LM Studio at runtime
+      - "9router": the gateway may substitute the serving model, and captions
+        are stored under the model that ACTUALLY produced them — so a 9Router
+        run targets photos with no caption at all (coverage), not per-label
+        completeness, which would loop forever on substituted labels.
     """
     p = settings.get("vision_provider", "auto")
     m = settings.get("vision_model")
-    if p == "auto" or m is None:
+    if p in ("auto", "9router") or m is None:
         return None
     return f"{p}:{m}"

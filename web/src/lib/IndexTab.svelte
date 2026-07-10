@@ -17,15 +17,28 @@
   let stopRequesting = false;  // bound into JobPanel; reset on stop() failure so the button doesn't stick
 
   // ── provider model catalogue ─────────────────────────────────────────────────
-  let pmodels = { lm_studio: [], lm_studio_types: {}, gemini_vision: [], gemini_embed: [], gemini_cooldowns: {} };
+  let pmodels = { lm_studio: [], lm_studio_types: {}, gemini_vision: [], gemini_embed: [], gemini_cooldowns: {},
+                  ninerouter_vision: [], ninerouter_embed: [], ninerouter_cooldowns: {} };
 
   // ── app settings ─────────────────────────────────────────────────────────────
-  let settings = {
+  // Provider rate limits: 0 = unlimited. The grid below binds straight into
+  // settings.rate_limits[provider][window], so every loaded settings object
+  // must carry the full structure even if the server response is partial.
+  const RL_PROVIDERS = [["lm_studio", "LM Studio"], ["gemini", "Gemini"], ["9router", "9Router"]];
+  const RL_WINDOWS = [["rps", "req/sec"], ["rpm", "req/min"], ["rph", "req/hour"], ["rpd", "req/day"]];
+  function normalizeRateLimits(s) {
+    s.rate_limits = s.rate_limits || {};
+    for (const [p] of RL_PROVIDERS)
+      s.rate_limits[p] = { rps: 0, rpm: 0, rph: 0, rpd: 0, ...(s.rate_limits[p] || {}) };
+    return s;
+  }
+
+  let settings = normalizeRateLimits({
     vision_provider: "auto", vision_model: null,
     embed_provider: "auto",  embed_model: null,
     caption_source_model: null,
     max_fail: 5,
-  };
+  });
   let settingsDirty = false;
   let settingsSaving = false;
 
@@ -46,7 +59,22 @@
     ["auto", "Auto"],
     ["lm_studio", "LM Studio"],
     ["gemini", "Gemini"],
+    ["9router", "9Router"],
   ];
+
+  // 9Router model ids are provider-prefixed; translate the prefix into a
+  // human tag so "the same model via two providers" stays tellable-apart.
+  const NINEROUTER_PREFIX_TAGS = {
+    "gc/": "Gemini CLI", "gemini/": "Gemini API", "kr/": "Kiro · credits",
+    "openrouter/": "OpenRouter", "oc/": "OpenCode", "mmf/": "MiMo",
+  };
+  function ninerouterTag(id) {
+    for (const [p, tag] of Object.entries(NINEROUTER_PREFIX_TAGS))
+      if (id.startsWith(p)) return tag;
+    return "";
+  }
+
+  const PROVIDER_NAMES = { lm_studio: "LM Studio", gemini: "Gemini", "9router": "9Router" };
 
   // Human titles for the "blocked — X is running" messages below, mirrors
   // JobPanel's own TITLES map so the two never disagree on wording.
@@ -79,7 +107,7 @@
   });
 
   async function loadSettings() {
-    try { settings = await api.getSettings(); settingsDirty = false; } catch {}
+    try { settings = normalizeRateLimits(await api.getSettings()); settingsDirty = false; } catch {}
   }
   async function loadFolderConfig() {
     try { folderConfig = await api.getFolderConfig(); } catch {}
@@ -112,16 +140,25 @@
   // Dropdown options for current provider selection
   $: visionModelOpts = settings.vision_provider === "lm_studio" ? lmVisionModels
                      : settings.vision_provider === "gemini" ? pmodels.gemini_vision
+                     : settings.vision_provider === "9router" ? (pmodels.ninerouter_vision || [])
                      : [];
   $: embedModelOpts  = settings.embed_provider === "lm_studio" ? lmEmbedModels
                      : settings.embed_provider === "gemini" ? pmodels.gemini_embed
+                     : settings.embed_provider === "9router" ? (pmodels.ninerouter_embed || [])
                      : [];
+
+  // 9Router has no auto-detect: a model choice is mandatory (the API also
+  // rejects the job with a 422, this just surfaces it before the click).
+  $: visionCfgIncomplete = settings.vision_provider === "9router" && !settings.vision_model;
+  $: embedCfgIncomplete  = settings.embed_provider === "9router" && !settings.embed_model;
 
   // All previously used vision model labels (from caption_history summary)
   $: usedVisionModels = Object.keys($status.model_status?.vision?.model_summary || {});
 
-  // Vision model label for the current settings (e.g. "lm_studio:qwen2-vl-7b")
-  $: selectedVisionLabel = (settings.vision_provider && settings.vision_provider !== "auto" && settings.vision_model)
+  // Vision model label for the current settings (e.g. "lm_studio:qwen2-vl-7b").
+  // Not shown for 9Router: the gateway can substitute the serving model, so
+  // captions are stored under the model that actually produced them.
+  $: selectedVisionLabel = (settings.vision_provider && !["auto", "9router"].includes(settings.vision_provider) && settings.vision_model)
     ? `${settings.vision_provider}:${settings.vision_model}` : null;
 
   // Model-aware counts from extended status
@@ -145,11 +182,25 @@
   async function saveSettings() {
     settingsSaving = true; err = "";
     try {
-      settings = await api.saveSettings(settings);
+      settings = normalizeRateLimits(await api.saveSettings(settings));
       settingsDirty = false;
       await refreshStatus();
     } catch (e) { err = e.message; }
     settingsSaving = false;
+  }
+
+  // One-click recovery after a 9Router embed-model substitution: adopt the
+  // model the gateway actually serves (its own fresh collection — the strict
+  // one-vector-space-per-collection rule is what aborted the run) and re-run.
+  let switchingServed = false;
+  async function switchToServedAndRerun() {
+    if (!job?.substitution?.suggested) return;
+    switchingServed = true;
+    settings.embed_provider = "9router";
+    settings.embed_model = job.substitution.suggested;
+    await saveSettings();
+    if (!err) await start("embed");
+    switchingServed = false;
   }
 
   // When provider changes, clear model selection
@@ -185,7 +236,20 @@
     }, 1000);
   }
 
-  $: noServices = $health.loaded && !$health.lm_studio && !$health.gemini;
+  $: noServices = $health.loaded && !$health.lm_studio && !$health.gemini && !$health.ninerouter;
+
+  // "Online" (server answered) is NOT "ready" — LM Studio lists JIT-loadable
+  // models even with nothing in memory. When its v0 API tells us the real
+  // loaded state, reflect it: online with no model loaded = warn, not green.
+  $: lmState = $health.lm_studio_state || { known: false };
+  $: lmPillState = !$health.lm_studio ? "off"
+                 : (lmState.known && !lmState.vision_loaded && !lmState.embed_loaded) ? "warn"
+                 : "on";
+  $: lmPillDetail = !$health.lm_studio ? "offline"
+                  : !lmState.known ? "online"
+                  : [lmState.vision_loaded && `vision: ${lmState.vision_loaded}`,
+                     lmState.embed_loaded && `embed: ${lmState.embed_loaded}`]
+                      .filter(Boolean).join(" · ") || "online — no model loaded";
   $: running = job && job.active;
   $: scanRunning = running && job.type === "scan";
   $: st = $status;
@@ -253,7 +317,13 @@
 
   async function recheckHealth() {
     rechecking = true;
-    await refreshHealth();
+    // Re-fetch the model catalogue too — its loaded/not-loaded tags were
+    // previously only fetched on mount, so a model unloaded in LM Studio
+    // kept showing "● loaded" here forever.
+    await Promise.all([
+      refreshHealth(),
+      api.providerModels().then(r => { pmodels = r; }).catch(() => {}),
+    ]);
     rechecking = false;
   }
 
@@ -402,6 +472,12 @@
       const cooldown = pmodels.gemini_cooldowns?.[id];
       return cooldown ? `⏳ rate-limited (${Math.ceil(cooldown)}s)` : "";
     }
+    if (provider === "9router") {
+      const cooldown = pmodels.ninerouter_cooldowns?.[id];
+      const tags = [ninerouterTag(id)];
+      if (cooldown) tags.push(`⏳ pool exhausted (${Math.ceil(cooldown)}s)`);
+      return tags.filter(Boolean).map(t => `[${t}]`).join("  ");
+    }
     return "";
   }
 </script>
@@ -436,10 +512,11 @@
     {#if !$health.loaded}
       <StatusPill label="Checking…" state="unknown" />
     {:else}
-      <StatusPill label="LM Studio" state={$health.lm_studio ? "on" : "off"}
-                  detail={$health.lm_studio ? "online" : "offline"} />
+      <StatusPill label="LM Studio" state={lmPillState} detail={lmPillDetail} />
       <StatusPill label="Gemini" state={$health.gemini ? "on" : ($health.gemini_key_set ? "warn" : "off")}
                   detail={$health.gemini ? "fallback ready" : ($health.gemini_key_set ? "unreachable" : "no key")} />
+      <StatusPill label="9Router" state={$health.ninerouter ? "on" : "off"}
+                  detail={$health.ninerouter ? "gateway online" : "offline"} />
     {/if}
   </div>
   {#if noServices}
@@ -549,13 +626,24 @@
       {#if settings.vision_provider !== "auto"}
         {#if visionModelOpts.length}
           <select bind:value={settings.vision_model} on:change={markDirty}>
-            <option value={null}>— auto-pick —</option>
+            {#if settings.vision_provider !== "9router"}
+              <option value={null}>— auto-pick —</option>
+            {:else}
+              <option value={null} disabled>— choose a model (required) —</option>
+            {/if}
             {#each visionModelOpts as m}
               <option value={m}>{m} {modelTypeLabel(m, settings.vision_provider)}</option>
             {/each}
           </select>
+          {#if visionCfgIncomplete}
+            <p class="warn-text hint">9Router has no auto-detect — pick the exact vision model to use.</p>
+          {:else if settings.vision_provider === "9router"}
+            <p class="hint">9Router runs caption photos that have no caption yet. If the gateway
+              substitutes the serving model, the caption is kept and credited to the model that
+              actually produced it (see "Models used" in the job panel).</p>
+          {/if}
         {:else}
-          <p class="warn-text hint">No {settings.vision_provider === "lm_studio" ? "LM Studio" : "Gemini"} vision models found.</p>
+          <p class="warn-text hint">No {PROVIDER_NAMES[settings.vision_provider]} vision models found.{settings.vision_provider === "9router" ? " Is 9Router running?" : ""}</p>
         {/if}
       {:else}
         <p class="hint">LM Studio first → Gemini fallback. Model auto-detected.</p>
@@ -579,13 +667,21 @@
       {#if settings.embed_provider !== "auto"}
         {#if embedModelOpts.length}
           <select bind:value={settings.embed_model} on:change={markDirty}>
-            <option value={null}>— auto-pick —</option>
+            {#if settings.embed_provider !== "9router"}
+              <option value={null}>— auto-pick —</option>
+            {:else}
+              <option value={null} disabled>— choose a model (required) —</option>
+            {/if}
             {#each embedModelOpts as m}
               <option value={m}>{m} {modelTypeLabel(m, settings.embed_provider)}</option>
             {/each}
           </select>
+          {#if embedCfgIncomplete}
+            <p class="warn-text hint">9Router has no auto-detect — pick the exact embedding model to use.
+              Each model gets its own search index; changing model means re-embedding.</p>
+          {/if}
         {:else}
-          <p class="warn-text hint">No {settings.embed_provider === "lm_studio" ? "LM Studio" : "Gemini"} embed models found.</p>
+          <p class="warn-text hint">No {PROVIDER_NAMES[settings.embed_provider]} embed models found.{settings.embed_provider === "9router" ? " Is 9Router running?" : ""}</p>
         {/if}
       {:else}
         <p class="hint">LM Studio embed model first → Gemini text-embedding fallback.</p>
@@ -628,6 +724,30 @@
       Detect faces during embedding
       <span class="hint">(off → run face detection separately below)</span>
     </label>
+  </div>
+
+  <!-- Provider rate limits -->
+  <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px">
+    <div class="cfg-label">Provider rate limits</div>
+    <p class="hint" style="margin-bottom:8px">
+      Ceilings on captioning/embedding requests per provider — a job pauses when a window
+      fills instead of burning quota on 429 errors (the panel shows when it's waiting).
+      0 = unlimited. Changes apply immediately, even mid-job. Counters are in-memory and
+      reset when the server restarts.
+    </p>
+    <div class="rl-grid" role="group" aria-label="Provider rate limits">
+      <span></span>
+      {#each RL_WINDOWS as [, wlabel]}<span class="rl-head">{wlabel}</span>{/each}
+      {#each RL_PROVIDERS as [pkey, plabel] (pkey)}
+        <span class="rl-prov">{plabel}</span>
+        {#each RL_WINDOWS as [wkey, wlabel] (wkey)}
+          <input type="number" min="0" placeholder="0"
+                 aria-label="{plabel} {wlabel}"
+                 bind:value={settings.rate_limits[pkey][wkey]}
+                 on:change={markDirty} />
+        {/each}
+      {/each}
+    </div>
   </div>
 </div>
 
@@ -738,9 +858,13 @@
   {:else if running}
     <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
   {:else}
-    <button class="primary" on:click={() => start("vision")} disabled={noServices}>
+    <button class="primary" on:click={() => start("vision")} disabled={noServices || visionCfgIncomplete}
+            title={visionCfgIncomplete ? "Pick a 9Router vision model in Run configuration first" : ""}>
       ▶ Caption {visionPending} photo{visionPending === 1 ? "" : "s"}
     </button>
+    {#if visionCfgIncomplete}
+      <p class="warn-text hint">Blocked: 9Router is selected for vision but no model is chosen.</p>
+    {/if}
   {/if}
 </div>
 
@@ -758,6 +882,19 @@
   {/if}
   {#if jobIs(job, "embed")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+    {#if !job.active && job.substitution}
+      <div class="confirm-card" style="margin-top:10px">
+        <span class="warn-text">⚠ 9Router is serving <code>{job.substitution.served}</code>
+        instead of <code>{job.substitution.requested}</code> — the run was stopped so vectors
+        from two models never mix in one search index.</span>
+        <div class="row" style="gap:10px; margin-top:10px">
+          <button class="primary" on:click={switchToServedAndRerun} disabled={switchingServed}>
+            {switchingServed ? "Switching…" : `Switch to ${job.substitution.suggested} & re-run`}
+          </button>
+          <span class="hint">Uses its own fresh collection; pending is recomputed, nothing is lost.</span>
+        </div>
+      </div>
+    {/if}
   {:else if embedPending === 0 && mEmbed.eligible > 0}
     <p class="ok-text">✓ All eligible captions are embedded.</p>
   {:else if embedPending === 0}
@@ -765,9 +902,13 @@
   {:else if running}
     <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
   {:else}
-    <button class="primary" on:click={() => start("embed")} disabled={noServices}>
+    <button class="primary" on:click={() => start("embed")} disabled={noServices || embedCfgIncomplete}
+            title={embedCfgIncomplete ? "Pick a 9Router embedding model in Run configuration first" : ""}>
       ▶ Embed {embedPending} photo{embedPending === 1 ? "" : "s"}
     </button>
+    {#if embedCfgIncomplete}
+      <p class="warn-text hint">Blocked: 9Router is selected for embedding but no model is chosen.</p>
+    {/if}
   {/if}
 </div>
 
@@ -933,9 +1074,13 @@
     <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
   {:else}
     <p class="hint">First-time setup: runs B then C for everything not yet indexed.</p>
-    <button class="primary" on:click={() => start("full")} disabled={noServices}>
+    <button class="primary" on:click={() => start("full")} disabled={noServices || visionCfgIncomplete || embedCfgIncomplete}
+            title={visionCfgIncomplete || embedCfgIncomplete ? "Pick 9Router model(s) in Run configuration first" : ""}>
       ▶ Index {missingFull} photo{missingFull === 1 ? "" : "s"} from scratch
     </button>
+    {#if visionCfgIncomplete || embedCfgIncomplete}
+      <p class="warn-text hint">Blocked: 9Router is selected but no model is chosen (Run configuration).</p>
+    {/if}
   {/if}
 </div>
 
@@ -955,7 +1100,8 @@
   {:else if running}
     <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
   {:else}
-    <button on:click={() => start("reanalyze")} disabled={noServices}>
+    <button on:click={() => start("reanalyze")} disabled={noServices || visionCfgIncomplete || embedCfgIncomplete}
+            title={visionCfgIncomplete || embedCfgIncomplete ? "Pick 9Router model(s) in Run configuration first" : ""}>
       🔄 Re-analyze {missingAttrs} stale photo{missingAttrs === 1 ? "" : "s"}
     </button>
   {/if}
@@ -1006,6 +1152,11 @@
     text-transform: uppercase; letter-spacing:.05em; margin: 12px 0 6px; }
   .cfg-label { font-size: 12px; font-weight: 600; color: var(--muted);
     text-transform: uppercase; letter-spacing:.05em; margin-bottom: 8px; }
+  .rl-grid { display: grid; grid-template-columns: max-content repeat(4, 90px);
+    gap: 6px 10px; align-items: center; max-width: 520px; }
+  .rl-grid .rl-head { font-size: 12px; color: var(--muted); text-align: center; }
+  .rl-grid .rl-prov { font-size: 13px; }
+  .rl-grid input { width: 100%; padding: 5px 8px; font-size: 13px; }
   .hint { color: var(--muted); font-size: 13px; font-weight: 400; margin: 0; }
   .ok-text { color: var(--success); font-size: 14px; }
   .err-text { color: var(--danger); font-size: 13px; }

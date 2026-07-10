@@ -7,11 +7,13 @@ import urllib.error
 from datetime import datetime
 from constants import (
     LM_STUDIO_URL,
+    NINEROUTER_URL,
     GEMINI_API_KEY,
     GEMINI_BASE,
     EMBEDDING_REGISTRY_PATH,
 )
-from vision import list_lm_studio_models_v0
+from vision import list_lm_studio_models_v0, _EMBED_NAME_PATTERNS
+import ratelimit
 
 _GEMINI_EMBED_MODEL = "text-embedding-004"
 import time as _time
@@ -168,11 +170,14 @@ def _is_connection_error(e: Exception) -> bool:
 
 
 def _lm_embed_model_id() -> str | None:
-    """Best-effort id of the currently loaded LM Studio EMBEDDING model, using
-    the v0 API's real type/loaded-state info (mirrors vision._lm_model_id()'s
-    vision-model lookup). Returns None when the v0 API is unreachable or no
-    embeddings model is currently loaded — callers fall back to the plain
-    /v1/models heuristic (first entry, no type/state filtering) in that case."""
+    """Best-effort id of the LM Studio EMBEDDING model to use, via the v0
+    API's real type/loaded-state info (mirrors vision._lm_model_id()'s
+    vision-model lookup). Prefers a loaded embeddings model; when none is
+    loaded but the v0 API answered, falls back to any embeddings-TYPED model
+    (LM Studio JIT-loads it on request — naming a correct-type model beats
+    the old behavior of letting callers grab /v1/models[0], which could be a
+    6GB chat model that then JIT-loads just to fail the embed call).
+    Returns None only when the v0 API is unreachable."""
     try:
         v0 = list_lm_studio_models_v0()
     except Exception:
@@ -180,6 +185,20 @@ def _lm_embed_model_id() -> str | None:
     for m in v0:
         if m.get("state") == "loaded" and m.get("type") == "embeddings":
             return m.get("id")
+    for m in v0:
+        if m.get("type") == "embeddings":
+            return m.get("id")
+    return None
+
+
+def _lm_v1_embed_fallback_id(models: list[dict]) -> str | None:
+    """Pick an embedding model from a raw /v1/models list (old LM Studio, no
+    v0 API): first id matching the shared embed name patterns, never an
+    arbitrary [0] (which can be a chat/vision model)."""
+    for m in models:
+        mid = m.get("id", "")
+        if any(p in mid.lower() for p in _EMBED_NAME_PATTERNS):
+            return mid
     return None
 
 
@@ -193,12 +212,11 @@ def _lm_studio_embed(text: str, model: str = None) -> tuple[list, str]:
             req = urllib.request.Request(f"{LM_STUDIO_URL}/models")
             with urllib.request.urlopen(req, timeout=3) as r:
                 data = json.loads(r.read())
-                models = data.get("data", [])
-                if models:
-                    model_name = models[0].get("id", model_name)
+            model_name = _lm_v1_embed_fallback_id(data.get("data", [])) or model_name
         except Exception:
             pass
 
+    ratelimit.acquire("lm_studio")
     payload = json.dumps({"model": model_name, "input": text}).encode("utf-8")
     req = urllib.request.Request(
         f"{LM_STUDIO_URL}/embeddings",
@@ -220,12 +238,13 @@ def _lm_studio_embed_batch(texts: list[str], model: str = None) -> tuple[list, s
             req = urllib.request.Request(f"{LM_STUDIO_URL}/models")
             with urllib.request.urlopen(req, timeout=3) as r:
                 data = json.loads(r.read())
-                models = data.get("data", [])
-                if models:
-                    model_name = models[0].get("id", model_name)
+            model_name = _lm_v1_embed_fallback_id(data.get("data", [])) or model_name
         except Exception:
             pass
 
+    # One batch POST is ONE request against the provider's quota — acquire a
+    # single slot for the whole chunk, matching how providers count.
+    ratelimit.acquire("lm_studio")
     payload = json.dumps({"model": model_name, "input": texts}).encode("utf-8")
     req = urllib.request.Request(
         f"{LM_STUDIO_URL}/embeddings",
@@ -273,6 +292,7 @@ def _gemini_embed(text: str, model: str = None) -> tuple[list, str]:
         raise RuntimeError(
             f"Gemini embed model {model_name} in post-429 cooldown — skipping retry"
         )
+    ratelimit.acquire("gemini")
     url = f"{GEMINI_BASE}/models/{model_name}:embedContent?key={GEMINI_API_KEY}"
     payload = json.dumps(
         {
@@ -293,6 +313,96 @@ def _gemini_embed(text: str, model: str = None) -> tuple[list, str]:
         raise RuntimeError(f"Gemini embed {e.code}: {e.read()[:200]}")
 
 
+# ── 9Router (local multi-provider gateway) ────────────────────────────────────
+# 9Router pools multiple API keys/accounts per provider and rotates them on 429
+# internally — that's the whole point of routing embeddings through it. Model
+# ids are provider-prefixed (e.g. "gemini/gemini-embedding-001"), which keeps
+# them distinct from LM Studio/direct-Gemini ids in the registry, so the same
+# upstream model reached via different providers can never share a collection.
+
+_9r_embed_models_cache: tuple[float, list[str]] | None = None
+
+
+def list_9router_embed_models() -> list[str]:
+    """Embedding model ids from 9Router's dedicated /v1/models/embedding list,
+    cached 5 min. Returns [] when 9Router is unreachable."""
+    global _9r_embed_models_cache
+    if _9r_embed_models_cache and _time.time() - _9r_embed_models_cache[0] < 300:
+        return _9r_embed_models_cache[1]
+    try:
+        req = urllib.request.Request(f"{NINEROUTER_URL}/models/embedding")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        models = [m["id"] for m in data.get("data", [])]
+        _9r_embed_models_cache = (_time.time(), models)
+        return models
+    except Exception as e:
+        print(f"[embeddings] 9Router embed model list failed: {e}")
+        return []
+
+
+# A 429 surfacing through 9Router means every pooled key/account for that
+# model is exhausted (the gateway already rotated through them) — cool down.
+_9r_embed_cooldown: dict[str, float] = {}
+
+
+def ninerouter_embed_cooldowns() -> dict[str, float]:
+    """{model: seconds_remaining} for 9Router embed models in post-429 cooldown."""
+    now = _time.time()
+    return {m: round(until - now, 1) for m, until in _9r_embed_cooldown.items() if until > now}
+
+
+def _9router_embed_request(payload_input, model: str, timeout: int) -> list:
+    """Shared single/batch POST to 9Router /v1/embeddings. Returns the raw
+    data rows. `model` is REQUIRED (no auto-pick by design)."""
+    if not model:
+        raise ValueError("9Router requires an explicit embedding model id")
+    if _9r_embed_cooldown.get(model, 0) > _time.time():
+        raise RuntimeError(f"9Router embed model {model} in post-429 cooldown — skipping retry")
+    ratelimit.acquire("9router")
+    payload = json.dumps({"model": model, "input": payload_input}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{NINEROUTER_URL}/embeddings",
+        data=payload,
+        headers={"Content-Type": "application/json", "Authorization": "Bearer 9router"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            result = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            _9r_embed_cooldown[model] = _time.time() + _EMBED_RATE_LIMIT_COOLDOWN_SEC
+        raise RuntimeError(f"9Router embed {e.code}: {e.read()[:200]}")
+    # Unlike captions, a substituted EMBEDDING model must be rejected: vectors
+    # from two models — even at the same dimension (gemini-embedding-2-preview
+    # is also 3072-d) — live in different vector spaces, and mixing them in one
+    # ChromaDB collection silently corrupts similarity search for everything
+    # already stored. The response echoes the serving model (verified live:
+    # requested "gemini/gemini-embedding-001" → model "gemini-embedding-001",
+    # prefix stripped), so containment == same model.
+    served = result.get("model")
+    if served and served not in model:
+        global _last_substitution
+        _last_substitution = {"requested": model, "served": served}
+        raise RuntimeError(
+            f"9Router substituted embedding model ({model} → {served}) — "
+            "rejected to keep one vector space per collection"
+        )
+    return result["data"]
+
+
+def _9router_embed(text: str, model: str) -> tuple[list, str]:
+    rows = _9router_embed_request(text, model, timeout=30)
+    return rows[0]["embedding"], model
+
+
+def _9router_embed_batch(texts: list[str], model: str) -> tuple[list, str]:
+    """Batch embed through 9Router in ONE request (verified live: list input
+    returns index-tagged rows, same contract as LM Studio's endpoint)."""
+    rows = sorted(_9router_embed_request(texts, model, timeout=120), key=lambda d: d.get("index", 0))
+    return [row["embedding"] for row in rows], model
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
@@ -300,16 +410,22 @@ def get_embedding(
     text: str, force_provider: str = "auto", model: str = None
 ) -> tuple[list | None, str, str]:
     """Returns (vector, model_name, source).
-    force_provider: "auto" (LM Studio → Gemini), "lm_studio", or "gemini".
+    force_provider: "auto" (LM Studio → Gemini), "lm_studio", "gemini", or
+    "9router" (explicit opt-in, never part of the auto chain, model required).
     model: explicit embedding model id for the forced provider. In "auto" mode it
     is only passed to LM Studio (a Gemini fallback picks its own default).
     Registers the model on success. Returns (None, '', 'error') on full failure."""
+    global _last_error, _last_substitution
+    _last_error = None
+    _last_substitution = None
     lm = ("lm_studio", lambda t: _lm_studio_embed(t, model))
     gem = ("gemini", lambda t: _gemini_embed(t, model if force_provider == "gemini" else None))
     if force_provider == "lm_studio":
         chain = [lm]
     elif force_provider == "gemini":
         chain = [gem]
+    elif force_provider == "9router":
+        chain = [("9router", lambda t: _9router_embed(t, model))]
     else:
         chain = [lm, gem]
 
@@ -318,13 +434,52 @@ def get_embedding(
             vector, model_name = fn(text)
             register_model(source, model_name, len(vector))
             return vector, model_name, source
+        except ratelimit.Cancelled:
+            # Stop pressed during a rate-limit wait — not a provider failure;
+            # must reach the job manager, not roll over to the next provider.
+            raise
         except Exception as e:
+            _last_error = f"{source}: {e}"
             if _is_connection_error(e):
                 print(f"[embeddings] {source} offline, trying next")
                 continue
             print(f"[embeddings] {source} error: {e}")
             continue
     return None, "", "error"
+
+
+# Why the last get_embedding/get_embeddings_batch call failed entirely, for
+# the job log. The (None, "", "error") return can't carry the reason, and the
+# reason now matters: "9Router substituted the model — pick a different one"
+# needs a restart with a NEW model, while "LM Studio offline" just needs the
+# service back. Single worker thread runs jobs, so module-level slots are fine.
+_last_error: str | None = None
+
+# Set when the last full failure was specifically a 9Router embed-model
+# substitution: {"requested": <id we asked for>, "served": <id that answered>}.
+# The job manager surfaces this so the UI can offer a one-click "switch the
+# embed model to what 9Router actually serves and re-run".
+_last_substitution: dict | None = None
+
+
+def last_embed_error() -> str | None:
+    return _last_error
+
+
+def last_substitution() -> dict | None:
+    return _last_substitution
+
+
+def resolve_9router_embed_id(served: str, requested: str) -> str:
+    """Map a served model name (echoed WITHOUT its provider prefix, e.g.
+    'gemini-embedding-2-preview') back to the full selectable 9Router id.
+    Prefers a match from the live embedding list; falls back to reusing the
+    requested id's provider prefix."""
+    for mid in list_9router_embed_models():
+        if served in mid:
+            return mid
+    prefix = requested.split("/", 1)[0] if "/" in requested else ""
+    return f"{prefix}/{served}" if prefix else served
 
 
 def get_embeddings_batch(
@@ -339,6 +494,9 @@ def get_embeddings_batch(
     the chunk — that slot in the returned list is None while every other text
     still gets embedded, so callers must check for (and handle) None entries
     whenever the overall result isn't None."""
+    global _last_error, _last_substitution
+    _last_error = None
+    _last_substitution = None
     if not texts:
         return [], "", ""
 
@@ -349,6 +507,8 @@ def get_embeddings_batch(
             try:
                 v, name = _gemini_embed(t, m)
                 vecs.append(v)
+            except ratelimit.Cancelled:
+                raise
             except Exception as e:
                 print(f"[embeddings] gemini batch item error: {e}")
                 vecs.append(None)
@@ -360,6 +520,8 @@ def get_embeddings_batch(
         chain = [lm]
     elif force_provider == "gemini":
         chain = [gem]
+    elif force_provider == "9router":
+        chain = [("9router", lambda ts: _9router_embed_batch(ts, model))]
     else:
         chain = [lm, gem]
 
@@ -375,7 +537,10 @@ def get_embeddings_batch(
                 raise RuntimeError(f"{source} failed to embed every item in the batch")
             register_model(source, model_name, dims[0])
             return vectors, model_name, source
+        except ratelimit.Cancelled:
+            raise
         except Exception as e:
+            _last_error = f"{source}: {e}"
             if _is_connection_error(e):
                 print(f"[embeddings] {source} offline, trying next")
                 continue

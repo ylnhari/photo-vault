@@ -7,6 +7,7 @@ import { api } from "./api.js";
 
 export const health = writable({
   loaded: false, lm_studio: false, gemini: false, gemini_key_set: false,
+  ninerouter: false, lm_studio_state: { known: false },
 });
 
 // Shared shape so a failed refreshStatus() can reset to a clear "unknown"
@@ -55,7 +56,8 @@ export async function refreshHealth() {
     const h = await api.health();
     health.set({ loaded: true, ...h });
   } catch {
-    health.set({ loaded: true, lm_studio: false, gemini: false, gemini_key_set: false });
+    health.set({ loaded: true, lm_studio: false, gemini: false, gemini_key_set: false,
+                 ninerouter: false, lm_studio_state: { known: false } });
   }
 }
 

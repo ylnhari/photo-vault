@@ -813,3 +813,79 @@ def test_meta_404_when_truly_not_indexed(client):
     # this Chroma usage pattern), but the failure is now logged server-side —
     # exercised here via a plain call to confirm it doesn't crash the request.
     assert r.status_code == 404
+
+
+# ── 9Router integration ───────────────────────────────────────────────────────
+
+def test_index_start_9router_vision_without_model_rejected(client):
+    with patch("api.manager.start") as start:
+        r = client.post("/api/index/start", json={
+            "type": "vision", "vision_provider": "9router",
+        })
+    assert r.status_code == 422
+    assert "vision model" in r.json()["detail"]
+    start.assert_not_called()
+
+
+def test_index_start_9router_embed_without_model_rejected(client):
+    with patch("api.manager.start") as start:
+        r = client.post("/api/index/start", json={
+            "type": "embed", "embed_provider": "9router",
+        })
+    assert r.status_code == 422
+    start.assert_not_called()
+
+
+def test_index_start_9router_with_model_accepted(client):
+    captured = {}
+    def fake_start(jtype, **kw):
+        captured.update(kw); captured["jtype"] = jtype
+        return {"active": False, "finished": True}
+    with patch("api.manager.start", side_effect=fake_start):
+        r = client.post("/api/index/start", json={
+            "type": "vision", "vision_provider": "9router",
+            "vision_model": "gc/gemini-2.5-flash-lite",
+        })
+    assert r.status_code == 200
+    assert captured["vision_provider"] == "9router"
+    assert captured["vision_model"] == "gc/gemini-2.5-flash-lite"
+
+
+def test_index_start_faces_job_not_blocked_by_incomplete_9router_settings(client):
+    """A job that uses neither vision nor embed must not be rejected just
+    because a 9Router provider is saved without a model."""
+    with patch("api.manager.start", return_value={"active": False, "finished": True}):
+        r = client.post("/api/index/start", json={
+            "type": "faces", "vision_provider": "9router", "embed_provider": "9router",
+        })
+    assert r.status_code == 200
+
+
+def test_provider_models_includes_9router_lists(client):
+    with patch("api.list_lm_studio_models", return_value=[]), \
+         patch("api.list_lm_studio_models_v0", return_value=[]), \
+         patch("api.list_gemini_vision_models", return_value=[]), \
+         patch("api.list_gemini_embed_models", return_value=[]), \
+         patch("api.list_9router_vision_models", return_value=["gc/gemini-2.5-flash"]), \
+         patch("api.list_9router_embed_models", return_value=["gemini/gemini-embedding-001"]), \
+         patch("api.ninerouter_cooldowns", return_value={}), \
+         patch("api.ninerouter_embed_cooldowns", return_value={"gemini/gemini-embedding-001": 42.0}):
+        r = client.get("/api/provider-models")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ninerouter_vision"] == ["gc/gemini-2.5-flash"]
+    assert body["ninerouter_embed"] == ["gemini/gemini-embedding-001"]
+    assert body["ninerouter_cooldowns"]["gemini/gemini-embedding-001"] == 42.0
+
+
+def test_vision_model_label_none_for_9router():
+    """9Router captions are stored under the SERVED model's label, so the
+    pre-run label is unpredictable → None, which makes a 9Router vision run
+    target photos with no caption at all (coverage semantics)."""
+    import settings as settings_mod
+    assert settings_mod.vision_model_label(
+        {"vision_provider": "9router", "vision_model": "gc/gemini-2.5-flash"}
+    ) is None
+    assert settings_mod.vision_model_label(
+        {"vision_provider": "lm_studio", "vision_model": "m"}
+    ) == "lm_studio:m"

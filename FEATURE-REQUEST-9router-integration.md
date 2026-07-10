@@ -1,10 +1,22 @@
 # Feature Request: Integrating 9Router into photo-vault
 
-> **Status: PROPOSED — design pending. NOT implemented. No code changed.**
-> Date drafted: 2026-07-06
-> Author context: exploration + live testing session (see "Verified findings" below).
-> The *how* (implementation) is intentionally **not designed yet** — it must satisfy the
-> design requirements in the section of that name. This file is the input for that later design.
+> **Status: IMPLEMENTED 2026-07-08** — first-class `9router` provider shipped (vision +
+> embeddings + health + UI selector), all Section 4 requirements met, verified live end-to-end
+> (real photo captioned via `gc/gemini-2.5-flash-lite`, 3072-d single+batch embeds via
+> `gemini/gemini-embedding-001`, honest LM Studio loaded-state reporting, no regressions —
+> 359/359 tests green). Substitution policy (2026-07-08): 9Router may serve a request with a
+> substituted upstream model (observed: `gc/gemini-2.5-flash-lite` answered by
+> `gemini-3.1-flash-lite`). **Vision:** the caption is kept and stored under the model that
+> ACTUALLY produced it; a 9Router vision run targets photos with no caption at all (coverage
+> semantics), and the job panel shows a per-model "Models used" tally at the end of the run.
+> **Embeddings:** a substituted model is REJECTED (same-dimension substitutes would silently
+> poison the collection's vector space); the aborted job records {requested, served, suggested}
+> and the Embed section offers a one-click "Switch to <served model> & re-run" (saves settings,
+> restarts with correct pending accounting — decided over silently saving substituted vectors,
+> which would fragment coverage across collections search can't use). 9Router is opt-in only —
+> never part of the "auto" fallback chain, and always requires an explicit model id.
+>
+> Original header: Status PROPOSED, drafted 2026-07-06, design intentionally deferred.
 
 ---
 

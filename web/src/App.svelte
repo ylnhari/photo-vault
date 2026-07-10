@@ -30,7 +30,7 @@
     ? Math.round(($jobStatus.done / $jobStatus.total) * 100) : 0;
 
   $: indexedCount = $status.stage.active_model_embedded || 0;
-  $: noServices = $health.loaded && !$health.lm_studio && !$health.gemini;
+  $: noServices = $health.loaded && !$health.lm_studio && !$health.gemini && !$health.ninerouter;
 
   function onSelect(e) {
     const d = e.detail;

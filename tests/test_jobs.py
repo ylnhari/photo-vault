@@ -392,3 +392,132 @@ def test_worker_thread_crash_is_recorded_not_swallowed():
 def test_idle_state_error_field_defaults_to_none():
     mgr = JobManager()
     assert mgr.status()["error"] is None
+
+
+def test_vision_job_tallies_models_used():
+    """model_counts records how many captions each ACTUAL model produced —
+    the end-of-run summary for 9Router runs, where the gateway can substitute
+    serving models mid-run."""
+    mgr = JobManager()
+    fake = _fake_indexer(["a", "b", "c"], lambda *a, **k: None)
+    served = iter(["9router:gc/gemini-2.5-flash-lite",
+                   "9router:gemini-3.1-flash-lite",
+                   "9router:gc/gemini-2.5-flash-lite"])
+    fake.compute_caption.side_effect = lambda *a, **k: (next(served), '{"caption":"ok"}')
+    with patch("jobs.Indexer", return_value=fake):
+        mgr.start("vision")
+        s = _wait_idle(mgr)
+    assert s["ok"] == 3
+    assert s["model_counts"] == {
+        "9router:gc/gemini-2.5-flash-lite": 2,
+        "9router:gemini-3.1-flash-lite": 1,
+    }
+
+
+def test_model_counts_reset_between_jobs():
+    mgr = JobManager()
+    fake = _fake_indexer(["a"], lambda *a, **k: None)
+    fake.compute_caption.side_effect = lambda *a, **k: ("m1", '{"caption":"ok"}')
+    with patch("jobs.Indexer", return_value=fake):
+        mgr.start("vision")
+        s = _wait_idle(mgr)
+    assert s["model_counts"] == {"m1": 1}
+    mgr.reset()
+    assert mgr.status()["model_counts"] == {}
+
+
+def test_embed_job_records_substitution_for_recovery():
+    """A 9Router embed substitution aborts the run AND leaves a structured
+    {requested, served, suggested} record in job state so the UI can offer
+    'switch to the served model & re-run'."""
+    mgr = JobManager()
+    fake = _fake_indexer(["a", "b"], lambda *a, **k: None)
+    # An explicit embed_model routes through the model-aware pending query.
+    fake.get_embed_pending_for_model.return_value = [("a", {}), ("b", {})]
+    fake.image_catalog = {"images": {
+        "a": {"filename": "a.jpg", "caption_json": '{"caption":"x"}'},
+        "b": {"filename": "b.jpg", "caption_json": '{"caption":"y"}'},
+    }}
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("jobs.settings_mod.load", return_value={"faces_during_embed": False}), \
+         patch("jobs.resolve_caption_json", side_effect=lambda d, csm: d["caption_json"]), \
+         patch("embeddings.get_embeddings_batch", return_value=(None, "", "error")), \
+         patch("embeddings.last_embed_error",
+               return_value="9router: substituted embedding model"), \
+         patch("embeddings.last_substitution",
+               return_value={"requested": "gemini/gemini-embedding-001",
+                             "served": "gemini-embedding-2-preview"}), \
+         patch("embeddings.resolve_9router_embed_id",
+               return_value="gemini/gemini-embedding-2-preview"):
+        mgr.start("embed", embed_provider="9router",
+                  embed_model="gemini/gemini-embedding-001", max_fail=2)
+        s = _wait_idle(mgr)
+    assert s["aborted"] is True
+    assert s["substitution"] == {
+        "requested": "gemini/gemini-embedding-001",
+        "served": "gemini-embedding-2-preview",
+        "suggested": "gemini/gemini-embedding-2-preview",
+    }
+    assert any("substituted" in (l["note"] or "") for l in s["log"])
+    mgr.reset()
+    assert mgr.status()["substitution"] is None
+
+
+def test_status_reports_eta_and_rate_while_active():
+    mgr = JobManager()
+    with mgr._lock:
+        mgr._state.update({"active": True, "total": 10, "done": 5,
+                           "started_at": time.time() - 50})
+    s = mgr.status()
+    # 5 done in 50s → 0.1/s → 5 remaining ≈ 50s, 6/min
+    assert s["eta_seconds"] == pytest.approx(50, abs=3)
+    assert s["rate_per_min"] == pytest.approx(6.0, abs=0.5)
+
+
+def test_status_eta_none_when_idle_or_nothing_done():
+    mgr = JobManager()
+    s = mgr.status()
+    assert s["eta_seconds"] is None
+    assert s["rate_per_min"] is None
+    assert s["rate_wait"] == {}
+    with mgr._lock:
+        mgr._state.update({"active": True, "total": 10, "done": 0,
+                           "started_at": time.time()})
+    s = mgr.status()
+    assert s["eta_seconds"] is None
+
+
+def test_rate_limit_cancel_stops_sequential_job_without_failures():
+    """ratelimit.Cancelled (Stop pressed during a rate-limit sleep) must end
+    the job as 'stopped' — never counted as a per-image failure."""
+    import ratelimit
+    mgr = JobManager()
+
+    def boom(img_id, **k):
+        raise ratelimit.Cancelled("stopped while waiting on gemini rate limit (rpm)")
+    fake = _fake_indexer(["a", "b", "c"], boom)
+    with patch("jobs.Indexer", return_value=fake):
+        mgr.start("full")
+        s = _wait_idle(mgr)
+    assert s["stopped"] is True
+    assert s["fail"] == 0
+    assert s["done"] == 0
+    assert s["failed_ids"] == []
+
+
+def test_rate_limit_cancel_in_vision_batch_leaves_items_pending():
+    """In the parallel vision runner a Cancelled item is neither ok nor
+    failed — it simply stays pending for the next run."""
+    import ratelimit
+    mgr = JobManager()
+
+    def boom(img_id, **k):
+        raise ratelimit.Cancelled("stopped while waiting on gemini rate limit (rpm)")
+    fake = _fake_indexer(["a", "b"], boom)
+    with patch("jobs.Indexer", return_value=fake):
+        mgr.start("vision")
+        s = _wait_idle(mgr)
+    assert s["fail"] == 0
+    assert s["ok"] == 0
+    assert s["done"] == 0
+    assert s["aborted"] is False

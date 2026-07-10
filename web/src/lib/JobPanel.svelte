@@ -34,6 +34,20 @@
 
   $: running = job.active;
   $: pct = job.total ? Math.round((job.done / job.total) * 100) : (running ? 0 : 100);
+
+  // ETA comes from the backend (cumulative average rate, includes time spent
+  // paused on rate limits). rate_wait says which provider is currently
+  // sleeping on a full rate-limit window — without it a throttled job just
+  // looks frozen.
+  function fmtDur(s) {
+    s = Math.max(0, Math.round(s));
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    if (h) return `${h}h ${m}m`;
+    if (m) return `${m}m ${sec}s`;
+    return `${sec}s`;
+  }
+  const RL_NAMES = { lm_studio: "LM Studio", gemini: "Gemini", "9router": "9Router" };
+  $: rateWaits = Object.entries(job.rate_wait || {});
 </script>
 
 <div class="panel" class:running class:aborted={job.aborted} style="--tile:{theme.color}"
@@ -72,9 +86,28 @@
     <span class="muted">{job.done}/{job.total}</span>
     <span class="chip ok">✅ {job.ok}</span>
     {#if job.fail}<span class="chip fail">❌ {job.fail}</span>{/if}
+    {#if running && job.eta_seconds != null}
+      <span class="chip">⏱ ~{fmtDur(job.eta_seconds)} left{job.rate_per_min ? ` · ${job.rate_per_min}/min` : ""}</span>
+    {/if}
+    {#each rateWaits as [prov, w] (prov)}
+      <span class="chip warn">⏸ {RL_NAMES[prov] || prov} rate limit ({w.limit}) — resumes in {fmtDur(w.seconds)}</span>
+    {/each}
     {#if job.aborted}<span class="chip fail">auto-stopped · too many failures</span>{/if}
     {#if job.stopped}<span class="chip warn">stopped by you</span>{/if}
   </div>
+
+  <!-- Per-model tally: which models actually produced this run's captions.
+       Matters with 9Router, whose gateway can substitute serving models
+       mid-run — one run can legitimately span several models. Lives only in
+       job state, so it disappears when the job is cleared. -->
+  {#if job.model_counts && Object.keys(job.model_counts).length}
+    <div class="models">
+      <span class="muted" style="font-size:12px">Models used:</span>
+      {#each Object.entries(job.model_counts).sort((a, b) => b[1] - a[1]) as [label, count]}
+        <span class="chip">{label} × {count}</span>
+      {/each}
+    </div>
+  {/if}
 
   {#if job.log?.length}
     <div class="log">
@@ -131,6 +164,7 @@
   @keyframes indeterminate { 0% { transform: translateX(-100%); } 100% { transform: translateX(330%); } }
 
   .stats { display: flex; gap: 10px; align-items: baseline; font-size: 13px; flex-wrap: wrap; }
+  .models { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; margin-top: 8px; }
   .pct { font-size: 22px; font-weight: 700; color: var(--tile); }
   .chip { padding: 2px 9px; border-radius: 99px; background: var(--surface2); font-size: 12px; }
   .chip.ok { color: var(--success); }

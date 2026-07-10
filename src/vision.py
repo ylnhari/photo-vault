@@ -9,7 +9,14 @@ import urllib.error
 from openai import OpenAI
 from PIL import Image, ImageOps
 import imaging  # noqa: F401 — registers HEIF opener + sets the pixel-bomb cap on import
-from constants import LM_STUDIO_URL, GEMINI_API_KEY, GEMINI_BASE, GEMINI_VISION_MODELS
+import ratelimit
+from constants import (
+    LM_STUDIO_URL,
+    NINEROUTER_URL,
+    GEMINI_API_KEY,
+    GEMINI_BASE,
+    GEMINI_VISION_MODELS,
+)
 
 _PROMPT = (
     "Analyze this photo and respond ONLY with valid JSON (no markdown, no explanation). "
@@ -53,6 +60,17 @@ def _get_lm_client():
     if _lm_client is None:
         _lm_client = OpenAI(base_url=LM_STUDIO_URL, api_key="lm-studio")
     return _lm_client
+
+
+_9r_client = None
+
+
+def _get_9router_client():
+    global _9r_client
+    if _9r_client is None:
+        # 9Router needs no key locally; the SDK requires a non-empty string.
+        _9r_client = OpenAI(base_url=NINEROUTER_URL, api_key="9router")
+    return _9r_client
 
 
 def encode_image(image_path, max_size=(1024, 1024)):
@@ -126,12 +144,18 @@ def list_lm_studio_models_v0() -> list[dict]:
 
 def _lm_model_id() -> str:
     """Best-effort id of the currently loaded LM Studio vision model. Prefers
-    the v0 API's real 'loaded' vlm; falls back to the first /v1/models entry
-    (which may not actually be the resident model) if v0 is unavailable."""
+    the v0 API's real 'loaded' vlm. When the v0 API answered but reports NO
+    loaded vlm, return the bare 'lm_studio' label — claiming the first
+    /v1/models entry (an arbitrary, possibly embedding, NOT-loaded model)
+    would record a lie in caption_history. The /v1/models[0] guess is kept
+    only for old LM Studio versions where v0 is unavailable and we genuinely
+    can't know better."""
     v0 = list_lm_studio_models_v0()
     for m in v0:
         if m.get("state") == "loaded" and m.get("type") == "vlm":
             return f"lm_studio:{m['id']}"
+    if v0:  # v0 API reachable and authoritative: nothing suitable is loaded
+        return "lm_studio"
     try:
         client = _get_lm_client()
         models = client.models.list()
@@ -260,6 +284,109 @@ def list_gemini_vision_models(fallback: bool = True) -> list[str]:
     return _fetch_gemini_models("generateContent", fallback=fallback)
 
 
+# ── 9Router (local multi-provider gateway) ────────────────────────────────────
+# 9Router pools accounts/keys per provider and rotates them on 429 internally —
+# photo-vault just names ONE model id and lets the gateway do key management.
+# Model ids are provider-prefixed (gc/ = Gemini CLI OAuth, gemini/ = Gemini API
+# key, kr/ = Kiro credits, openrouter/ = OpenRouter) so the same upstream model
+# via two providers stays distinguishable end-to-end.
+
+_9R_TIMEOUT = 10
+
+# Vision-capable id patterns among what 9Router exposes. /v1/models lists every
+# chat model of every connected provider (incl. text-only coders); keep the
+# dropdown to models that can actually caption an image. -thinking/-agentic
+# Kiro variants are excluded: same vision ability, slower and burns credits.
+_9R_VISION_PATTERNS = ("gemini", "gemma", "claude", "gpt-5", "qwen-vl", "-vl")
+_9R_VISION_EXCLUDE = ("-thinking", "-agentic", "embedding")
+
+_9r_models_cache: tuple[float, list[str]] | None = None
+
+
+def list_9router_vision_models() -> list[str]:
+    """Vision-capable model ids from the live 9Router /v1/models list, cached
+    5 min. Returns [] when 9Router is unreachable (UI shows 'not found')."""
+    global _9r_models_cache
+    if _9r_models_cache and time.time() - _9r_models_cache[0] < 300:
+        return _9r_models_cache[1]
+    try:
+        req = urllib.request.Request(f"{NINEROUTER_URL}/models")
+        with urllib.request.urlopen(req, timeout=_9R_TIMEOUT) as r:
+            data = json.loads(r.read())
+        ids = [m["id"] for m in data.get("data", [])]
+        vision = [
+            m for m in ids
+            if any(p in m.lower() for p in _9R_VISION_PATTERNS)
+            and not any(x in m.lower() for x in _9R_VISION_EXCLUDE)
+        ]
+        _9r_models_cache = (time.time(), vision)
+        return vision
+    except Exception as e:
+        print(f"[vision] 9Router model list failed: {e}")
+        return []
+
+
+# Same 429-cooldown pattern as Gemini's below. 9Router rotates keys/accounts
+# internally, so a 429 surfacing HERE means every pooled account for that model
+# is exhausted — back off instead of hammering, and let the UI flag it.
+_9r_cooldown: dict[str, float] = {}
+
+
+def ninerouter_cooldowns() -> dict[str, float]:
+    """{model: seconds_remaining} for 9Router models in a post-429 cooldown."""
+    now = time.time()
+    return {m: round(until - now, 1) for m, until in _9r_cooldown.items() if until > now}
+
+
+def _call_9router(base64_image: str, model: str) -> tuple[str, str]:
+    """One captioning call through 9Router. `model` is REQUIRED — the gateway
+    has no LM-Studio-style loaded-model introspection, and design rule is
+    'only the user-chosen model, no silent auto-pick'. No cross-model fallback
+    here either: a failure is a per-image failure for the job manager.
+    Returns (caption_json, model_id_actually_used)."""
+    if not model:
+        raise ValueError("9Router requires an explicit vision model id")
+    if _9r_cooldown.get(model, 0) > time.time():
+        raise RuntimeError(f"9Router model {model} in post-429 cooldown — skipping")
+    ratelimit.acquire("9router")
+    client = _get_9router_client()
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            stream=False,  # 9Router defaults to streaming; be explicit
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _PROMPT},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                        },
+                    ],
+                }
+            ],
+            max_tokens=1400,
+        )
+    except Exception as e:
+        if "429" in str(e):
+            _9r_cooldown[model] = time.time() + _RATE_LIMIT_COOLDOWN_SEC
+        raise
+    # 9Router may serve the request with a different upstream model than asked
+    # (its own tiered fallback / provider-side aliasing — observed live:
+    # gc/gemini-2.5-flash-lite answered by gemini-3.1-flash-lite). The caption
+    # is still perfectly good — keep it, but attribute it to the model that
+    # ACTUALLY produced it (a caption is a caption for coverage purposes; the
+    # per-model bookkeeping must not lie). When the served name just echoes
+    # the requested id (usually without the provider prefix), keep the
+    # requested id — it carries strictly more information.
+    served = getattr(response, "model", None)
+    used = model if (not served or served in model) else served
+    if used is not model:
+        print(f"[vision] 9Router served {model} via {served}")
+    return _strip_markdown(response.choices[0].message.content.strip()), used
+
+
 _REQUIRED_VISION_KEYS = ("caption", "scene", "occasion", "weather", "group_size")
 
 
@@ -285,6 +412,7 @@ def validate_vision_output(text: str) -> dict:
 
 
 def _call_lm_studio(base64_image: str, model: str = "vision-model") -> str:
+    ratelimit.acquire("lm_studio")
     client = _get_lm_client()
     response = client.chat.completions.create(
         model=model or "vision-model",
@@ -379,6 +507,9 @@ def _call_gemini(base64_image: str, model: str = None) -> tuple[str, str]:
 
     last_err = None
     for m in candidates:
+        # One acquire per attempt, not per _call_gemini: a 429/404/503 retry
+        # against the next model is its own request as far as Gemini counts.
+        ratelimit.acquire("gemini")
         url = f"{GEMINI_BASE}/models/{m}:generateContent?key={GEMINI_API_KEY}"
         req = urllib.request.Request(
             url, data=payload, headers={"Content-Type": "application/json"}
@@ -406,8 +537,10 @@ def get_image_caption(
     model: str = None,
 ):
     """
-    force_provider: "auto" (LM Studio → Gemini fallback), "lm_studio", or "gemini"
-    model: explicit model id to use (only honored when force_provider is lm_studio/gemini).
+    force_provider: "auto" (LM Studio → Gemini fallback), "lm_studio", "gemini",
+    or "9router" (explicit opt-in — never part of the auto chain, and requires
+    an explicit model id per the no-silent-auto-pick rule).
+    model: explicit model id to use (only honored when force_provider is not "auto").
     with_model=False → returns caption text (str, backward compatible).
     with_model=True  → returns (caption_text, model_label) identifying which model produced it.
     """
@@ -419,10 +552,26 @@ def get_image_caption(
     if not base64_image:
         return _ret(json.dumps({"error": "encoding failed"}), "error")
 
+    # ratelimit.Cancelled must escape every provider branch un-swallowed:
+    # it means Stop was pressed while waiting for a rate-limit slot, and
+    # converting it into an {"error": ...} caption would make the job manager
+    # count the item as a FAILURE instead of leaving it pending for next run.
+
+    if force_provider == "9router":
+        try:
+            text, used_model = _call_9router(base64_image, model)
+            return _ret(text, f"9router:{used_model}")
+        except ratelimit.Cancelled:
+            raise
+        except Exception as e:
+            return _ret(json.dumps({"error": f"9Router failed: {e}"}), "error")
+
     if force_provider == "gemini":
         try:
             text, used_model = _call_gemini(base64_image, model)
             return _ret(text, f"gemini:{used_model}")
+        except ratelimit.Cancelled:
+            raise
         except Exception as ge:
             return _ret(json.dumps({"error": f"Gemini failed: {ge}"}), "error")
 
@@ -431,18 +580,24 @@ def get_image_caption(
             label = f"lm_studio:{model}" if model else _lm_model_id()
             text = _call_lm_studio(base64_image, model)
             return _ret(text, label)
+        except ratelimit.Cancelled:
+            raise
         except Exception as e:
             return _ret(json.dumps({"error": f"LM Studio failed: {e}"}), "error")
 
     try:
         label = f"lm_studio:{model}" if model else _lm_model_id()
         return _ret(_call_lm_studio(base64_image, model), label)
+    except ratelimit.Cancelled:
+        raise
     except Exception as e:
         if _is_connection_error(e):
             print(f"[vision] LM Studio offline, falling back to Gemini")
             try:
                 text, used_model = _call_gemini(base64_image)
                 return _ret(text, f"gemini:{used_model}")
+            except ratelimit.Cancelled:
+                raise
             except Exception as ge:
                 return _ret(
                     json.dumps({"error": f"LM Studio offline; Gemini failed: {ge}"}),

@@ -7,6 +7,14 @@ browse by timeline and people. UI is a Svelte SPA talking to a FastAPI backend o
 ## Context
 All local, no cloud, no paid APIs. Primary: LM Studio (vision + embeddings) + InsightFace (faces).
 Fallback: Gemini free tier for both vision and embeddings when LM Studio is offline.
+Opt-in third provider: **9Router** (local OpenAI-compatible gateway, `constants.NINEROUTER_URL`
+from `../ports.json → registry.9router.port`) — pools multiple Gemini CLI accounts/API keys and
+rotates them on 429 internally. Never part of the "auto" chain; always needs an explicit model id
+(no LM-Studio-style auto-detect). The gateway may substitute the serving model: vision keeps the
+caption but labels it with the model that ACTUALLY produced it (so 9Router vision runs target
+any-caption-missing photos, and the job panel tallies "Models used"); embeddings REJECT
+substitution (one vector space per collection). See `FEATURE-REQUEST-9router-integration.md` +
+`../9ROUTER.md`.
 GEMINI_API_KEY loaded from `.env` via `constants._load_env()` — never hardcoded.
 Multi-model embeddings: each embedding model gets its own ChromaDB collection; active model
 selected by user in UI; registry stored in `data/embedding_registry.json`.
@@ -35,6 +43,9 @@ src/
   clustering.py   ← DBSCAN face clustering
   scanner.py / metadata.py ← recursive image discovery + EXIF
   validator.py    ← LM Studio / Gemini health checks
+  ratelimit.py    ← per-provider RPS/RPM/RPH/RPD throttle (user-set in Settings →
+                    "rate_limits", 0 = unlimited); acquire() before every provider
+                    inference call; sliding in-memory windows; Stop-aware (Cancelled)
   constants.py    ← paths + endpoints + GEMINI_VISION_MODELS + SERVER_PORT + _load_env()
 web/
   src/App.svelte  ← tabs: Search, Timeline, People, Index & Manage

@@ -449,3 +449,233 @@ def test_gemini_embed_429_sets_cooldown_and_skips_retry():
             _gemini_embed("test", model="text-embedding-004")
         mock_open.assert_not_called()
     embeddings_mod._gemini_embed_cooldown.clear()
+
+
+# ── 9Router ───────────────────────────────────────────────────────────────────
+
+def _fake_urlopen_9r_embed(rows: list):
+    class _Resp:
+        def read(self): return json.dumps({"data": rows}).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+    return _Resp()
+
+
+def test_9router_embed_requires_model():
+    from embeddings import _9router_embed
+    with pytest.raises(ValueError, match="explicit embedding model"):
+        _9router_embed("text", None)
+
+
+def test_9router_embed_success():
+    import embeddings
+    rows = [{"index": 0, "embedding": [0.1, 0.2, 0.3]}]
+    with patch("urllib.request.urlopen", return_value=_fake_urlopen_9r_embed(rows)), \
+         patch.dict(embeddings._9r_embed_cooldown, {}, clear=True):
+        vec, model = embeddings._9router_embed("text", "gemini/gemini-embedding-001")
+    assert vec == [0.1, 0.2, 0.3]
+    assert model == "gemini/gemini-embedding-001"
+
+
+def test_9router_embed_batch_orders_by_index():
+    import embeddings
+    rows = [
+        {"index": 2, "embedding": [3.0]},
+        {"index": 0, "embedding": [1.0]},
+        {"index": 1, "embedding": [2.0]},
+    ]
+    with patch("urllib.request.urlopen", return_value=_fake_urlopen_9r_embed(rows)), \
+         patch.dict(embeddings._9r_embed_cooldown, {}, clear=True):
+        vecs, model = embeddings._9router_embed_batch(["a", "b", "c"], "gemini/gemini-embedding-001")
+    assert vecs == [[1.0], [2.0], [3.0]]
+
+
+def test_9router_embed_429_sets_cooldown():
+    import embeddings
+    with patch("urllib.request.urlopen", side_effect=_http_error(429)), \
+         patch.dict(embeddings._9r_embed_cooldown, {}, clear=True):
+        with pytest.raises(RuntimeError, match="429"):
+            embeddings._9router_embed("text", "gemini/gemini-embedding-001")
+        assert "gemini/gemini-embedding-001" in embeddings._9r_embed_cooldown
+        with pytest.raises(RuntimeError, match="cooldown"):
+            embeddings._9router_embed("text", "gemini/gemini-embedding-001")
+
+
+def test_get_embedding_9router_no_cross_provider_fallback():
+    """force_provider='9router' failure must NOT silently fall back to
+    LM Studio/Gemini — different model = different vector space."""
+    from embeddings import get_embedding
+    lm = MagicMock(); gem = MagicMock()
+    with patch("embeddings._9router_embed", side_effect=RuntimeError("exhausted")), \
+         patch("embeddings._lm_studio_embed", lm), patch("embeddings._gemini_embed", gem):
+        result, model_name, source = get_embedding("text", force_provider="9router",
+                                                   model="gemini/gemini-embedding-001")
+    assert result is None
+    assert source == "error"
+    lm.assert_not_called()
+    gem.assert_not_called()
+
+
+def test_get_embedding_9router_registers_with_source():
+    from embeddings import get_embedding
+    with patch("embeddings._9router_embed", return_value=([0.1] * 4, "gemini/gemini-embedding-001")), \
+         patch("embeddings.register_model") as reg:
+        result, model_name, source = get_embedding("text", force_provider="9router",
+                                                   model="gemini/gemini-embedding-001")
+    assert source == "9router"
+    assert model_name == "gemini/gemini-embedding-001"
+    reg.assert_called_once_with("9router", "gemini/gemini-embedding-001", 4)
+
+
+def test_get_embeddings_batch_9router():
+    from embeddings import get_embeddings_batch
+    with patch("embeddings._9router_embed_batch", return_value=([[0.1], [0.2]], "gemini/gemini-embedding-001")), \
+         patch("embeddings.register_model"):
+        vecs, model_name, source = get_embeddings_batch(["a", "b"], force_provider="9router",
+                                                        model="gemini/gemini-embedding-001")
+    assert vecs == [[0.1], [0.2]]
+    assert source == "9router"
+
+
+def test_list_9router_embed_models_offline_returns_empty():
+    import embeddings
+    with patch("urllib.request.urlopen", side_effect=ConnectionRefusedError("refused")), \
+         patch.object(embeddings, "_9r_embed_models_cache", None):
+        assert embeddings.list_9router_embed_models() == []
+
+
+# ── /v1/models fallback never grabs an arbitrary (possibly chat) model ────────
+
+def test_lm_studio_embed_v1_fallback_skips_chat_models():
+    """Old-LM-Studio path (/v1/models heuristic): pick the first EMBED-named
+    model, not [0] — [0] can be a several-GB chat model that JIT-loads."""
+    from embeddings import _lm_studio_embed
+    models = {"data": [{"id": "gemma-4-e4b-it"}, {"id": "text-embedding-nomic-embed-text-v1.5"}]}
+    expected = [0.5, 0.6]
+    class _ModelsResp:
+        def read(self): return json.dumps(models).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+    def fake(req, timeout=None):
+        url = getattr(req, "full_url", str(req))
+        if url.endswith("/models"):
+            return _ModelsResp()
+        return _fake_urlopen_lm_studio_embed(expected)
+    with patch("urllib.request.urlopen", side_effect=fake), \
+         patch("embeddings.list_lm_studio_models_v0", return_value=[]):
+        vec, model = _lm_studio_embed("test")
+    assert model == "text-embedding-nomic-embed-text-v1.5"
+    assert vec == expected
+
+
+def _fake_urlopen_9r_embed_with_model(rows: list, served_model: str):
+    class _Resp:
+        def read(self): return json.dumps({"data": rows, "model": served_model}).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+    return _Resp()
+
+
+def test_9router_embed_rejects_substituted_model():
+    """Same-dimension substitution (e.g. gemini-embedding-2-preview is also
+    3072-d) would silently poison the collection — reject, never store."""
+    import embeddings
+    rows = [{"index": 0, "embedding": [0.1] * 4}]
+    with patch("urllib.request.urlopen",
+               return_value=_fake_urlopen_9r_embed_with_model(rows, "gemini-embedding-2-preview")), \
+         patch.dict(embeddings._9r_embed_cooldown, {}, clear=True):
+        with pytest.raises(RuntimeError, match="substituted"):
+            embeddings._9router_embed("text", "gemini/gemini-embedding-001")
+
+
+def test_9router_embed_accepts_prefix_stripped_echo():
+    """The normal case: response echoes the requested id without the provider
+    prefix (verified live) — that's the same model, accept it."""
+    import embeddings
+    rows = [{"index": 0, "embedding": [0.1, 0.2]}]
+    with patch("urllib.request.urlopen",
+               return_value=_fake_urlopen_9r_embed_with_model(rows, "gemini-embedding-001")), \
+         patch.dict(embeddings._9r_embed_cooldown, {}, clear=True):
+        vec, model = embeddings._9router_embed("text", "gemini/gemini-embedding-001")
+    assert vec == [0.1, 0.2]
+    assert model == "gemini/gemini-embedding-001"
+
+
+def test_9router_embed_batch_rejects_substituted_model():
+    import embeddings
+    rows = [{"index": 0, "embedding": [0.1]}, {"index": 1, "embedding": [0.2]}]
+    with patch("urllib.request.urlopen",
+               return_value=_fake_urlopen_9r_embed_with_model(rows, "some-other-model")), \
+         patch.dict(embeddings._9r_embed_cooldown, {}, clear=True):
+        with pytest.raises(RuntimeError, match="substituted"):
+            embeddings._9router_embed_batch(["a", "b"], "gemini/gemini-embedding-001")
+
+
+def test_batch_full_failure_records_reason_for_job_log():
+    """The (None,'','error') return can't carry WHY — last_embed_error() must,
+    so the job log can tell 'pick a different model' from 'service offline'."""
+    import embeddings
+    with patch("embeddings._9router_embed_batch",
+               side_effect=RuntimeError("9Router substituted embedding model (a → b) — rejected")):
+        vecs, _, source = embeddings.get_embeddings_batch(
+            ["x"], force_provider="9router", model="gemini/gemini-embedding-001")
+    assert vecs is None and source == "error"
+    assert "substituted" in embeddings.last_embed_error()
+
+
+def test_batch_success_clears_last_error():
+    import embeddings
+    embeddings._last_error = "stale"
+    embeddings._last_substitution = {"requested": "a", "served": "b"}
+    with patch("embeddings._lm_studio_embed_batch", return_value=([[0.1]], "m")), \
+         patch("embeddings.register_model"):
+        vecs, _, source = embeddings.get_embeddings_batch(["x"], force_provider="lm_studio")
+    assert vecs == [[0.1]]
+    assert embeddings.last_embed_error() is None
+    assert embeddings.last_substitution() is None
+
+
+def test_substitution_rejection_records_structured_details():
+    """The rejection must leave {requested, served} behind so the job manager
+    can surface a one-click 'switch to the served model' recovery."""
+    import embeddings
+    rows = [{"index": 0, "embedding": [0.1] * 4}]
+    with patch("urllib.request.urlopen",
+               return_value=_fake_urlopen_9r_embed_with_model(rows, "gemini-embedding-2-preview")), \
+         patch.dict(embeddings._9r_embed_cooldown, {}, clear=True):
+        vecs, _, source = embeddings.get_embeddings_batch(
+            ["x"], force_provider="9router", model="gemini/gemini-embedding-001")
+    assert vecs is None and source == "error"
+    assert embeddings.last_substitution() == {
+        "requested": "gemini/gemini-embedding-001",
+        "served": "gemini-embedding-2-preview",
+    }
+
+
+def test_get_embedding_single_also_records_reason():
+    """The single-embed path (full/reanalyze jobs) surfaces the same honest
+    reason as the batch path."""
+    import embeddings
+    with patch("embeddings._9router_embed",
+               side_effect=RuntimeError("9Router substituted embedding model (a → b) — rejected")):
+        vec, _, source = embeddings.get_embedding(
+            "x", force_provider="9router", model="gemini/gemini-embedding-001")
+    assert vec is None and source == "error"
+    assert "substituted" in embeddings.last_embed_error()
+
+
+def test_resolve_9router_embed_id_prefers_live_list():
+    import embeddings
+    with patch("embeddings.list_9router_embed_models",
+               return_value=["gemini/gemini-embedding-001", "gemini/gemini-embedding-2-preview"]):
+        assert embeddings.resolve_9router_embed_id(
+            "gemini-embedding-2-preview", "gemini/gemini-embedding-001"
+        ) == "gemini/gemini-embedding-2-preview"
+
+
+def test_resolve_9router_embed_id_falls_back_to_requested_prefix():
+    import embeddings
+    with patch("embeddings.list_9router_embed_models", return_value=[]):
+        assert embeddings.resolve_9router_embed_id(
+            "gemini-embedding-2-preview", "gemini/gemini-embedding-001"
+        ) == "gemini/gemini-embedding-2-preview"

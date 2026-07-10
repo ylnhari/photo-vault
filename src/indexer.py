@@ -773,7 +773,10 @@ def _embed_one(img_id: str, img_data: dict, upsert: bool = False,
         embedding_text, force_provider=embed_provider, model=embed_model
     )
     if embedding is None:
-        raise RuntimeError("embedding failed (LM Studio and Gemini both unavailable)")
+        from embeddings import last_embed_error
+        raise RuntimeError(
+            f"embedding failed — {last_embed_error() or 'all embedding providers unavailable'}"
+        )
 
     client = db.client()
     collection = client.get_or_create_collection(name=collection_name_for(model_name))

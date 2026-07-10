@@ -460,3 +460,183 @@ def test_encode_image_converts_rgba_png(tmp_path):
     assert result is not None
     decoded = Image.open(io.BytesIO(base64.b64decode(result)))
     assert decoded.format == "JPEG"
+
+
+# ── 9Router ───────────────────────────────────────────────────────────────────
+
+def _9r_chat_response(text: str, served_model: str = "gc/gemini-2.5-flash"):
+    resp = MagicMock()
+    resp.model = served_model
+    resp.choices = [MagicMock()]
+    resp.choices[0].message.content = text
+    return resp
+
+
+def test_call_9router_requires_model():
+    from vision import _call_9router
+    with pytest.raises(ValueError, match="explicit vision model"):
+        _call_9router("base64data", None)
+
+
+def test_call_9router_success_sends_stream_false():
+    import vision
+    client = MagicMock()
+    client.chat.completions.create.return_value = _9r_chat_response(VALID_JSON)
+    with patch.object(vision, "_get_9router_client", return_value=client), \
+         patch.dict(vision._9r_cooldown, {}, clear=True):
+        out, used = vision._call_9router("base64data", "gc/gemini-2.5-flash")
+    assert out == VALID_JSON
+    assert used == "gc/gemini-2.5-flash"
+    kwargs = client.chat.completions.create.call_args.kwargs
+    assert kwargs["model"] == "gc/gemini-2.5-flash"
+    assert kwargs["stream"] is False
+
+
+def test_call_9router_echoed_model_keeps_requested_id():
+    """Served name is usually the requested id minus the provider prefix —
+    keep the requested id (it carries strictly more information)."""
+    import vision
+    client = MagicMock()
+    client.chat.completions.create.return_value = _9r_chat_response(
+        VALID_JSON, served_model="gemini-2.5-flash")
+    with patch.object(vision, "_get_9router_client", return_value=client), \
+         patch.dict(vision._9r_cooldown, {}, clear=True):
+        _, used = vision._call_9router("base64data", "gc/gemini-2.5-flash")
+    assert used == "gc/gemini-2.5-flash"
+
+
+def test_call_9router_substitution_reports_served_model():
+    """The gateway substituted a different upstream model → the caption is
+    kept but attributed to the model that actually produced it."""
+    import vision
+    client = MagicMock()
+    client.chat.completions.create.return_value = _9r_chat_response(
+        VALID_JSON, served_model="gemini-3.1-flash-lite")
+    with patch.object(vision, "_get_9router_client", return_value=client), \
+         patch.dict(vision._9r_cooldown, {}, clear=True):
+        text, used = vision._call_9router("base64data", "gc/gemini-2.5-flash-lite")
+    assert text == VALID_JSON
+    assert used == "gemini-3.1-flash-lite"
+
+
+def test_call_9router_429_sets_cooldown_and_skips_retry():
+    import vision
+    client = MagicMock()
+    client.chat.completions.create.side_effect = RuntimeError("Error code: 429 - quota")
+    with patch.object(vision, "_get_9router_client", return_value=client), \
+         patch.dict(vision._9r_cooldown, {}, clear=True):
+        with pytest.raises(RuntimeError):
+            vision._call_9router("base64data", "gc/gemini-2.5-flash")
+        assert "gc/gemini-2.5-flash" in vision._9r_cooldown
+        # second call short-circuits on the cooldown without hitting the client
+        with pytest.raises(RuntimeError, match="cooldown"):
+            vision._call_9router("base64data", "gc/gemini-2.5-flash")
+    assert client.chat.completions.create.call_count == 1
+
+
+def test_get_image_caption_9router_labels_requested_model(tmp_path):
+    import vision
+    img_path = tmp_path / "t.jpg"
+    img_path.write_bytes(_make_tiny_image_bytes())
+    client = MagicMock()
+    client.chat.completions.create.return_value = _9r_chat_response(VALID_JSON)
+    with patch.object(vision, "_get_9router_client", return_value=client), \
+         patch.dict(vision._9r_cooldown, {}, clear=True):
+        text, label = vision.get_image_caption(
+            str(img_path), force_provider="9router",
+            model="gc/gemini-2.5-flash", with_model=True,
+        )
+    assert text == VALID_JSON
+    assert label == "9router:gc/gemini-2.5-flash"
+
+
+def test_get_image_caption_9router_substitution_labels_served_model(tmp_path):
+    """Caption from a substituted model is stored under the ACTUAL model's
+    label — per-model bookkeeping must not lie about provenance."""
+    import vision
+    img_path = tmp_path / "t.jpg"
+    img_path.write_bytes(_make_tiny_image_bytes())
+    client = MagicMock()
+    client.chat.completions.create.return_value = _9r_chat_response(
+        VALID_JSON, served_model="gemini-3.1-flash-lite")
+    with patch.object(vision, "_get_9router_client", return_value=client), \
+         patch.dict(vision._9r_cooldown, {}, clear=True):
+        text, label = vision.get_image_caption(
+            str(img_path), force_provider="9router",
+            model="gc/gemini-2.5-flash-lite", with_model=True,
+        )
+    assert text == VALID_JSON
+    assert label == "9router:gemini-3.1-flash-lite"
+
+
+def test_get_image_caption_9router_without_model_errors_no_fallback(tmp_path):
+    """No silent auto-pick and no cross-provider fallback for 9Router."""
+    import vision
+    img_path = tmp_path / "t.jpg"
+    img_path.write_bytes(_make_tiny_image_bytes())
+    gem = MagicMock()
+    with patch.object(vision, "_call_gemini", gem), \
+         patch.object(vision, "_call_lm_studio", gem):
+        text, label = vision.get_image_caption(
+            str(img_path), force_provider="9router", with_model=True,
+        )
+    assert label == "error"
+    assert "9Router" in json.loads(text)["error"]
+    gem.assert_not_called()
+
+
+def test_list_9router_vision_models_filters_and_excludes():
+    import vision
+    ids = [
+        "gc/gemini-2.5-flash", "gemini/gemma-4-31b-it", "kr/claude-sonnet-4.5",
+        "kr/claude-sonnet-4.5-thinking", "kr/claude-sonnet-4.5-agentic",
+        "kr/deepseek-3.2", "oc/some-coder",
+    ]
+    class _Resp:
+        def read(self): return json.dumps({"data": [{"id": i} for i in ids]}).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+    with patch("urllib.request.urlopen", return_value=_Resp()), \
+         patch.object(vision, "_9r_models_cache", None):
+        models = vision.list_9router_vision_models()
+    assert "gc/gemini-2.5-flash" in models
+    assert "gemini/gemma-4-31b-it" in models
+    assert "kr/claude-sonnet-4.5" in models
+    assert "kr/claude-sonnet-4.5-thinking" not in models
+    assert "kr/claude-sonnet-4.5-agentic" not in models
+    assert "kr/deepseek-3.2" not in models
+    assert "oc/some-coder" not in models
+
+
+def test_list_9router_vision_models_offline_returns_empty():
+    import vision
+    with patch("urllib.request.urlopen", side_effect=ConnectionRefusedError("refused")), \
+         patch.object(vision, "_9r_models_cache", None):
+        assert vision.list_9router_vision_models() == []
+
+
+# ── _lm_model_id honesty (bug: arbitrary model claimed when none loaded) ─────
+
+def test_lm_model_id_no_arbitrary_claim_when_v0_says_nothing_loaded():
+    """v0 API reachable + nothing loaded → bare 'lm_studio', never the first
+    /v1/models entry (which can be a not-loaded embedding model)."""
+    import vision
+    v0 = [
+        {"id": "text-embedding-foo", "type": "embeddings", "state": "not-loaded"},
+        {"id": "some-vlm", "type": "vlm", "state": "not-loaded"},
+    ]
+    client = MagicMock()
+    with patch.object(vision, "list_lm_studio_models_v0", return_value=v0), \
+         patch.object(vision, "_get_lm_client", return_value=client):
+        assert vision._lm_model_id() == "lm_studio"
+    client.models.list.assert_not_called()
+
+
+def test_lm_model_id_uses_v1_guess_only_when_v0_unavailable():
+    import vision
+    m = MagicMock(); m.id = "first-model"
+    client = MagicMock()
+    client.models.list.return_value = MagicMock(data=[m])
+    with patch.object(vision, "list_lm_studio_models_v0", return_value=[]), \
+         patch.object(vision, "_get_lm_client", return_value=client):
+        assert vision._lm_model_id() == "lm_studio:first-model"
