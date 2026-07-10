@@ -78,6 +78,7 @@ import clustering
 from clustering import ClusterMembersStaleError
 import albums as albums_mgr
 import folders as folder_mgr
+import ratelimit
 import settings as settings_mgr
 
 os.makedirs(THUMB_DIR, exist_ok=True)
@@ -392,6 +393,28 @@ def reset_settings():
     """Reset to factory defaults."""
     settings_mgr.save(settings_mgr.DEFAULTS)
     return settings_mgr.load()
+
+
+@app.get("/api/rate-limits/suggest")
+def rate_limit_suggest(provider: str, model: str | None = None):
+    """Suggested request ceilings for a provider (+model). Sources, best
+    first: values LEARNED from real Gemini 429 QuotaFailure metadata (exact
+    per-account numbers), else the PUBLISHED free-tier table in ratelimit.py.
+    There is no query-my-quota endpoint for an AI Studio API key, so these
+    two are the only honest signals. available=False for providers where a
+    client-side ceiling isn't meaningful."""
+    s = ratelimit.suggest(provider, model)
+    if s is None:
+        reason = (
+            "local server — no provider quota to respect"
+            if provider == "lm_studio"
+            else "9Router rotates pooled accounts/keys on 429 internally — "
+                 "throttle only if you want to reserve quota for other apps"
+            if provider == "9router"
+            else "unknown provider"
+        )
+        return {"available": False, "reason": reason}
+    return {"available": True, **s}
 
 
 # ── scanning ────────────────────────────────────────────────────────────────

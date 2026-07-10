@@ -20,6 +20,7 @@ inference request (an embed batch is one request; each Gemini vision model
 attempt in the fallback loop is its own request), which matches how the
 providers count.
 """
+import json
 import threading
 import time
 from collections import deque
@@ -126,3 +127,84 @@ def reset():
     with _lock:
         _history.clear()
         _waiting.clear()
+
+
+# ── Suggested limits ─────────────────────────────────────────────────────────
+# There is NO "what are my limits" endpoint for an AI Studio API key (quota
+# introspection needs the Cloud Quotas API with OAuth on a GCP project), so
+# suggestions come from two real sources, best first:
+#   1. LEARNED: Gemini 429 bodies carry google.rpc.QuotaFailure metadata that
+#      states the violated quota and its exact per-account value — parsed by
+#      learn_from_gemini_429() at both 429 sites and kept here (in-memory).
+#   2. PUBLISHED: the static table below — free-tier values as verified on
+#      THIS account in AI Studio → Rate Limit (2026-07-04; same audit that
+#      ordered constants.GEMINI_VISION_MODELS). Update it when Google does.
+# LM Studio is local (no meaningful ceiling) and 9Router rotates pooled
+# accounts/keys on 429 internally — its whole job — so neither gets a
+# suggestion; suggest() returns None for them.
+
+# Longest-prefix-ish match: first substring hit wins, so order specific → generic.
+SUGGESTED_GEMINI = (
+    ("gemini-3.1-flash-lite", {"rpm": 15, "rpd": 500}),   # verified RPD 500
+    ("flash-lite",            {"rpm": 15, "rpd": 20}),    # verified RPD 20
+    ("embedding",             {"rpm": 100, "rpd": 1000}),
+    ("",                      {"rpm": 10, "rpd": 20}),    # any other Gemini model
+)
+
+_learned: dict[tuple[str, str], dict[str, int]] = {}  # (provider, model) -> {window: value}
+
+_QUOTA_ID_WINDOWS = (
+    ("PerSecond", "rps"), ("PerMinute", "rpm"), ("PerHour", "rph"), ("PerDay", "rpd"),
+)
+
+
+def learn_from_gemini_429(model: str, body) -> None:
+    """Harvest real per-account quota values from a Gemini 429 response body.
+    Best-effort: any parse failure is silently ignored — the 429 itself is
+    already handled by the caller's cooldown logic."""
+    try:
+        if isinstance(body, bytes):
+            body = body.decode("utf-8", errors="replace")
+        data = json.loads(body)
+        for detail in data.get("error", {}).get("details", []):
+            if not detail.get("@type", "").endswith("QuotaFailure"):
+                continue
+            for v in detail.get("violations", []):
+                qid = v.get("quotaId", "")
+                try:
+                    val = int(v.get("quotaValue", 0))
+                except (TypeError, ValueError):
+                    continue
+                m = v.get("quotaDimensions", {}).get("model") or model
+                for token, window in _QUOTA_ID_WINDOWS:
+                    if token in qid and val > 0:
+                        with _lock:
+                            _learned.setdefault(("gemini", m), {})[window] = val
+    except Exception:
+        pass
+
+
+def suggest(provider: str, model: str | None = None) -> dict | None:
+    """Suggested {rps, rpm, rph, rpd, sources} for a provider (+model), or
+    None when throttling isn't meaningful for it (local LM Studio; 9Router,
+    which rotates pooled accounts internally). sources maps each non-zero
+    window to "learned" (from a real 429) or "published" (static table)."""
+    if provider != "gemini":
+        return None
+    if not model:
+        from constants import GEMINI_VISION_MODELS
+        model = GEMINI_VISION_MODELS[0]
+    limits = {k: 0 for k in WINDOWS}
+    sources: dict[str, str] = {}
+    for pattern, vals in SUGGESTED_GEMINI:
+        if pattern in model:
+            for k, v in vals.items():
+                limits[k] = v
+                sources[k] = "published"
+            break
+    with _lock:
+        learned = dict(_learned.get(("gemini", model), {}))
+    for k, v in learned.items():
+        limits[k] = v
+        sources[k] = "learned"
+    return {**limits, "model": model, "sources": sources}

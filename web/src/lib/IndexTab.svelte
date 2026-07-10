@@ -33,6 +33,29 @@
     return s;
   }
 
+  // "Suggest" fills a provider's row from the backend: values learned from
+  // real Gemini 429 QuotaFailure metadata when we've seen one, else the
+  // published free-tier table. (There is no query-my-quota API for an AI
+  // Studio key, so those are the only honest sources.)
+  let rlSuggestNote = "";
+  async function suggestLimits(pkey) {
+    rlSuggestNote = "";
+    try {
+      const model = pkey === "gemini"
+        ? ((settings.vision_provider === "gemini" && settings.vision_model) || null)
+        : null;
+      const r = await api.rateLimitSuggest(pkey, model);
+      if (!r.available) { rlSuggestNote = r.reason; return; }
+      settings.rate_limits[pkey] = { rps: r.rps, rpm: r.rpm, rph: r.rph, rpd: r.rpd };
+      settings = settings;
+      markDirty();
+      const srcs = Object.values(r.sources || {});
+      rlSuggestNote = `Filled for ${r.model}: ` + (srcs.includes("learned")
+        ? "includes exact limits learned from this account's 429 responses."
+        : "published free-tier values — a real 429 teaches the exact account numbers.");
+    } catch (e) { rlSuggestNote = e.message; }
+  }
+
   let settings = normalizeRateLimits({
     vision_provider: "auto", vision_model: null,
     embed_provider: "auto",  embed_model: null,
@@ -738,6 +761,7 @@
     <div class="rl-grid" role="group" aria-label="Provider rate limits">
       <span></span>
       {#each RL_WINDOWS as [, wlabel]}<span class="rl-head">{wlabel}</span>{/each}
+      <span></span>
       {#each RL_PROVIDERS as [pkey, plabel] (pkey)}
         <span class="rl-prov">{plabel}</span>
         {#each RL_WINDOWS as [wkey, wlabel] (wkey)}
@@ -746,8 +770,15 @@
                  bind:value={settings.rate_limits[pkey][wkey]}
                  on:change={markDirty} />
         {/each}
+        <button class="ghost sm" on:click={() => suggestLimits(pkey)}
+                title="Fill from limits learned from real 429s, else published free-tier values">
+          ✨ Suggest
+        </button>
       {/each}
     </div>
+    {#if rlSuggestNote}
+      <p class="hint" style="margin-top:6px">{rlSuggestNote}</p>
+    {/if}
   </div>
 </div>
 
@@ -1152,8 +1183,8 @@
     text-transform: uppercase; letter-spacing:.05em; margin: 12px 0 6px; }
   .cfg-label { font-size: 12px; font-weight: 600; color: var(--muted);
     text-transform: uppercase; letter-spacing:.05em; margin-bottom: 8px; }
-  .rl-grid { display: grid; grid-template-columns: max-content repeat(4, 90px);
-    gap: 6px 10px; align-items: center; max-width: 520px; }
+  .rl-grid { display: grid; grid-template-columns: max-content repeat(4, 90px) max-content;
+    gap: 6px 10px; align-items: center; max-width: 640px; }
   .rl-grid .rl-head { font-size: 12px; color: var(--muted); text-align: center; }
   .rl-grid .rl-prov { font-size: 13px; }
   .rl-grid input { width: 100%; padding: 5px 8px; font-size: 13px; }

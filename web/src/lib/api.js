@@ -71,6 +71,8 @@ export const api = {
   getSettings: () => j("GET", "/api/settings"),
   saveSettings: (s) => j("PUT", "/api/settings", s),
   resetSettings: () => j("DELETE", "/api/settings"),
+  rateLimitSuggest: (provider, model) =>
+    j("GET", `/api/rate-limits/suggest?provider=${encodeURIComponent(provider)}${model ? `&model=${encodeURIComponent(model)}` : ""}`),
 
   // Indexing jobs
   indexStart: (cfg) => j("POST", "/api/index/start", cfg),

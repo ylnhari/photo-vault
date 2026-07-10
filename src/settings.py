@@ -49,9 +49,14 @@ DEFAULTS: dict = {
     # instead of burning quota on 429s and tripping model cooldowns. Enforced
     # by ratelimit.acquire() before every provider inference call; counters
     # are in-memory sliding windows that reset on server restart.
+    # LM Studio is local and 9Router rotates pooled accounts internally, so
+    # both default to unlimited. Gemini gets a real free-tier default (from
+    # the AI-Studio-verified numbers in ratelimit.SUGGESTED_GEMINI, sized for
+    # the primary gemini-3.1-flash-lite model) — all-zeros would mean every
+    # fresh install hammers the free tier into 429s by default.
     "rate_limits": {
         "lm_studio": {"rps": 0, "rpm": 0, "rph": 0, "rpd": 0},
-        "gemini":    {"rps": 0, "rpm": 0, "rph": 0, "rpd": 0},
+        "gemini":    {"rps": 0, "rpm": 10, "rph": 0, "rpd": 500},
         "9router":   {"rps": 0, "rpm": 0, "rph": 0, "rpd": 0},
     },
 }

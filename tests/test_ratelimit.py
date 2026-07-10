@@ -112,3 +112,65 @@ def test_limits_for_reads_settings_and_sanitizes(monkeypatch):
     assert lims == {"rps": 0, "rpm": 15, "rph": 0, "rpd": 0}
     # provider with no config at all → fully unlimited
     assert ratelimit._limits_for("lm_studio") == {"rps": 0, "rpm": 0, "rph": 0, "rpd": 0}
+
+
+# ── suggestions: learned-from-429 + published table ──────────────────────────
+
+_429_BODY = b'''{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[
+ {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[
+  {"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests",
+   "quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+   "quotaDimensions":{"model":"gemini-3.1-flash-lite","location":"global"},
+   "quotaValue":"12"},
+  {"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests",
+   "quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+   "quotaDimensions":{"model":"gemini-3.1-flash-lite","location":"global"},
+   "quotaValue":"480"}]},
+ {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"36s"}]}}'''
+
+
+@pytest.fixture(autouse=True)
+def _clear_learned():
+    ratelimit._learned.clear()
+    yield
+    ratelimit._learned.clear()
+
+
+def test_suggest_published_values_for_gemini_model():
+    s = ratelimit.suggest("gemini", "gemini-3.1-flash-lite")
+    assert s["rpm"] == 15 and s["rpd"] == 500
+    assert s["sources"] == {"rpm": "published", "rpd": "published"}
+    assert s["model"] == "gemini-3.1-flash-lite"
+
+
+def test_suggest_defaults_to_primary_vision_model_when_none_given():
+    s = ratelimit.suggest("gemini", None)
+    from constants import GEMINI_VISION_MODELS
+    assert s["model"] == GEMINI_VISION_MODELS[0]
+
+
+def test_suggest_none_for_local_and_gateway_providers():
+    assert ratelimit.suggest("lm_studio") is None
+    assert ratelimit.suggest("9router") is None
+
+
+def test_learn_from_gemini_429_overrides_published():
+    ratelimit.learn_from_gemini_429("gemini-3.1-flash-lite", _429_BODY)
+    s = ratelimit.suggest("gemini", "gemini-3.1-flash-lite")
+    # learned values (12 rpm / 480 rpd) beat the published table (15/500)
+    assert s["rpm"] == 12 and s["rpd"] == 480
+    assert s["sources"]["rpm"] == "learned"
+    assert s["sources"]["rpd"] == "learned"
+
+
+def test_learn_from_gemini_429_garbage_is_ignored():
+    ratelimit.learn_from_gemini_429("gemini-3.1-flash-lite", b"<html>gateway timeout</html>")
+    ratelimit.learn_from_gemini_429("gemini-3.1-flash-lite", None)
+    assert ratelimit._learned == {}
+
+
+def test_learn_uses_quota_dimension_model_not_requested_one():
+    # dimensions say which model the quota belongs to — trust that over the
+    # id we happened to request (fallback chains cross models).
+    ratelimit.learn_from_gemini_429("gemini-2.5-flash", _429_BODY)
+    assert ("gemini", "gemini-3.1-flash-lite") in ratelimit._learned

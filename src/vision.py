@@ -524,6 +524,10 @@ def _call_gemini(base64_image: str, model: str = None) -> tuple[str, str]:
             if e.code in (429, 404, 503):
                 if e.code == 429:
                     _mark_rate_limited(m, e.headers.get("Retry-After") if e.headers else None)
+                    # The 429 body names the violated quota and its exact
+                    # per-account value — feed it to the rate-limit
+                    # suggestions so the UI can offer REAL numbers.
+                    ratelimit.learn_from_gemini_429(m, e.read())
                 last_err = f"{m}:{e.code}"
                 continue
             raise RuntimeError(f"Gemini {e.code} ({m}): {e.read()[:200]}")

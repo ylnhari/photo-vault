@@ -308,9 +308,11 @@ def _gemini_embed(text: str, model: str = None) -> tuple[list, str]:
             result = json.loads(r.read())
         return result["embedding"]["values"], model_name
     except urllib.error.HTTPError as e:
+        body = e.read()  # readable only once — capture before using twice
         if e.code == 429:
             _mark_embed_rate_limited(model_name, e.headers.get("Retry-After") if e.headers else None)
-        raise RuntimeError(f"Gemini embed {e.code}: {e.read()[:200]}")
+            ratelimit.learn_from_gemini_429(model_name, body)
+        raise RuntimeError(f"Gemini embed {e.code}: {body[:200]}")
 
 
 # ── 9Router (local multi-provider gateway) ────────────────────────────────────
