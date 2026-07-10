@@ -107,8 +107,31 @@ def get_defaults() -> list[str]:
         candidates = [
             os.path.join(home, "Pictures"),
         ]
+        # The real pictures dir is localized on many systems (~/Bilder,
+        # ~/Images, …) — the XDG user-dirs config names it authoritatively.
+        xdg = _xdg_pictures_dir(home)
+        if xdg and xdg not in candidates:
+            candidates.insert(0, xdg)
 
     return [p for p in candidates if os.path.isdir(p)]
+
+
+def _xdg_pictures_dir(home: str) -> str | None:
+    """Parse XDG_PICTURES_DIR from ~/.config/user-dirs.dirs (freedesktop
+    user-dirs spec) — lines look like: XDG_PICTURES_DIR="$HOME/Bilder"."""
+    cfg = os.path.join(
+        os.environ.get("XDG_CONFIG_HOME", os.path.join(home, ".config")),
+        "user-dirs.dirs")
+    try:
+        with open(cfg, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("XDG_PICTURES_DIR="):
+                    val = line.split("=", 1)[1].strip().strip('"')
+                    return val.replace("$HOME", home)
+    except OSError:
+        pass
+    return None
 
 
 # ── bootstrap ─────────────────────────────────────────────────────────────────

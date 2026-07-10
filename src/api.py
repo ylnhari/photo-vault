@@ -703,13 +703,14 @@ def backup_status():
 @app.get("/api/fs/list")
 def fs_list(path: str | None = None):
     """Server-side folder browser for the folder-picker UI (browsers can't
-    hand a real filesystem path to a web page). No path → the drive roots;
+    hand a real filesystem path to a web page). No path → the filesystem
+    roots (drive letters on Windows, / + mounted volumes on macOS/Linux);
     otherwise the folder's subdirectories. Local single-user app behind the
     bearer token — directory names are not a secret from the app's own user."""
+    import platformfs
     if not path:
-        import string
-        drives = [f"{c}:\\" for c in string.ascii_uppercase if os.path.exists(f"{c}:\\")]
-        return {"path": None, "parent": None, "dirs": drives}
+        return {"path": None, "parent": None, "dirs": platformfs.list_roots(),
+                "sep": os.sep}
     p = Path(path)
     if not p.is_dir():
         raise HTTPException(404, f"folder not found: {path}")
@@ -723,13 +724,13 @@ def fs_list(path: str | None = None):
             except OSError:
                 continue
             name = child.name
-            if name.startswith(("$", ".")) or name == "System Volume Information":
+            if name.startswith(("$", ".")) or platformfs.is_system_name(name):
                 continue
             dirs.append(name)
     except PermissionError:
         raise HTTPException(403, f"no permission to list: {path}")
     parent = None if p == p.parent else str(p.parent)
-    return {"path": str(p), "parent": parent, "dirs": dirs}
+    return {"path": str(p), "parent": parent, "dirs": dirs, "sep": os.sep}
 
 
 @app.get("/api/ingest/validate")

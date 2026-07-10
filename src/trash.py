@@ -3,16 +3,16 @@ Soft-delete for indexed photos. "Removing" a photo moves its catalog entry to
 data/trash.json (search vectors are dropped so results stay clean, but the
 caption and derived files are kept, so restore is cheap: the photo re-enters
 the catalog and just needs re-embedding). Purging the trash does the permanent
-cleanup. File deletion uses the OS Recycle Bin on Windows so even that is
+cleanup. File deletion uses the OS trash (Windows Recycle Bin, macOS Finder
+Trash, freedesktop Trash on Linux — see platformfs) so even that is
 recoverable outside the app.
 """
-import ctypes
 import json
 import os
-import sys
 import threading
 import time
 
+import platformfs
 from constants import DATA_DIR
 
 TRASH_PATH = os.path.join(DATA_DIR, "trash.json")
@@ -86,37 +86,10 @@ def purge(img_ids: list[str] | None = None) -> list[str]:
 
 def delete_file_to_recycle_bin(path: str) -> bool:
     """
-    Delete a file recoverably: Windows Recycle Bin via SHFileOperationW
-    (stdlib ctypes, no dependency). Returns True when the recycle path was
-    used; False means the caller should fall back to os.remove.
+    Delete a file recoverably via the OS trash (Recycle Bin / Finder Trash /
+    freedesktop Trash — platformfs picks the implementation). Returns True
+    when the trash path was used; False means the caller should fall back to
+    os.remove. Name kept for the existing call sites; behavior is now
+    cross-platform.
     """
-    if sys.platform != "win32":
-        return False
-    try:
-        class SHFILEOPSTRUCTW(ctypes.Structure):
-            _fields_ = [
-                ("hwnd", ctypes.c_void_p),
-                ("wFunc", ctypes.c_uint),
-                ("pFrom", ctypes.c_wchar_p),
-                ("pTo", ctypes.c_wchar_p),
-                ("fFlags", ctypes.c_uint16),
-                ("fAnyOperationsAborted", ctypes.c_int),
-                ("hNameMappings", ctypes.c_void_p),
-                ("lpszProgressTitle", ctypes.c_wchar_p),
-            ]
-
-        FO_DELETE = 3
-        FOF_ALLOWUNDO = 0x0040
-        FOF_NOCONFIRMATION = 0x0010
-        FOF_SILENT = 0x0004
-        FOF_NOERRORUI = 0x0400
-
-        op = SHFILEOPSTRUCTW()
-        op.wFunc = FO_DELETE
-        op.pFrom = os.path.abspath(path) + "\0"  # double-NUL-terminated list
-        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
-        result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
-        return result == 0 and not op.fAnyOperationsAborted
-    except Exception as e:
-        print(f"[trash] recycle-bin delete failed for {path}: {e}")
-        return False
+    return platformfs.move_to_trash(path)

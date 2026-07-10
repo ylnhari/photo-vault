@@ -73,8 +73,9 @@ _SUMMARY = """
 """
 
 
-def test_backup_one_photo_root_copies_without_purge_and_skips_videos(env):
+def test_backup_one_photo_root_copies_without_purge_and_skips_videos(env, monkeypatch):
     tmp_path, pics = env
+    monkeypatch.setattr(os, "name", "nt")  # force the robocopy engine
     proc = MagicMock(returncode=3, stdout=_SUMMARY)
     with patch("backup.subprocess.run", return_value=proc) as run:
         note = backup.backup_one(str(pics))
@@ -88,8 +89,9 @@ def test_backup_one_photo_root_copies_without_purge_and_skips_videos(env):
     assert backup.status()["last_backup_at"] is not None
 
 
-def test_backup_one_data_root_uses_strict_mirror(env):
+def test_backup_one_data_root_uses_strict_mirror(env, monkeypatch):
     tmp_path, pics = env
+    monkeypatch.setattr(os, "name", "nt")
     proc = MagicMock(returncode=1, stdout=_SUMMARY)
     with patch("backup.subprocess.run", return_value=proc) as run:
         backup.backup_one(backup.DATA_DIR)
@@ -97,8 +99,9 @@ def test_backup_one_data_root_uses_strict_mirror(env):
     assert "/MIR" in cmd and "/XF" not in cmd
 
 
-def test_backup_one_failure_raises(env):
+def test_backup_one_failure_raises(env, monkeypatch):
     tmp_path, pics = env
+    monkeypatch.setattr(os, "name", "nt")
     proc = MagicMock(returncode=16, stdout="ERROR : access denied\n")
     with patch("backup.subprocess.run", return_value=proc):
         with pytest.raises(RuntimeError, match="exit 16"):
@@ -109,6 +112,78 @@ def test_backup_one_failure_raises(env):
 def test_backup_one_unmapped_source_raises(env):
     with pytest.raises(RuntimeError, match="no backup destination"):
         backup.backup_one(r"C:\not\a\root")
+
+
+# ── cross-platform python mirror engine ──────────────────────────────────────
+# Pure stdlib, so these run for real on every OS (no robocopy involved).
+
+def _tree(base, spec):
+    """Create files from {relpath: content} under base."""
+    for rel, content in spec.items():
+        p = base / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content)
+
+
+def test_python_mirror_copies_and_skips_videos_without_purge(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    _tree(src, {"2023/a.jpg": b"aa", "2023/clip.mp4": b"vv", "b.png": b"bb"})
+    # a pre-existing extra at dest must SURVIVE a no-purge photo mirror
+    _tree(dst, {"old-video.mov": b"keepme"})
+    note = backup._mirror_python(str(src), str(dst), purge=False)
+    assert (dst / "2023" / "a.jpg").read_bytes() == b"aa"
+    assert (dst / "b.png").read_bytes() == b"bb"
+    assert not (dst / "2023" / "clip.mp4").exists()   # video invisible
+    assert (dst / "old-video.mov").exists()           # extras kept (no purge)
+    assert "2 copied" in note
+
+
+def test_python_mirror_incremental_second_run_copies_nothing(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    _tree(src, {"a.jpg": b"aa", "sub/b.jpg": b"bb"})
+    backup._mirror_python(str(src), str(dst), purge=False)
+    note = backup._mirror_python(str(src), str(dst), purge=False)
+    assert "0 copied" in note and "2 unchanged" in note
+
+
+def test_python_mirror_purge_removes_extras_and_empty_dirs(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    _tree(src, {"keep.bin": b"k"})
+    _tree(dst, {"keep.bin": b"k", "gone/stale.bin": b"s"})
+    note = backup._mirror_python(str(src), str(dst), purge=True)
+    assert not (dst / "gone").exists()   # extra file AND its emptied dir gone
+    assert (dst / "keep.bin").exists()
+    assert "1 removed at dest" in note
+
+
+def test_python_mirror_skips_system_dirs(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    _tree(src, {"ok.jpg": b"o", "$RECYCLE.BIN/zombie.jpg": b"z",
+                ".Trash-1000/dead.jpg": b"d"})
+    backup._mirror_python(str(src), str(dst), purge=False)
+    assert (dst / "ok.jpg").exists()
+    assert not (dst / "$RECYCLE.BIN").exists()
+    assert not (dst / ".Trash-1000").exists()
+
+
+def test_python_mirror_failure_raises_and_reports(tmp_path, monkeypatch):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    _tree(src, {"a.jpg": b"aa"})
+    monkeypatch.setattr(backup.shutil, "copy2",
+                        lambda a, b: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(RuntimeError, match="disk full"):
+        backup._mirror_python(str(src), str(dst), purge=False)
+
+
+def test_backup_one_uses_python_engine_off_windows(env, monkeypatch):
+    tmp_path, pics = env
+    (pics / "x.jpg").write_bytes(b"x")
+    monkeypatch.setattr(os, "name", "posix")
+    with patch("backup.subprocess.run") as run:  # must NOT be called
+        note = backup.backup_one(str(pics))
+    run.assert_not_called()
+    assert "1 copied" in note
+    assert backup.status()["last_backup_at"] is not None
 
 
 def test_validate_dest_rejects_library_overlap(tmp_path, monkeypatch):

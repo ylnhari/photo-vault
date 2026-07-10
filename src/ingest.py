@@ -21,6 +21,7 @@ from pathlib import Path
 
 import exifread
 
+import platformfs
 from constants import DATA_DIR
 from scanner import IMAGE_EXTENSIONS, content_uid, _sig, _is_locally_available
 
@@ -140,8 +141,7 @@ def source_stats(src: str) -> dict:
     media_bytes = 0
     other_files = 0
     for dirpath, dirnames, filenames in os.walk(src):
-        dirnames[:] = [d for d in dirnames
-                       if not d.startswith(('$', 'System Volume Information'))]
+        platformfs.skip_system_dirs(dirnames)
         for name in filenames:
             p = Path(dirpath) / name
             if p.suffix.lower() in MEDIA_EXTENSIONS:
@@ -164,9 +164,9 @@ def list_staging_files(source: str) -> list[str]:
         raise ValueError(f"staging folder not found: {source}")
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
-        # Never descend into a recycle bin / hidden system dirs on the card.
-        dirnames[:] = [d for d in dirnames
-                       if not d.startswith(('$', 'System Volume Information'))]
+        # Never descend into a recycle bin / trash / system dirs on the card
+        # (any OS — deleted photos must not resurrect as "new" imports).
+        platformfs.skip_system_dirs(dirnames)
         for name in filenames:
             p = Path(dirpath) / name
             if p.suffix.lower() in MEDIA_EXTENSIONS and _is_locally_available(p):

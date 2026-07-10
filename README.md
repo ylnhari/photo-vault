@@ -54,6 +54,24 @@ indexing, vision, embeddings, faces, search — and expose a JSON API. The SPA i
 Indexing runs as a **background job**: progress streams to the UI, a Stop button works mid-run,
 and the page never freezes. Everything is local; your photos and index never leave your machine.
 
+## Platform support
+
+Windows, macOS, and Linux. All OS-specific filesystem behavior lives in one module
+(`src/platformfs.py`) and adapts automatically:
+
+| Capability | Windows | macOS | Linux |
+|---|---|---|---|
+| Folder picker roots | Drive letters (`C:\`, `D:\`, …) | `/` + `/Volumes/*` | `/` + `/media/*`, `/run/media/<user>/*`, `/mnt/*` |
+| Backup copy engine | robocopy (built in, incremental) | stdlib incremental mirror | stdlib incremental mirror |
+| Recoverable delete | Recycle Bin | Finder Trash | freedesktop Trash (`~/.local/share/Trash`) |
+| Cloud-placeholder skip (OneDrive etc.) | ✓ | n/a | n/a |
+| Default photo folder | `~/Pictures`, OneDrive Pictures | `~/Pictures` | XDG pictures dir (localized), `~/Pictures` |
+
+Both engines use the same incremental compare (size + mtime within 2 s — FAT/exFAT
+timestamp granularity), so backing up to an exFAT SD card doesn't re-copy the world each run.
+System folders (`$RECYCLE.BIN`, `System Volume Information`, `.Trashes`, `.Trash-1000`,
+`lost+found`, Spotlight/fseventsd) are never scanned, imported from, or mirrored on any OS.
+
 ## Requirements
 
 - Python 3.10+ and [uv](https://docs.astral.sh/uv/)
@@ -96,12 +114,45 @@ make web       # terminal 2 — Vite dev server on :5173 (proxies /api → :8768
 
 3. Go to **Index & Manage** tab → **Services** — confirm LM Studio and/or Gemini show online
 
-4. **A — Scan**: enter your Photos folder path (e.g. `C:\Users\you\Pictures`) → **Scan folders**
+4. **A — Scan**: add your Photos folder (Browse opens a visual folder picker) → **Scan folders**
 
 5. **B — Vision** then **C — Embed** (or **D — Full index** to do both). Watch the live progress
    bar; **Stop** anytime — it halts between photos. Each photo logs its provider (✅ local / ☁️ Gemini)
 
 6. After indexing: use **Search**, browse **Timeline**, register people in **People**
+
+## Import & consolidate
+
+**Index & Manage → Import** merges any staging folder — Google Takeout extract, pen-drive
+dump, SD card, phone download — into your library. Every file is identified by SHA-1 of its
+bytes, so content the library has *ever* seen is skipped no matter how many times it was
+copied or renamed; only genuinely new files are copied in, organized `YYYY/MM/` by EXIF date.
+The staging source is read-only — originals are never touched, so a botched run costs nothing.
+
+Pick folders visually (no typing paths). The pre-flight check explains, in plain sentences,
+anything that can't proceed:
+- importing **from inside your scanned library** (that would re-import your own photos),
+- importing **into** a folder outside the scanned library (imports would sit invisible,
+  never scanned or captioned),
+- a source or destination that overlaps an excluded folder.
+
+## Backup
+
+**Index & Manage → Backup** mirrors every scanned folder plus photo-vault's own `data/`
+(captions, faces, embeddings, settings) to any connected destination — external drive,
+SD card, USB stick, another internal disk, a mounted network share. A restore therefore
+brings back your *index*, not just pixels.
+
+- **Incremental**: only new/changed files copy; a re-run after captioning refreshes just
+  the metadata folder.
+- **Opportunistic**: the destination doesn't need to be always plugged in — the Backup card
+  shows "last backup N days ago" and whether the drive is currently connected.
+- **Safe by rule**: the destination may not overlap the scanned library in either direction
+  (inside it → the mirror would back itself up recursively; containing it → the next scan
+  would index your own backup and double every photo). The UI explains any refusal.
+- **Videos are left alone**: photo-root mirroring ignores video files entirely, and never
+  deletes anything extra it finds at the destination. Only the `photo-vault-data` folder is
+  a strict mirror.
 
 ## Fallback table
 
@@ -119,8 +170,10 @@ Both LM Studio and Gemini can be active simultaneously — LM Studio is always t
 make test                            # or: uv run python -m pytest tests/ -q
 ```
 
-137 tests covering: embeddings, vision, search, indexer, validator, tagger, the background
-job manager, and the FastAPI endpoints. All mocked — no services needed to run tests.
+450+ tests covering: embeddings, vision, search, indexer, validator, tagger, ingest, backup,
+rate limiting, the cross-platform filesystem layer, the background job manager, and the
+FastAPI endpoints. All external calls mocked — no services needed to run tests, and the
+full OS matrix (Windows/macOS/Linux behavior) is exercised on whatever OS runs them.
 
 ## File structure
 

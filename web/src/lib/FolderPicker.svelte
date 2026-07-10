@@ -9,9 +9,10 @@
   export let open = false;
   export let title = "Select a folder";
 
-  let cur = null;      // current path (null = drive list)
+  let cur = null;      // current path (null = roots list)
   let parent = null;
   let dirs = [];
+  let sep = "/";       // path separator, reported by the server per-OS
   let loading = false;
   let err = "";
 
@@ -22,13 +23,18 @@
     try {
       const r = await api.fsList(path);
       cur = r.path; parent = r.parent; dirs = r.dirs;
+      if (r.sep) sep = r.sep;
     } catch (e) { err = e.message; }
     loading = false;
   }
 
   function enter(name) {
-    // At the drive level entries are already full roots like "D:\".
-    load(cur ? cur.replace(/\\$/, "") + "\\" + name : name);
+    // At the roots level entries are already full paths ("D:\" on Windows,
+    // "/" or "/media/usb" on Linux/macOS); below that they're bare names to
+    // join onto the current path with the server's separator.
+    if (!cur) { load(name); return; }
+    const base = cur.endsWith(sep) ? cur.slice(0, -1) : cur;
+    load(base + sep + name);
   }
 
   function choose() {
@@ -47,13 +53,13 @@
         <b>{title}</b>
         <button class="ghost sm" on:click={cancel} aria-label="Close">✕</button>
       </div>
-      <div class="crumb" title={cur || "Drives"}>
+      <div class="crumb" title={cur || "Drives & volumes"}>
         {#if cur}
           <button class="ghost sm" on:click={() => load(parent)} disabled={loading}
                   aria-label="Up one level">↑ Up</button>
           <span class="path">{cur}</span>
         {:else}
-          <span class="path">Select a drive</span>
+          <span class="path">Select a drive or volume</span>
         {/if}
       </div>
       {#if err}<p class="err-text" style="padding:0 14px">{err}</p>{/if}
