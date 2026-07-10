@@ -722,26 +722,43 @@
         {/each}
       </div>
       {#if settings.vision_provider !== "auto"}
-        {#if visionModelOpts.length}
+        {#if settings.vision_provider === "9router"}
+          <!-- Free-entry with suggestions: 9Router's /v1/models is a cosmetic
+               catalog, not a routing restriction — it passes unlisted ids
+               through to the provider (verified: gemini/gemma-4-26b-a4b-it
+               works while absent from the list). A plain select would wall
+               off every model the gateway can actually serve. -->
+          <input class="model-input" list="nr-vision-models"
+                 placeholder="pick or type a model id, e.g. gemini/gemma-4-26b-a4b-it"
+                 bind:value={settings.vision_model} on:input={markDirty}
+                 on:change={() => { settings.vision_model = (settings.vision_model || "").trim() || null; }} />
+          <datalist id="nr-vision-models">
+            {#each visionModelOpts as m}
+              <option value={m}>{modelTypeLabel(m, settings.vision_provider)}</option>
+            {/each}
+          </datalist>
+          {#if visionCfgIncomplete}
+            <p class="warn-text hint">9Router has no auto-detect — pick a suggestion or type the exact
+              provider-prefixed id (e.g. <code>gc/…</code> for Gemini CLI, <code>gemini/…</code> for API keys).</p>
+          {:else}
+            <p class="hint">9Router runs caption photos that have no caption yet. Ids not in the
+              suggestion list are passed through to the provider as-is. If the gateway substitutes
+              the serving model, the caption is kept and credited to the model that actually
+              produced it (see "Models used" in the job panel).</p>
+          {/if}
+          {#if !visionModelOpts.length}
+            <p class="warn-text hint">9Router's model list is empty — is it running? A typed model id
+              will still be tried at job start.</p>
+          {/if}
+        {:else if visionModelOpts.length}
           <select bind:value={settings.vision_model} on:change={markDirty}>
-            {#if settings.vision_provider !== "9router"}
-              <option value={null}>— auto-pick —</option>
-            {:else}
-              <option value={null} disabled>— choose a model (required) —</option>
-            {/if}
+            <option value={null}>— auto-pick —</option>
             {#each visionModelOpts as m}
               <option value={m}>{m} {modelTypeLabel(m, settings.vision_provider)}</option>
             {/each}
           </select>
-          {#if visionCfgIncomplete}
-            <p class="warn-text hint">9Router has no auto-detect — pick the exact vision model to use.</p>
-          {:else if settings.vision_provider === "9router"}
-            <p class="hint">9Router runs caption photos that have no caption yet. If the gateway
-              substitutes the serving model, the caption is kept and credited to the model that
-              actually produced it (see "Models used" in the job panel).</p>
-          {/if}
         {:else}
-          <p class="warn-text hint">No {PROVIDER_NAMES[settings.vision_provider]} vision models found.{settings.vision_provider === "9router" ? " Is 9Router running?" : ""}</p>
+          <p class="warn-text hint">No {PROVIDER_NAMES[settings.vision_provider]} vision models found.</p>
         {/if}
       {:else}
         <p class="hint">LM Studio first → Gemini fallback. Model auto-detected.</p>
@@ -1417,6 +1434,7 @@
 
   /* model config grid */
   .cfg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 12px; }
+  .model-input { width: 100%; }
   .cfg-grid .col { display: flex; flex-direction: column; gap: 6px; }
   @media (max-width: 720px) { .cfg-grid { grid-template-columns: 1fr; } }
 
