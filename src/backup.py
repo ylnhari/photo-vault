@@ -99,6 +99,48 @@ def status() -> dict:
     }
 
 
+def validate_dest(dest: str) -> dict:
+    """Pre-flight check for the backup destination. It must not overlap the
+    scanned library in either direction: inside an included folder the mirror
+    would recursively back itself up; containing an included folder means the
+    scan would index your own backup, doubling every photo in the catalog.
+    Anything else — SD card, pen drive, another internal drive — is fine."""
+    from folders import get_effective_scan_dirs, get_excluded_paths
+
+    def _norm(p):
+        return os.path.normcase(str(Path(p).resolve()))
+
+    def _under(child, parent):
+        return child == parent or child.startswith(parent + os.sep)
+
+    dest = (dest or "").strip()
+    if not dest:
+        return {"ok": False, "reason": "Pick a backup destination folder."}
+    drive = os.path.splitdrive(dest)[0]
+    if drive and not os.path.exists(drive + os.sep):
+        return {"ok": False, "reason":
+                f"Drive {drive} isn't connected right now — plug it in and try again."}
+    b = _norm(dest)
+    for inc in get_effective_scan_dirs():
+        i = _norm(inc)
+        if _under(b, i):
+            return {"ok": False, "reason":
+                    f"Can't back up into here — it's inside your scanned library ({inc}), "
+                    "so the mirror would recursively back itself up. Pick a folder outside "
+                    "the library, ideally on the SD card or another drive."}
+        if _under(i, b):
+            return {"ok": False, "reason":
+                    f"Can't back up into here — it contains your scanned folder ({inc}), "
+                    "so the next scan would index your own backup and double every photo. "
+                    "Pick a separate folder."}
+    for ex in get_excluded_paths():
+        if _under(b, _norm(ex)) or _under(_norm(ex), b):
+            return {"ok": False, "reason":
+                    f"Can't back up into here — it overlaps an excluded folder ({ex}). "
+                    "Pick a clean, separate folder for the backup."}
+    return {"ok": True, "reason": None}
+
+
 def backup_one(src: str) -> str:
     """Mirror one source root to its destination. Returns a job-log note.
     Raises on robocopy failure (exit >= 8) so the job counts it as a fail."""
@@ -111,6 +153,10 @@ def backup_one(src: str) -> str:
     os.makedirs(dst, exist_ok=True)
     cmd = [
         "robocopy", src, dst, "/MIR", "/R:1", "/W:1",
+        # /FFT: FAT-style 2-second timestamp granularity, /DST: tolerate DST
+        # offsets — without these an NTFS→exFAT mirror (the SD card is exFAT)
+        # sees every file as "changed" and re-copies the whole library each run.
+        "/FFT", "/DST",
         "/NP", "/NDL", "/NFL",
         "/XD", "$RECYCLE.BIN", "System Volume Information",
     ]

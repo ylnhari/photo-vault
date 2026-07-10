@@ -5,6 +5,7 @@
   import StatusPill from "./StatusPill.svelte";
   import JobPanel from "./JobPanel.svelte";
   import SectionHead from "./SectionHead.svelte";
+  import FolderPicker from "./FolderPicker.svelte";
   import { onActivateKey } from "./keyboard.js";
   const dispatch = createEventDispatcher();
 
@@ -88,6 +89,50 @@
   }
   async function loadBackupStatus() {
     try { backupSt = await api.backupStatus(); } catch {}
+  }
+
+  // Folder picker + pre-flight validation. Every folder choice goes through
+  // a server-side validator that either approves or explains, in a full
+  // sentence, why the operation can't happen — no silent failures, no
+  // hand-typed paths required.
+  let picker = null; // "source" | "ingest_dest" | "backup_dest" | null
+  let srcCheck = null;       // /api/ingest/validate result for stagingPath
+  let srcChecking = false;
+  let backupMsg = "";
+
+  const fmtGB = (b) => (b / 1073741824).toFixed(2);
+
+  async function validateSource(path) {
+    stagingPath = path;
+    srcCheck = null;
+    if (!path?.trim()) return;
+    srcChecking = true;
+    try { srcCheck = await api.ingestValidate(path.trim()); }
+    catch (e) { srcCheck = { ok: false, reason: e.message }; }
+    srcChecking = false;
+  }
+
+  async function onPickFolder(path) {
+    const which = picker;
+    picker = null;
+    if (which === "source") return validateSource(path);
+    if (which === "ingest_dest") {
+      settings.ingest_dest = path;
+      await saveSettings();               // server validates; err shows reason
+      if (err) await loadSettings();      // revert the rejected value
+      if (stagingPath) validateSource(stagingPath);
+    }
+    if (which === "backup_dest") {
+      backupMsg = "";
+      try {
+        const v = await api.backupValidate(path);
+        if (!v.ok) { backupMsg = v.reason; return; }
+        settings.backup_dest = path;
+        await saveSettings();
+        if (err) { backupMsg = err; err = ""; await loadSettings(); }
+        loadBackupStatus();
+      } catch (e) { backupMsg = e.message; }
+    }
   }
 
   const PROVIDERS = [
@@ -891,22 +936,40 @@
     <span class="hint" style="font-weight:400">(merge SD card / Takeout / phone dumps — duplicates skipped by content)</span>
   </SectionHead>
   <p class="hint" style="margin-bottom:10px">
-    Point this at any external folder. Every file is identified by its content hash, so
-    anything the library has ever seen is <b>skipped</b> — no matter how many times it was
-    copied or renamed. Only new photos & videos are copied into
-    <code>{settings.ingest_dest || "…\\Imported"}</code>, organized by year/month.
-    Originals are never touched. Afterwards, run <b>Scan</b> above — only the new photos
-    will go through captioning.
+    Import from anywhere — SD card, pen drive, another internal or network drive, a Takeout
+    extract. Every file is identified by its content hash, so anything the library has ever
+    seen is <b>skipped</b> — no matter how many times it was copied or renamed. Only new
+    photos & videos are copied in, organized by year/month. Originals are never touched.
+    Afterwards, run <b>Scan</b> above — only the new photos go through captioning.
   </p>
   {#if jobIs(job, "ingest")}
     <JobPanel {job} bind:stopRequested={stopRequesting} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if running}
     <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
   {:else}
-    <div class="add-row">
-      <input bind:value={stagingPath} placeholder="Staging folder… e.g. E:\DCIM or D:\Takeout\Google Photos"
-             on:keydown={(e) => e.key === "Enter" && stagingPath.trim() && start("ingest", { source_path: stagingPath.trim() })} />
-      <button class="primary" disabled={!stagingPath.trim()}
+    <div class="pickrow">
+      <span class="cfg-label" style="margin:0">From</span>
+      <code class="pathbox" title={stagingPath}>{stagingPath || "no folder selected"}</code>
+      <button class="sm" on:click={() => picker = "source"}>📂 Browse…</button>
+    </div>
+    <div class="pickrow">
+      <span class="cfg-label" style="margin:0">Into</span>
+      <code class="pathbox" title={settings.ingest_dest}>{settings.ingest_dest || "…\\Imported"}<span class="hint">\YYYY\MM</span></code>
+      <button class="ghost sm" on:click={() => picker = "ingest_dest"}>Change…</button>
+    </div>
+    {#if srcChecking}
+      <p class="hint">Checking folder…</p>
+    {:else if srcCheck && !srcCheck.ok}
+      <p class="warn-text" style="font-size:13px">✋ {srcCheck.reason}</p>
+    {:else if srcCheck}
+      <p class="ok-text" style="font-size:13px">
+        ✓ Ready: {srcCheck.media_files.toLocaleString()} photos & videos
+        ({fmtGB(srcCheck.media_bytes)} GB) will be checked; duplicates are skipped
+        automatically{srcCheck.other_files ? ` · ${srcCheck.other_files.toLocaleString()} non-media files ignored` : ""}.
+      </p>
+    {/if}
+    <div style="margin-top:10px">
+      <button class="primary" disabled={!srcCheck?.ok}
               on:click={() => start("ingest", { source_path: stagingPath.trim() })}>
         📥 Import new files
       </button>
@@ -1241,15 +1304,14 @@
     faces, search index, settings) — a restore brings everything back, not just pixels.
     The card doesn't need to stay plugged in: sync opportunistically whenever it is.
   </p>
-  <div class="add-row" style="margin-bottom:10px">
-    <input bind:value={settings.backup_dest} placeholder="Backup folder on the SD card… e.g. E:\PhotoVaultBackup"
-           on:change={markDirty} />
-    {#if settingsDirty}
-      <button class="sm" on:click={async () => { await saveSettings(); loadBackupStatus(); }} disabled={settingsSaving}>
-        {settingsSaving ? "Saving…" : "Save"}
-      </button>
-    {/if}
+  <div class="pickrow" style="margin-bottom:10px">
+    <span class="cfg-label" style="margin:0">Mirror to</span>
+    <code class="pathbox" title={settings.backup_dest}>{settings.backup_dest || "no folder selected"}</code>
+    <button class="sm" on:click={() => { backupMsg = ""; picker = "backup_dest"; }}>📂 Browse…</button>
   </div>
+  {#if backupMsg}
+    <p class="warn-text" style="font-size:13px; margin-bottom:10px">✋ {backupMsg}</p>
+  {/if}
   {#if jobIs(job, "backup")}
     <JobPanel {job} bind:stopRequested={stopRequesting} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if backupSt.configured}
@@ -1277,7 +1339,18 @@
   {/if}
 </div>
 
+<FolderPicker open={picker !== null}
+              title={picker === "source" ? "Import from which folder?"
+                   : picker === "ingest_dest" ? "Where should imports be filed? (must be inside a scanned folder)"
+                   : "Back up to which folder? (SD card / pen drive / other drive)"}
+              on:select={(e) => onPickFolder(e.detail.path)}
+              on:close={() => picker = null} />
+
 <style>
+  .pickrow { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .pathbox { flex: 1; min-width: 0; padding: 6px 10px; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--surface2); font-size: 12px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .card { background: var(--surface); border: 1px solid var(--border);
     border-radius: var(--radius-lg); padding: 18px; margin-bottom: 14px;
     box-shadow: var(--shadow-1); transition: box-shadow .2s, border-color .2s; }

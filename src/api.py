@@ -391,6 +391,18 @@ def put_settings(req: SettingsReq):
     # back to its default/auto behavior, while an omitted field leaves the
     # existing stored value untouched.
     patch = req.model_dump(exclude_unset=True)
+    # Destination settings go through the same validators as the pre-flight
+    # UI, so a rule violation is refused with the same friendly explanation.
+    if patch.get("ingest_dest"):
+        import ingest as ingest_mod
+        v = ingest_mod.validate_dest(patch["ingest_dest"])
+        if not v["ok"]:
+            raise HTTPException(422, v["reason"])
+    if patch.get("backup_dest"):
+        import backup as backup_mod
+        v = backup_mod.validate_dest(patch["backup_dest"])
+        if not v["ok"]:
+            raise HTTPException(422, v["reason"])
     return settings_mgr.update(patch)
 
 
@@ -503,6 +515,17 @@ def add_folder(req: FolderReq):
         raise HTTPException(400, "path is required")
     if not os.path.isdir(path):
         raise HTTPException(400, f"directory not found: {path}")
+    # Scanning the backup mirror would index a duplicate of every photo —
+    # same overlap rule as the backup_dest check in put_settings, enforced
+    # from this direction too (folders can be added after backup is set up).
+    backup_dest = settings_mgr.load().get("backup_dest")
+    if backup_dest:
+        p = os.path.normcase(str(Path(path).resolve()))
+        b = os.path.normcase(str(Path(backup_dest).resolve()))
+        if p == b or p.startswith(b + os.sep) or b.startswith(p + os.sep):
+            raise HTTPException(
+                422, "that folder overlaps the backup destination — scanning your "
+                     "own backup would duplicate every photo in the catalog")
     result = folder_mgr.add_included(path)
     if result["status"] == "not_found":
         raise HTTPException(400, f"directory not found: {path}")
@@ -636,19 +659,15 @@ def index_start(req: IndexReq):
     if req.vision_provider not in ("auto", "9router", None) and req.vision_model:
         vml = f"{req.vision_provider}:{req.vision_model}"
     if req.type == "ingest":
-        src = (req.source_path or "").strip()
-        if not src or not os.path.isdir(src):
-            raise HTTPException(422, "ingest needs an existing staging folder path")
-        # Ingesting FROM a scanned folder would copy library files into the
-        # library's Imported/ area — every one a hash-skip at best, a second
-        # physical copy at worst. Point ingest at external staging only.
-        src_resolved = os.path.normcase(str(Path(src).resolve()))
-        for inc in folder_mgr.get_effective_scan_dirs():
-            inc_r = os.path.normcase(str(Path(inc).resolve()))
-            if src_resolved == inc_r or src_resolved.startswith(inc_r + os.sep):
-                raise HTTPException(
-                    422, "that folder is already part of the scanned library — "
-                         "ingest is for external sources (SD card, Takeout, phone dumps)")
+        # Same validators the pre-flight UI uses — one source of truth for
+        # the rules and for the friendly explanations.
+        import ingest as ingest_mod
+        v = ingest_mod.validate_source(req.source_path)
+        if not v["ok"]:
+            raise HTTPException(422, v["reason"])
+        dv = ingest_mod.validate_dest(ingest_mod.default_dest() or "")
+        if not dv["ok"]:
+            raise HTTPException(422, dv["reason"])
     if req.type == "backup":
         import backup as backup_mod
         bs = backup_mod.status()
@@ -678,6 +697,62 @@ def index_start(req: IndexReq):
 def backup_status():
     import backup as backup_mod
     return backup_mod.status()
+
+
+@app.get("/api/fs/list")
+def fs_list(path: str | None = None):
+    """Server-side folder browser for the folder-picker UI (browsers can't
+    hand a real filesystem path to a web page). No path → the drive roots;
+    otherwise the folder's subdirectories. Local single-user app behind the
+    bearer token — directory names are not a secret from the app's own user."""
+    if not path:
+        import string
+        drives = [f"{c}:\\" for c in string.ascii_uppercase if os.path.exists(f"{c}:\\")]
+        return {"path": None, "parent": None, "dirs": drives}
+    p = Path(path)
+    if not p.is_dir():
+        raise HTTPException(404, f"folder not found: {path}")
+    p = p.resolve()
+    dirs = []
+    try:
+        for child in sorted(p.iterdir(), key=lambda c: c.name.lower()):
+            try:
+                if not child.is_dir():
+                    continue
+            except OSError:
+                continue
+            name = child.name
+            if name.startswith(("$", ".")) or name == "System Volume Information":
+                continue
+            dirs.append(name)
+    except PermissionError:
+        raise HTTPException(403, f"no permission to list: {path}")
+    parent = None if p == p.parent else str(p.parent)
+    return {"path": str(p), "parent": parent, "dirs": dirs}
+
+
+@app.get("/api/ingest/validate")
+def ingest_validate(source: str):
+    """Pre-flight for the Import UI: is this source importable, and what
+    would the import look at (media count/size, ignored files)? The nice
+    refusal sentences come straight from ingest.validate_source."""
+    import ingest as ingest_mod
+    v = ingest_mod.validate_source(source)
+    out = {"ok": v["ok"], "reason": v["reason"],
+           "dest": ingest_mod.default_dest()}
+    if v["ok"]:
+        out.update(ingest_mod.source_stats(source))
+        dv = ingest_mod.validate_dest(out["dest"] or "")
+        if not dv["ok"]:
+            out["ok"] = False
+            out["reason"] = dv["reason"]
+    return out
+
+
+@app.get("/api/backup/validate")
+def backup_validate(dest: str):
+    import backup as backup_mod
+    return backup_mod.validate_dest(dest)
 
 
 @app.get("/api/dedupe/pending")

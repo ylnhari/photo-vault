@@ -122,3 +122,83 @@ def test_list_staging_files_filters_media_and_sorts(env):
 def test_list_staging_files_missing_folder_raises(tmp_path):
     with pytest.raises(ValueError):
         ingest.list_staging_files(str(tmp_path / "nope"))
+
+
+def test_default_dest_prefers_non_onedrive_folder(monkeypatch):
+    import settings, folders
+    monkeypatch.setattr(settings, "load", lambda: {"ingest_dest": None})
+    monkeypatch.setattr(folders, "get_effective_scan_dirs", lambda: [
+        r"C:\Users\x\OneDrive\Pictures", r"C:\Users\x\Pictures",
+    ])
+    assert ingest.default_dest() == os.path.join(r"C:\Users\x\Pictures", "Imported")
+
+
+def test_default_dest_falls_back_to_onedrive_when_only_option(monkeypatch):
+    import settings, folders
+    monkeypatch.setattr(settings, "load", lambda: {"ingest_dest": None})
+    monkeypatch.setattr(folders, "get_effective_scan_dirs",
+                        lambda: [r"C:\Users\x\OneDrive\Pictures"])
+    assert ingest.default_dest() == os.path.join(r"C:\Users\x\OneDrive\Pictures", "Imported")
+
+
+def test_stale_cache_entries_pruned_so_deleted_files_reimport(env):
+    staging, library = env
+    ts = time.mktime((2020, 5, 5, 9, 0, 0, 0, 0, -1))
+    v = _write(staging / "clip.mp4", b"video-bytes-2", ts)
+    s1 = ingest.IngestSession(str(staging), catalog_images={}, dest=str(library))
+    note = s1.ingest_one(str(v))
+    s1.close()
+    assert note.startswith("imported")
+    # Simulate the imported copy being deleted (cleanup, accident, whatever):
+    # its hash must NOT keep claiming "in library" forever.
+    imported = next((library / "2020" / "05").iterdir())
+    imported.unlink()
+    s2 = ingest.IngestSession(str(staging), catalog_images={}, dest=str(library))
+    assert s2.ingest_one(str(v)).startswith("imported")
+    s2.close()
+
+
+# ── pre-flight validators (rules are user-defined; messages are the UX) ──────
+
+def _folders(monkeypatch, included, excluded=()):
+    import folders
+    monkeypatch.setattr(folders, "get_effective_scan_dirs", lambda: list(included))
+    monkeypatch.setattr(folders, "get_excluded_paths", lambda: list(excluded))
+
+
+def test_validate_source_refuses_included_and_excluded(tmp_path, monkeypatch):
+    lib = tmp_path / "Pictures"; lib.mkdir()
+    ex = lib / "private"; ex.mkdir()
+    other = tmp_path / "sdcard"; other.mkdir()
+    _folders(monkeypatch, [str(lib)], [str(ex)])
+    assert not ingest.validate_source(str(lib))["ok"]
+    assert "already part of your scanned library" in ingest.validate_source(str(lib))["reason"]
+    assert not ingest.validate_source(str(ex))["ok"]
+    assert "excluded" in ingest.validate_source(str(ex))["reason"]
+    assert ingest.validate_source(str(other))["ok"]
+
+
+def test_validate_source_missing_folder(tmp_path, monkeypatch):
+    _folders(monkeypatch, [])
+    r = ingest.validate_source(str(tmp_path / "nope"))
+    assert not r["ok"] and "doesn't exist" in r["reason"]
+
+
+def test_validate_dest_must_be_inside_included_not_excluded(tmp_path, monkeypatch):
+    lib = tmp_path / "Pictures"; lib.mkdir()
+    ex = lib / "private"; ex.mkdir()
+    _folders(monkeypatch, [str(lib)], [str(ex)])
+    assert ingest.validate_dest(str(lib / "Imported"))["ok"]
+    r_out = ingest.validate_dest(str(tmp_path / "elsewhere"))
+    assert not r_out["ok"] and "included scan folder" in r_out["reason"]
+    r_ex = ingest.validate_dest(str(ex / "Imported"))
+    assert not r_ex["ok"] and "excluded" in r_ex["reason"]
+
+
+def test_source_stats_counts_media_and_ignores_rest(tmp_path):
+    src = tmp_path / "dump"; src.mkdir()
+    _write(src / "a.jpg", b"x" * 100)
+    _write(src / "b.mp4", b"y" * 200)
+    _write(src / "readme.txt", b"z")
+    s = ingest.source_stats(str(src))
+    assert s == {"media_files": 2, "media_bytes": 300, "other_files": 1}

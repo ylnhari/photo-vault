@@ -84,3 +84,16 @@ def test_backup_one_failure_raises(env):
 def test_backup_one_unmapped_source_raises(env):
     with pytest.raises(RuntimeError, match="no backup destination"):
         backup.backup_one(r"C:\not\a\root")
+
+
+def test_validate_dest_rejects_library_overlap(tmp_path, monkeypatch):
+    import folders
+    lib = tmp_path / "Pictures"; lib.mkdir()
+    monkeypatch.setattr(folders, "get_effective_scan_dirs", lambda: [str(lib)])
+    monkeypatch.setattr(folders, "get_excluded_paths", lambda: [])
+    inside = backup.validate_dest(str(lib / "backup"))
+    assert not inside["ok"] and "recursively" in inside["reason"]
+    containing = backup.validate_dest(str(tmp_path))
+    assert not containing["ok"] and "double every photo" in containing["reason"]
+    ok = backup.validate_dest(str(tmp_path / "separate"))
+    assert ok["ok"]

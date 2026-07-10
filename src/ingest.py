@@ -56,15 +56,104 @@ def _save_media_cache(cache: dict):
 
 def default_dest() -> str | None:
     """Where imports land when no explicit ingest_dest is configured: an
-    Imported/ folder inside the first included scan folder — inside, so the
-    normal Scan job picks new photos up with zero extra configuration."""
+    Imported/ folder inside an included scan folder — inside, so the normal
+    Scan job picks new photos up with zero extra configuration. Prefers a
+    non-cloud-synced folder: scan dirs are sorted alphabetically, and
+    'OneDrive' sorting before 'Pictures' once silently routed imports into
+    OneDrive — gigabytes of videos syncing to the cloud is never the
+    expected outcome of a local import."""
     import settings as settings_mod
     dest = settings_mod.load().get("ingest_dest")
     if dest:
         return dest
     from folders import get_effective_scan_dirs
     dirs = get_effective_scan_dirs()
-    return os.path.join(dirs[0], "Imported") if dirs else None
+    if not dirs:
+        return None
+    local = [d for d in dirs if "onedrive" not in d.lower()]
+    return os.path.join((local or dirs)[0], "Imported")
+
+
+def _norm(p: str) -> str:
+    return os.path.normcase(str(Path(p).resolve()))
+
+
+def _under(child: str, parent: str) -> bool:
+    return child == parent or child.startswith(parent + os.sep)
+
+
+def validate_source(src: str) -> dict:
+    """Pre-flight check for an import SOURCE folder. Returns {ok, reason} —
+    reason is a friendly, complete sentence the UI shows verbatim.
+    Rules (user-defined): the source must exist, must not already be part of
+    the scanned library (that would import the library into itself), and
+    must not be inside an excluded folder (excluded means 'not my photos' —
+    importing from there is almost certainly a mistake)."""
+    from folders import get_effective_scan_dirs, get_excluded_paths
+    src = (src or "").strip()
+    if not src:
+        return {"ok": False, "reason": "Pick a folder to import from."}
+    if not os.path.isdir(src):
+        return {"ok": False, "reason": f"That folder doesn't exist or isn't accessible: {src}"}
+    s = _norm(src)
+    for ex in get_excluded_paths():
+        if _under(s, _norm(ex)):
+            return {"ok": False, "reason":
+                    f"Can't import from here — it's inside an excluded folder ({ex}). "
+                    "Excluded means these files were deliberately left out of your library; "
+                    "remove the exclusion first if you actually want them."}
+    for inc in get_effective_scan_dirs():
+        if _under(s, _norm(inc)):
+            return {"ok": False, "reason":
+                    f"Can't import from here — it's already part of your scanned library ({inc}). "
+                    "Importing it would only create duplicate copies of photos you already have."}
+    return {"ok": True, "reason": None}
+
+
+def validate_dest(dest: str) -> dict:
+    """Pre-flight check for the import DESTINATION. It must be inside an
+    included scan folder (or photos land where they'd never be indexed) and
+    not inside an excluded one (same invisibility problem)."""
+    from folders import get_effective_scan_dirs, get_excluded_paths
+    dest = (dest or "").strip()
+    if not dest:
+        return {"ok": False, "reason": "Pick a destination folder for imports."}
+    d = _norm(dest)
+    for ex in get_excluded_paths():
+        if _under(d, _norm(ex)):
+            return {"ok": False, "reason":
+                    f"Can't import into here — it's inside an excluded folder ({ex}), "
+                    "so imported photos would never be scanned or captioned."}
+    if not any(_under(d, _norm(inc)) for inc in get_effective_scan_dirs()):
+        return {"ok": False, "reason":
+                "The destination must be inside one of your included scan folders — "
+                "otherwise imported photos would sit invisible, never scanned or captioned. "
+                "Pick a folder (or subfolder) of the folders listed in Folder Management."}
+    return {"ok": True, "reason": None}
+
+
+def source_stats(src: str) -> dict:
+    """What an import would look at: media file count and total size (plus
+    how many non-media files will be ignored). Powers the pre-flight preview
+    so the user sees the scope before committing."""
+    media_files = 0
+    media_bytes = 0
+    other_files = 0
+    for dirpath, dirnames, filenames in os.walk(src):
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(('$', 'System Volume Information'))]
+        for name in filenames:
+            p = Path(dirpath) / name
+            if p.suffix.lower() in MEDIA_EXTENSIONS:
+                media_files += 1
+                try:
+                    media_bytes += p.stat().st_size
+                except OSError:
+                    pass
+            else:
+                other_files += 1
+    return {"media_files": media_files, "media_bytes": media_bytes,
+            "other_files": other_files}
 
 
 def list_staging_files(source: str) -> list[str]:
@@ -118,6 +207,16 @@ class IngestSession:
         self.dest = str(Path(self.dest).resolve())
         self.cache = _load_media_cache()
         self._dirty = 0
+        # Self-heal: drop cache entries whose file no longer exists. Without
+        # this, a file deleted after ingest would keep its hash in the "seen"
+        # set forever and re-ingesting its source would silently skip it —
+        # claiming it's "in the library" when it isn't. (Deliberate deletions
+        # are re-importable this way; that's the lesser evil vs. phantom
+        # library claims.)
+        stale = [p for p in self.cache["by_path"] if not os.path.exists(p)]
+        for p in stale:
+            del self.cache["by_path"][p]
+            self._dirty += 1
         # Image content the catalog already tracks — the big dedupe net.
         self.seen: set[str] = set(catalog_images.keys())
         self._refresh_library_video_hashes()

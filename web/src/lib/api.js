@@ -82,6 +82,9 @@ export const api = {
   providerModels: () => j("GET", "/api/provider-models"),
   backupStatus: () => j("GET", "/api/backup/status"),
   dedupePending: () => j("GET", "/api/dedupe/pending"),
+  fsList: (path) => j("GET", `/api/fs/list${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+  ingestValidate: (source) => j("GET", `/api/ingest/validate?source=${encodeURIComponent(source)}`),
+  backupValidate: (dest) => j("GET", `/api/backup/validate?dest=${encodeURIComponent(dest)}`),
 
   // Search
   filters: () => j("GET", "/api/filters"),
