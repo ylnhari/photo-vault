@@ -42,6 +42,10 @@ src/
   tagger.py       ← register person from reference images → person_map.json
   clustering.py   ← DBSCAN face clustering
   scanner.py / metadata.py ← recursive image discovery + EXIF
+  ingest.py       ← import & consolidate: staging folder → library (content-hash
+                    dedupe incl. videos via media_hashes.json, YYYY/MM layout)
+  backup.py       ← opportunistic robocopy /MIR of scan folders + data/ to the
+                    SD card (backup_dest setting); status() = drive + staleness
   validator.py    ← LM Studio / Gemini health checks
   ratelimit.py    ← per-provider RPS/RPM/RPH/RPD throttle (user-set in Settings →
                     "rate_limits", 0 = unlimited); acquire() before every provider
