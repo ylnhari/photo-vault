@@ -7,7 +7,10 @@
   const TITLES = { vision: "Vision analysis", embed: "Embedding",
                    full: "Full index", reanalyze: "Re-analyze",
                    faces: "Face detection", thumbs: "Thumbnails",
-                   dhash: "Duplicate scan", scan: "Scanning folders" };
+                   dhash: "Duplicate scan", scan: "Scanning folders",
+                   ingest: "Importing & consolidating",
+                   dedupe: "Removing duplicate copies",
+                   backup: "Backing up" };
 
   // Each job type gets its own accent so the panel reads as a continuation
   // of that section's identity, not a generic grey status box.
@@ -20,6 +23,9 @@
     scan:     { icon: "📂", color: "#3b82f6" },
     full:     { icon: "⚡", color: "#22c55e" },
     reanalyze:{ icon: "🔄", color: "#fb923c" },
+    ingest:   { icon: "📥", color: "#10b981" },
+    dedupe:   { icon: "🧹", color: "#f43f5e" },
+    backup:   { icon: "💾", color: "#0ea5e9" },
   };
   $: theme = THEME[job.type] || { icon: "⚙", color: "#6366f1" };
 

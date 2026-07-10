@@ -7,9 +7,10 @@ task — the UI never blocks. Stop granularity depends on job type: "vision"
 (_run_vision_parallel) and "embed" (_run_embed_batched) check between batches
 (sized by vision_concurrency and EMBED_BATCH respectively, so up to one
 batch's worth of in-flight work can finish after Stop is pressed); every other
-job type (faces/thumbs/dhash/full/reanalyze/scan) runs via _run_sequential and
-checks between every individual item.
+job type (faces/thumbs/dhash/full/reanalyze/scan/ingest/dedupe/backup) runs
+via _run_sequential and checks between every individual item.
 """
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +21,7 @@ from indexer import Indexer, resolve_caption_json, build_embed_payload
 from vision import parse_vision_attributes, build_embedding_text
 
 JOB_TYPES = ("vision", "embed", "full", "reanalyze", "faces", "thumbs",
-             "dhash", "scan")
+             "dhash", "scan", "ingest", "dedupe", "backup")
 
 # Captions per /v1/embeddings request during embed jobs. LM Studio accepts a
 # list, so one round-trip embeds the whole chunk.
@@ -89,6 +90,24 @@ class JobManager:
             from folders import ensure_defaults, get_effective_scan_dirs
             ensure_defaults()
             return get_effective_scan_dirs()
+        elif jtype == "ingest":
+            # One work item per staging media file (paths). Listing is cheap
+            # (no hashing) — safe under start()'s lock.
+            from ingest import list_staging_files
+            src = cfg.get("source_path")
+            if not src:
+                raise ValueError("ingest requires a source folder")
+            return list_staging_files(src)
+        elif jtype == "dedupe":
+            # 'uid::path' items — recorded byte-identical extra copies.
+            return idx.get_redundant_copies()
+        elif jtype == "backup":
+            # One work item per mirror root (source paths).
+            import backup as backup_mod
+            roots = [src for src, _ in backup_mod.backup_roots()]
+            if not roots:
+                raise ValueError("backup destination not configured")
+            return roots
         else:
             raise ValueError(f"unknown job type: {jtype}")
         return [img_id for img_id, _ in items]
@@ -96,7 +115,7 @@ class JobManager:
     def start(self, jtype: str, vision_provider: str = "auto", max_fail: int = 5,
               vision_model: str = None, embed_provider: str = "auto",
               embed_model: str = None, caption_source_model: str = None,
-              vision_model_label: str = None) -> dict:
+              vision_model_label: str = None, source_path: str = None) -> dict:
         if jtype not in JOB_TYPES:
             raise ValueError(f"unknown job type: {jtype}")
         # max_fail <= 0 would abort the job after the very first batch
@@ -123,6 +142,7 @@ class JobManager:
                 "caption_source_model": caption_source_model,
                 "vision_model_label": vision_model_label,
                 "max_fail": max_fail,
+                "source_path": source_path,
             }
             ids = self._pending_ids(jtype, cfg)
             self._stop.clear()
@@ -449,14 +469,29 @@ class JobManager:
             faces_during_embed = bool(settings_mod.load().get("faces_during_embed", True))
         except Exception:
             faces_during_embed = True
+        # Ingest runs as one session: the seen-hash set (catalog ids + media
+        # hash cache, refreshing library video hashes on first use) is built
+        # once up front, then reused for every staging file.
+        ingest_session = None
+        if jtype == "ingest":
+            from ingest import IngestSession
+            ingest_session = IngestSession(
+                cfg["source_path"], idx.image_catalog["images"])
+
         consecutive = 0
         dirty = False
         for k, img_id in enumerate(ids):
             if self._stop.is_set():
                 self._update(stopped=True)
                 break
-            fname = (img_id if jtype == "scan" else
-                     idx.image_catalog["images"].get(img_id, {}).get("filename", ""))
+            if jtype in ("scan", "backup"):
+                fname = img_id                      # a folder path
+            elif jtype == "ingest":
+                fname = os.path.basename(img_id)    # a staging file path
+            elif jtype == "dedupe":
+                fname = os.path.basename(img_id.partition("::")[2])
+            else:
+                fname = idx.image_catalog["images"].get(img_id, {}).get("filename", "")
             try:
                 if jtype == "embed":
                     note = idx.embed_one(img_id, embed_provider=ep, embed_model=em,
@@ -470,6 +505,14 @@ class JobManager:
                     dirty = True
                 elif jtype == "scan":
                     note = idx.scan_folder_one(img_id)  # img_id is a folder path
+                elif jtype == "ingest":
+                    note = ingest_session.ingest_one(img_id)
+                elif jtype == "dedupe":
+                    note = idx.dedupe_copy_one(img_id)
+                    dirty = True
+                elif jtype == "backup":
+                    import backup as backup_mod
+                    note = backup_mod.backup_one(img_id)
                 elif jtype == "full":
                     note = idx.index_one_full(img_id, use_cached=True, upsert=False,
                                               vision_provider=vp, vision_model=vm,
@@ -510,6 +553,8 @@ class JobManager:
                 dirty = False
         if dirty:
             idx._save_catalog()
+        if ingest_session is not None:
+            ingest_session.close()
 
     def _update(self, ok=0, fail=0, skipped=0, done=0, failed_id=None, log=None,
                 stopped=False, aborted=False, model_used=None):

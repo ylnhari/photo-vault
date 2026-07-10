@@ -117,6 +117,14 @@ def content_uid(path) -> str:
     return h.hexdigest()
 
 
+def _note_dup_path(entry: dict, path: str):
+    """Remember a byte-identical extra copy of this photo (see the duplicate
+    branch in scan_directory). Consumed by indexer.get_redundant_copies()."""
+    dups = entry.setdefault("dup_paths", [])
+    if path not in dups and path != entry.get("path"):
+        dups.append(path)
+
+
 def _sig(stat) -> str:
     """Cheap change-signature so unchanged files are skipped without re-hashing.
     Uses sub-second mtime precision (rounded to milliseconds for stable
@@ -311,22 +319,29 @@ def scan_directory(
                 old_exists = bool(old_path) and os.path.exists(old_path)
                 if old_exists and str_path >= old_path:
                     # Byte-identical duplicate: two live paths hash to the
-                    # same content uid. This is a real data-model limitation
-                    # — the catalog only tracks one path per uid, so one
-                    # physical copy is always left untracked. Rather than
-                    # flip-flopping to "whichever path os.walk visited last"
-                    # (walk order isn't stable across rescans), deterministically
-                    # keep the lexicographically-first path so the same copy
-                    # stays "the tracked one" run after run.
+                    # same content uid. The catalog tracks ONE canonical path
+                    # per uid; rather than flip-flopping to "whichever path
+                    # os.walk visited last" (walk order isn't stable across
+                    # rescans), deterministically keep the lexicographically-
+                    # first path. The other copy is recorded in dup_paths so
+                    # the "dedupe" job can physically reclaim it — entries are
+                    # re-verified (exists + hash) before anything is trashed,
+                    # so a stale record here is harmless.
+                    _note_dup_path(entry, str_path)
                     unchanged += 1
                 else:
                     # Either a genuine move (old_path no longer exists) or a
                     # duplicate where the new path sorts first — both are the
-                    # right cases to adopt the new path.
+                    # right cases to adopt the new path. In the duplicate case
+                    # the old (still existing) copy becomes the redundant one.
+                    if old_exists:
+                        _note_dup_path(entry, old_path)
                     moved += 1
                     moved_ids.append(uid)
                     entry["path"] = str_path
                     entry["filename"] = path.name
+                    if str_path in entry.get("dup_paths", []):
+                        entry["dup_paths"].remove(str_path)
             entry["sig"] = sig
             entry["size_bytes"] = stats.st_size
         else:

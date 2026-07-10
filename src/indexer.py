@@ -548,6 +548,54 @@ class Indexer:
             self._save_catalog()
         return note
 
+    # ── Physical dedupe (byte-identical extra copies) ────────────────────────
+
+    def get_redundant_copies(self) -> list[str]:
+        """'uid::path' work items for the dedupe job — every extra
+        byte-identical copy recorded by scans (scanner._note_dup_path). Each
+        item is re-verified before anything is trashed, so stale records are
+        harmless."""
+        items = []
+        for uid, data in self.image_catalog["images"].items():
+            for p in data.get("dup_paths", []):
+                items.append(f"{uid}::{p}")
+        return sorted(items)
+
+    def dedupe_copy_one(self, item: str) -> str:
+        """Verify one recorded duplicate copy still exists, is still
+        byte-identical, and is not the canonical file — then move it to the
+        Recycle Bin (recoverable, never a hard delete). The canonical copy
+        must exist before we remove anything."""
+        from scanner import content_uid
+        from trash import delete_file_to_recycle_bin
+
+        uid, _, path = item.partition("::")
+        entry = self.image_catalog["images"].get(uid)
+        if entry is None:
+            return "skipped (photo no longer in catalog)"
+
+        def _forget():
+            if path in entry.get("dup_paths", []):
+                entry["dup_paths"].remove(path)
+                self._mark_dirty(uid)
+
+        if path == entry.get("path"):
+            _forget()
+            return "skipped (is now the canonical copy)"
+        if not os.path.exists(path):
+            _forget()
+            return "skipped (already gone)"
+        canonical = entry.get("path", "")
+        if not (canonical and os.path.exists(canonical)):
+            return "skipped (canonical copy missing — keeping this one)"
+        if content_uid(path) != uid:
+            _forget()
+            return "skipped (file changed since scan — not a duplicate anymore)"
+        if not delete_file_to_recycle_bin(path):
+            raise RuntimeError("could not move to Recycle Bin")
+        _forget()
+        return "duplicate copy → Recycle Bin"
+
     # ── Folder-level purge ────────────────────────────────────────────────────
 
     def count_images_under(self, folder_path: str) -> int:

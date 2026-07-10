@@ -657,3 +657,75 @@ def test_reconcile_paths_batches_update_into_one_call():
     assert fixed == 2
     col.update.assert_called_once()
     assert set(col.update.call_args.kwargs["ids"]) == {"a", "c"}
+
+
+# ── physical dedupe of byte-identical extra copies ───────────────────────────
+
+def _bare_indexer(images: dict):
+    """Indexer without loading the real catalog: dedupe_copy_one only touches
+    image_catalog and _mark_dirty."""
+    from indexer import Indexer
+    idx = Indexer.__new__(Indexer)
+    idx.image_catalog = {"images": images}
+    idx._mark_dirty = lambda *a, **k: None
+    return idx
+
+
+def test_dedupe_copy_one_trashes_verified_duplicate(tmp_path, monkeypatch):
+    from scanner import content_uid
+    canonical = tmp_path / "keep.jpg"
+    extra = tmp_path / "extra.jpg"
+    canonical.write_bytes(b"same-bytes")
+    extra.write_bytes(b"same-bytes")
+    uid = content_uid(canonical)
+    idx = _bare_indexer({uid: {"path": str(canonical), "dup_paths": [str(extra)]}})
+
+    trashed = []
+    monkeypatch.setattr("trash.delete_file_to_recycle_bin",
+                        lambda p: trashed.append(p) or True)
+    note = idx.dedupe_copy_one(f"{uid}::{extra}")
+    assert "Recycle Bin" in note
+    assert trashed == [str(extra)]
+    assert idx.image_catalog["images"][uid]["dup_paths"] == []
+
+
+def test_dedupe_copy_one_skips_missing_and_changed_files(tmp_path, monkeypatch):
+    from scanner import content_uid
+    canonical = tmp_path / "keep.jpg"
+    canonical.write_bytes(b"same-bytes")
+    uid = content_uid(canonical)
+    gone = str(tmp_path / "gone.jpg")
+    changed = tmp_path / "changed.jpg"
+    changed.write_bytes(b"DIFFERENT-bytes")
+    idx = _bare_indexer({uid: {"path": str(canonical),
+                               "dup_paths": [gone, str(changed)]}})
+    monkeypatch.setattr("trash.delete_file_to_recycle_bin",
+                        lambda p: pytest.fail("must not trash"))
+    assert "already gone" in idx.dedupe_copy_one(f"{uid}::{gone}")
+    assert "not a duplicate" in idx.dedupe_copy_one(f"{uid}::{changed}")
+    assert changed.exists()
+    assert idx.image_catalog["images"][uid]["dup_paths"] == []
+
+
+def test_dedupe_copy_one_refuses_when_canonical_missing(tmp_path, monkeypatch):
+    from scanner import content_uid
+    extra = tmp_path / "only_copy.jpg"
+    extra.write_bytes(b"same-bytes")
+    uid = content_uid(extra)
+    idx = _bare_indexer({uid: {"path": str(tmp_path / "vanished.jpg"),
+                               "dup_paths": [str(extra)]}})
+    monkeypatch.setattr("trash.delete_file_to_recycle_bin",
+                        lambda p: pytest.fail("must not trash the last copy"))
+    note = idx.dedupe_copy_one(f"{uid}::{extra}")
+    assert "canonical copy missing" in note
+    assert extra.exists()
+    # NOT forgotten — it should be retried once the canonical is back.
+    assert idx.image_catalog["images"][uid]["dup_paths"] == [str(extra)]
+
+
+def test_get_redundant_copies_lists_uid_path_items():
+    idx = _bare_indexer({
+        "u1": {"path": "p1", "dup_paths": ["x", "y"]},
+        "u2": {"path": "p2"},
+    })
+    assert idx.get_redundant_copies() == ["u1::x", "u1::y"]

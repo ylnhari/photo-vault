@@ -78,6 +78,18 @@
   let showOrphaned = false;
   let orphanedBusy = false;
 
+  // ── ingest / dedupe / backup ─────────────────────────────────────────────────
+  let stagingPath = "";
+  let dedupeCount = 0;
+  let backupSt = { configured: false, dest: null, available: false, days_since: null };
+
+  async function loadDedupeCount() {
+    try { dedupeCount = (await api.dedupePending()).count; } catch {}
+  }
+  async function loadBackupStatus() {
+    try { backupSt = await api.backupStatus(); } catch {}
+  }
+
   const PROVIDERS = [
     ["auto", "Auto"],
     ["lm_studio", "LM Studio"],
@@ -103,7 +115,9 @@
   // JobPanel's own TITLES map so the two never disagree on wording.
   const TITLES_BY_TYPE = { vision: "Vision analysis", embed: "Embedding",
     full: "Full index", reanalyze: "Re-analyze", faces: "Face detection",
-    thumbs: "Thumbnails", dhash: "Duplicate scan", scan: "Scanning folders" };
+    thumbs: "Thumbnails", dhash: "Duplicate scan", scan: "Scanning folders",
+    ingest: "Import & consolidate", dedupe: "Removing duplicate copies",
+    backup: "Backup" };
 
   onMount(async () => {
     if (!$health.loaded) refreshHealth();
@@ -125,6 +139,8 @@
       loadSettings(),
       loadFolderConfig(),
       loadOrphaned(),
+      loadDedupeCount(),
+      loadBackupStatus(),
       api.providerModels().then(r => { pmodels = r; }).catch(() => {}),
     ]);
   });
@@ -254,6 +270,8 @@
         await Promise.all([refreshStatus(), refreshModels()]);
         loadFolderConfig();  // scan jobs update folder stats
         loadOrphaned();
+        loadDedupeCount();   // scans record dup copies; dedupe consumes them
+        loadBackupStatus();  // backup jobs update last-backup time
         dispatch("indexed");
       }
     }, 1000);
@@ -301,12 +319,12 @@
   });
   onDestroy(unsubJobStatus);
 
-  async function start(type) {
+  async function start(type, extra = {}) {
     err = "";
     // Save settings first if dirty
     if (settingsDirty) await saveSettings();
     try {
-      job = await api.indexStart(buildCfg(type));
+      job = await api.indexStart({ ...buildCfg(type), ...extra });
       if (job.active) startPolling();
       else { await refreshStatus(); dispatch("indexed"); }
     } catch (e) { err = e.message; }
@@ -867,6 +885,35 @@
   </div>
 </div>
 
+<!-- Import & consolidate -->
+<div class="card">
+  <SectionHead icon="📥" color="#10b981" title="Import & consolidate">
+    <span class="hint" style="font-weight:400">(merge SD card / Takeout / phone dumps — duplicates skipped by content)</span>
+  </SectionHead>
+  <p class="hint" style="margin-bottom:10px">
+    Point this at any external folder. Every file is identified by its content hash, so
+    anything the library has ever seen is <b>skipped</b> — no matter how many times it was
+    copied or renamed. Only new photos & videos are copied into
+    <code>{settings.ingest_dest || "…\\Imported"}</code>, organized by year/month.
+    Originals are never touched. Afterwards, run <b>Scan</b> above — only the new photos
+    will go through captioning.
+  </p>
+  {#if jobIs(job, "ingest")}
+    <JobPanel {job} bind:stopRequested={stopRequesting} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+  {:else if running}
+    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
+  {:else}
+    <div class="add-row">
+      <input bind:value={stagingPath} placeholder="Staging folder… e.g. E:\DCIM or D:\Takeout\Google Photos"
+             on:keydown={(e) => e.key === "Enter" && stagingPath.trim() && start("ingest", { source_path: stagingPath.trim() })} />
+      <button class="primary" disabled={!stagingPath.trim()}
+              on:click={() => start("ingest", { source_path: stagingPath.trim() })}>
+        📥 Import new files
+      </button>
+    </div>
+  {/if}
+</div>
+
 <!-- B: Vision analysis -->
 <div class="card">
   <SectionHead icon="👁" color="#6366f1" title="B · Vision analysis" id="sec-vision">
@@ -996,6 +1043,29 @@
   <SectionHead icon="🔍" color="#06b6d4" title="Duplicates">
     <span class="hint" style="font-weight:400">(find near-identical photos — resaves, bursts, WhatsApp copies)</span>
   </SectionHead>
+
+  <!-- Exact byte-identical extra copies recorded by scans. Distinct from the
+       dHash near-dupes below: these are the SAME file sitting in several
+       places, so removing them is loss-free (one canonical copy always kept,
+       removals go to the Recycle Bin). -->
+  {#if jobIs(job, "dedupe")}
+    <JobPanel {job} bind:stopRequested={stopRequesting} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+  {:else if dedupeCount > 0}
+    <div class="row" style="gap:10px; margin-bottom:12px; flex-wrap:wrap; align-items:center">
+      <span class="hint"><b>{dedupeCount}</b> exact duplicate cop{dedupeCount === 1 ? "y" : "ies"} on disk
+        (same bytes, multiple locations — found during scans)</span>
+      {#if running}
+        <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running</div>
+      {:else}
+        <button class="sm" on:click={() => start("dedupe")}
+                title="Keeps one canonical file per photo; extra copies go to the Recycle Bin">
+          🧹 Reclaim space — Recycle {dedupeCount} cop{dedupeCount === 1 ? "y" : "ies"}
+        </button>
+      {/if}
+    </div>
+  {:else if totalScanned > 0}
+    <p class="hint" style="margin-bottom:10px">No exact duplicate copies recorded — scans note them automatically.</p>
+  {/if}
   {#if jobIs(job, "dhash")}
     <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
   {:else if dhashPending > 0}
@@ -1161,6 +1231,52 @@
   {/if}
 </div>
 
+<!-- G: Backup -->
+<div class="card">
+  <SectionHead icon="💾" color="#0ea5e9" title="G · Backup">
+    <span class="hint" style="font-weight:400">(mirror library + captions/index to the SD card)</span>
+  </SectionHead>
+  <p class="hint" style="margin-bottom:10px">
+    One-way mirror of every scanned folder <b>plus photo-vault's own data</b> (captions,
+    faces, search index, settings) — a restore brings everything back, not just pixels.
+    The card doesn't need to stay plugged in: sync opportunistically whenever it is.
+  </p>
+  <div class="add-row" style="margin-bottom:10px">
+    <input bind:value={settings.backup_dest} placeholder="Backup folder on the SD card… e.g. E:\PhotoVaultBackup"
+           on:change={markDirty} />
+    {#if settingsDirty}
+      <button class="sm" on:click={async () => { await saveSettings(); loadBackupStatus(); }} disabled={settingsSaving}>
+        {settingsSaving ? "Saving…" : "Save"}
+      </button>
+    {/if}
+  </div>
+  {#if jobIs(job, "backup")}
+    <JobPanel {job} bind:stopRequested={stopRequesting} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+  {:else if backupSt.configured}
+    <div class="row" style="gap:10px; flex-wrap:wrap; align-items:center">
+      {#if backupSt.available}
+        <span class="chip ok-text">🟢 drive connected</span>
+      {:else}
+        <span class="chip warn-text">🔌 drive not connected — plug in the SD card to sync</span>
+      {/if}
+      {#if backupSt.days_since != null}
+        <span class="chip" class:warn-text={backupSt.days_since > 14}>
+          last backup {backupSt.days_since < 1 ? "today" : `${Math.round(backupSt.days_since)} day${Math.round(backupSt.days_since) === 1 ? "" : "s"} ago`}
+        </span>
+      {:else}
+        <span class="chip warn-text">never backed up</span>
+      {/if}
+      {#if running}
+        <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running</div>
+      {:else if backupSt.available}
+        <button class="primary" on:click={() => start("backup")}>💾 Back up now</button>
+      {/if}
+    </div>
+  {:else}
+    <p class="hint">Set a destination folder above (on the SD card) to enable backups.</p>
+  {/if}
+</div>
+
 <style>
   .card { background: var(--surface); border: 1px solid var(--border);
     border-radius: var(--radius-lg); padding: 18px; margin-bottom: 14px;
@@ -1183,6 +1299,7 @@
     text-transform: uppercase; letter-spacing:.05em; margin: 12px 0 6px; }
   .cfg-label { font-size: 12px; font-weight: 600; color: var(--muted);
     text-transform: uppercase; letter-spacing:.05em; margin-bottom: 8px; }
+  .chip { padding: 3px 10px; border-radius: 99px; background: var(--surface2); font-size: 12px; }
   .rl-grid { display: grid; grid-template-columns: max-content repeat(4, 90px) max-content;
     gap: 6px 10px; align-items: center; max-width: 640px; }
   .rl-grid .rl-head { font-size: 12px; color: var(--muted); text-align: center; }

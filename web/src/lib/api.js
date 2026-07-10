@@ -80,6 +80,8 @@ export const api = {
   indexProgress: () => j("GET", "/api/index/progress"),
   indexReset: () => j("POST", "/api/index/reset"),
   providerModels: () => j("GET", "/api/provider-models"),
+  backupStatus: () => j("GET", "/api/backup/status"),
+  dedupePending: () => j("GET", "/api/dedupe/pending"),
 
   // Search
   filters: () => j("GET", "/api/filters"),

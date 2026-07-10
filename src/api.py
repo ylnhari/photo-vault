@@ -11,6 +11,7 @@ import os
 import threading
 from contextlib import contextmanager
 from datetime import datetime as _dt
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -171,6 +172,7 @@ class IndexReq(BaseModel):
     embed_model: str | None = None
     caption_source_model: str | None = None
     max_fail: int = 5
+    source_path: str | None = None  # ingest only: the staging folder to import
 
 
 class PersonReq(BaseModel):
@@ -209,6 +211,10 @@ class SettingsReq(BaseModel):
     # {provider: {rps|rpm|rph|rpd: int}} — client-side request ceilings,
     # 0 = unlimited. See settings.DEFAULTS["rate_limits"] / ratelimit.py.
     rate_limits: dict | None = None
+    # Where ingest copies new media (null → <first scan folder>\Imported).
+    ingest_dest: str | None = None
+    # Backup mirror destination (the SD card folder), e.g. E:\PhotoVaultBackup.
+    backup_dest: str | None = None
 
 
 class ClusterReq(BaseModel):
@@ -629,6 +635,27 @@ def index_start(req: IndexReq):
     vml = None
     if req.vision_provider not in ("auto", "9router", None) and req.vision_model:
         vml = f"{req.vision_provider}:{req.vision_model}"
+    if req.type == "ingest":
+        src = (req.source_path or "").strip()
+        if not src or not os.path.isdir(src):
+            raise HTTPException(422, "ingest needs an existing staging folder path")
+        # Ingesting FROM a scanned folder would copy library files into the
+        # library's Imported/ area — every one a hash-skip at best, a second
+        # physical copy at worst. Point ingest at external staging only.
+        src_resolved = os.path.normcase(str(Path(src).resolve()))
+        for inc in folder_mgr.get_effective_scan_dirs():
+            inc_r = os.path.normcase(str(Path(inc).resolve()))
+            if src_resolved == inc_r or src_resolved.startswith(inc_r + os.sep):
+                raise HTTPException(
+                    422, "that folder is already part of the scanned library — "
+                         "ingest is for external sources (SD card, Takeout, phone dumps)")
+    if req.type == "backup":
+        import backup as backup_mod
+        bs = backup_mod.status()
+        if not bs["configured"]:
+            raise HTTPException(422, "set a backup destination first")
+        if not bs["available"]:
+            raise HTTPException(422, f"backup drive not connected ({bs['dest']})")
     try:
         return manager.start(
             req.type,
@@ -639,9 +666,25 @@ def index_start(req: IndexReq):
             embed_model=req.embed_model,
             caption_source_model=req.caption_source_model,
             vision_model_label=vml,
+            source_path=req.source_path,
         )
     except RuntimeError as e:
         raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.get("/api/backup/status")
+def backup_status():
+    import backup as backup_mod
+    return backup_mod.status()
+
+
+@app.get("/api/dedupe/pending")
+def dedupe_pending():
+    """How many byte-identical extra copies the last scans recorded — drives
+    the 'Remove N duplicate copies' button."""
+    return {"count": len(Indexer().get_redundant_copies())}
 
 
 @app.get("/api/provider-models")

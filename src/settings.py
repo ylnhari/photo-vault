@@ -43,6 +43,15 @@ DEFAULTS: dict = {
     "face_cluster_eps": 0.5,
     "face_cluster_min_samples": 3,
 
+    # Where the ingest job copies newly imported media (organized YYYY/MM).
+    # null → an Imported/ folder inside the first included scan folder, so
+    # new photos are picked up by the normal Scan with zero extra config.
+    "ingest_dest": None,
+
+    # Backup mirror destination — a folder on the SD card / external drive,
+    # e.g. "E:\\PhotoVaultBackup". null → backup not configured.
+    "backup_dest": None,
+
     # Client-side request ceilings per provider — 0 = unlimited. Providers
     # (Gemini free tier especially) throttle requests per second/minute/day;
     # setting these at or under the published quota makes jobs pace themselves

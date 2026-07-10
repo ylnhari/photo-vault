@@ -168,3 +168,30 @@ def test_duplicate_content_path_is_stable_across_rescans(tmp_path):
         scan_directory(str(root), out)
         images = catalog_db.load_all(out)["images"]
         assert next(iter(images.values()))["path"] == tracked_path
+
+
+def test_duplicate_copies_recorded_in_dup_paths(tmp_path):
+    """The untracked byte-identical copy must be recorded in dup_paths so the
+    dedupe job can physically reclaim it — regardless of which path the
+    catalog adopted as canonical."""
+    from scanner import scan_directory
+    import catalog_db
+
+    root = tmp_path / "photos"
+    root.mkdir()
+    a = root / "a_copy.jpg"
+    b = root / "b_copy.jpg"
+    c = root / "c_copy.jpg"
+    for f in (a, b, c):
+        f.write_bytes(b"identical-bytes")
+    out = str(tmp_path / "catalog.db")
+
+    scan_directory(str(root), out)
+    entry = next(iter(catalog_db.load_all(out)["images"].values()))
+    assert entry["path"] == str(a)
+    assert sorted(entry["dup_paths"]) == [str(b), str(c)]
+
+    # Rescans must not duplicate the records.
+    scan_directory(str(root), out)
+    entry = next(iter(catalog_db.load_all(out)["images"].values()))
+    assert sorted(entry["dup_paths"]) == [str(b), str(c)]
