@@ -202,3 +202,155 @@ def test_rebuild_face_index_skips_orphan_check_when_catalog_unreadable(tmp_path)
 
     assert total == 1
     assert (face_dir / "a.json").exists()
+
+
+# ── accelerator auto-detection (execution providers) ────────────────────────
+# faces.py must never hardcode a provider: it enumerates what the installed
+# onnxruntime build exposes and lets the user pick, always falling back to CPU.
+
+def _accel_ids(opts):
+    return [o["id"] for o in opts]
+
+
+def test_available_accelerators_cpu_only_hides_azure():
+    """A plain CPU wheel reports Azure+CPU; Azure is a cloud EP, not a local
+    accelerator, so only auto+cpu are offered."""
+    import faces
+    with patch("faces.ort.get_available_providers",
+               return_value=["AzureExecutionProvider", "CPUExecutionProvider"]), \
+         patch("faces._openvino_devices", return_value=[]):
+        opts = faces.available_accelerators()
+    assert _accel_ids(opts) == ["auto", "cpu"]
+
+
+def test_available_accelerators_openvino_enumerates_devices():
+    """OpenVINO exposes one EP but several devices — each becomes its own
+    choice (openvino:GPU / openvino:NPU / openvino:CPU)."""
+    import faces
+    with patch("faces.ort.get_available_providers",
+               return_value=["OpenVINOExecutionProvider", "CPUExecutionProvider"]), \
+         patch("faces._openvino_devices", return_value=["CPU", "GPU", "NPU"]):
+        opts = faces.available_accelerators()
+    ids = _accel_ids(opts)
+    assert ids[0] == "auto" and ids[-1] == "cpu"
+    assert {"openvino:CPU", "openvino:GPU", "openvino:NPU"} <= set(ids)
+    gpu = next(o for o in opts if o["id"] == "openvino:GPU")
+    assert gpu["label"] == "Intel GPU (OpenVINO)" and gpu["device"] == "GPU"
+
+
+def test_available_accelerators_surfaces_cuda_and_dml():
+    import faces
+    with patch("faces.ort.get_available_providers",
+               return_value=["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"]), \
+         patch("faces._openvino_devices", return_value=[]):
+        ids = _accel_ids(faces.available_accelerators())
+    assert "cuda" in ids and "dml" in ids
+
+
+def test_resolve_providers_openvino_gpu_sets_device_type():
+    import faces
+    with patch("faces.ort.get_available_providers",
+               return_value=["OpenVINOExecutionProvider", "CPUExecutionProvider"]), \
+         patch("faces._openvino_devices", return_value=["CPU", "GPU"]):
+        providers, options = faces._resolve_providers("openvino:GPU")
+    assert providers == ["OpenVINOExecutionProvider", "CPUExecutionProvider"]
+    # device_type is set; a persistent OpenVINO compile cache_dir is also passed.
+    assert options[0]["device_type"] == "GPU"
+    assert "cache_dir" in options[0]
+    assert options[1] == {}
+
+
+def test_resolve_providers_unavailable_choice_falls_back_to_cpu():
+    """Asking for CUDA on a CPU-only wheel degrades to CPU, never raises."""
+    import faces
+    with patch("faces.ort.get_available_providers",
+               return_value=["CPUExecutionProvider"]), \
+         patch("faces._openvino_devices", return_value=[]):
+        providers, options = faces._resolve_providers("cuda")
+    assert providers == ["CPUExecutionProvider"] and options == [{}]
+
+
+def test_resolve_providers_openvino_device_missing_falls_back():
+    """openvino:NPU when the machine has no NPU device → CPU."""
+    import faces
+    with patch("faces.ort.get_available_providers",
+               return_value=["OpenVINOExecutionProvider", "CPUExecutionProvider"]), \
+         patch("faces._openvino_devices", return_value=["CPU", "GPU"]):
+        providers, _ = faces._resolve_providers("openvino:NPU")
+    assert providers == ["CPUExecutionProvider"]
+
+
+def test_auto_prefers_npu_over_igpu():
+    """'auto' ranks the Intel NPU above the iGPU: measured ~14× faster than CPU
+    for InsightFace detection, while the iGPU was slower than CPU on these small
+    models."""
+    import faces
+    with patch("faces.ort.get_available_providers",
+               return_value=["OpenVINOExecutionProvider", "CPUExecutionProvider"]), \
+         patch("faces._openvino_devices", return_value=["CPU", "GPU", "NPU"]):
+        assert faces._auto_choice() == "openvino:NPU"
+        providers, options = faces._resolve_providers("auto")
+    assert providers[0] == "OpenVINOExecutionProvider"
+    assert options[0]["device_type"] == "NPU"
+
+
+def test_auto_falls_to_cpu_when_nothing_else():
+    import faces
+    with patch("faces.ort.get_available_providers",
+               return_value=["AzureExecutionProvider", "CPUExecutionProvider"]), \
+         patch("faces._openvino_devices", return_value=[]):
+        assert faces._auto_choice() == "cpu"
+
+
+def test_resolved_provider_label_reports_device():
+    import faces
+    with patch("faces.ort.get_available_providers",
+               return_value=["OpenVINOExecutionProvider", "CPUExecutionProvider"]), \
+         patch("faces._openvino_devices", return_value=["CPU", "GPU", "NPU"]):
+        assert faces.resolved_provider_label("openvino:NPU") == "Intel NPU (OpenVINO)"
+        assert faces.resolved_provider_label("cuda") == "CPU"  # unavailable → fallback
+
+
+def test_group_faces_merges_same_person_splits_distinct():
+    """Within-video grouping: many detections of the same person collapse to one
+    representative; a genuinely different person stays separate."""
+    import faces
+    # Person A: three near-identical embeddings (different frames), growing bbox.
+    a1 = {"embedding": [1.0, 0.0, 0.0], "bbox": [0, 0, 10, 10]}
+    a2 = {"embedding": [0.98, 0.02, 0.0], "bbox": [0, 0, 30, 30]}   # largest → representative
+    a3 = {"embedding": [0.95, 0.05, 0.0], "bbox": [0, 0, 20, 20]}
+    # Person B: orthogonal embedding.
+    b1 = {"embedding": [0.0, 0.0, 1.0], "bbox": [5, 5, 25, 25]}
+    reps = faces.group_faces([a1, a2, a3, b1])
+    assert len(reps) == 2                       # two distinct people, not four
+    # The person-A representative is the largest-bbox detection.
+    a_rep = [r for r in reps if r["embedding"][0] > 0.5][0]
+    assert a_rep["bbox"] == [0, 0, 30, 30]
+
+
+def test_group_faces_drops_embeddingless_and_handles_small_input():
+    import faces
+    assert faces.group_faces([]) == []
+    one = [{"embedding": [1.0, 0.0], "bbox": [0, 0, 1, 1]}]
+    assert faces.group_faces(one) == one
+    # a detection with no embedding is dropped
+    assert faces.group_faces([{"bbox": [0, 0, 1, 1]}]) == []
+
+
+def test_get_app_rebuilds_when_choice_changes():
+    """Changing face_provider must rebuild the cached FaceAnalysis on the next
+    call rather than serving the session built for the old device."""
+    import faces
+    faces.reset_face_app()
+    fake_app = MagicMock(); fake_app.models = {}
+    choice = {"v": "cpu"}
+    with patch("faces.settings_mod.load", side_effect=lambda: {"face_provider": choice["v"]}), \
+         patch("faces.insightface.app.FaceAnalysis", return_value=fake_app) as FA, \
+         patch("faces.ort.get_available_providers", return_value=["CPUExecutionProvider"]), \
+         patch("faces._openvino_devices", return_value=[]):
+        faces._get_app(); faces._get_app()          # same choice → built once
+        assert FA.call_count == 1
+        choice["v"] = "auto"
+        faces._get_app()                              # choice changed → rebuild
+        assert FA.call_count == 2
+    faces.reset_face_app()

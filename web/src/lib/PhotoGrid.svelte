@@ -1,5 +1,5 @@
 <script>
-  import { api } from "./api.js";
+  import { api, fmtDuration } from "./api.js";
   import { lastDeleted } from "./stores.js";
   import { createEventDispatcher, onDestroy } from "svelte";
   export let photos = [];
@@ -171,6 +171,13 @@
                  thumbnails are small cached WebP, so eager loading is cheap. -->
             <img src={api.thumbUrl(p.id)} alt={p.filename} decoding="async"
                  draggable="false" on:load={(e) => onImgLoad(e, p)} />
+            {#if p.media_type === "video"}
+              <!-- Poster thumb is served by /api/image; badge marks it playable -->
+              <div class="play" aria-hidden="true">▶</div>
+              {#if fmtDuration(p.duration_s)}
+                <div class="dur">{fmtDuration(p.duration_s)}</div>
+              {/if}
+            {/if}
             {#if p.caption}<div class="cap">{p.caption}</div>{/if}
             {#if selectMode || selected.has(p.id)}
               <div class="check" class:on={selected.has(p.id)}>{selected.has(p.id) ? "✓" : ""}</div>
@@ -222,6 +229,22 @@
     opacity: 0; transition: opacity .15s;
   }
   .cell:hover .cap, .cell:focus-visible .cap { opacity: 1; }
+  /* Video affordances: centered play glyph + a bottom-right duration pill. */
+  .play {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: 44px; height: 44px; border-radius: 50%;
+    background: rgba(0,0,0,.5); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; padding-left: 3px; pointer-events: none;
+    transition: background .15s;
+  }
+  .cell:hover .play { background: var(--accent); }
+  .dur {
+    position: absolute; bottom: 6px; right: 6px;
+    background: rgba(0,0,0,.72); color: #fff;
+    font-size: 11px; line-height: 1; padding: 3px 5px; border-radius: 4px;
+    font-variant-numeric: tabular-nums; pointer-events: none;
+  }
   .check {
     position: absolute; top: 6px; left: 6px; width: 20px; height: 20px;
     border-radius: 50%; border: 2px solid #fff; background: rgba(0,0,0,.35);

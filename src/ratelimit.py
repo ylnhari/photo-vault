@@ -132,23 +132,27 @@ def reset():
 # ── Suggested limits ─────────────────────────────────────────────────────────
 # There is NO "what are my limits" endpoint for an AI Studio API key (quota
 # introspection needs the Cloud Quotas API with OAuth on a GCP project), so
-# suggestions come from two real sources, best first:
-#   1. LEARNED: Gemini 429 bodies carry google.rpc.QuotaFailure metadata that
-#      states the violated quota and its exact per-account value — parsed by
-#      learn_from_gemini_429() at both 429 sites and kept here (in-memory).
-#   2. PUBLISHED: the static table below — free-tier values as verified on
-#      THIS account in AI Studio → Rate Limit (2026-07-04; same audit that
-#      ordered constants.GEMINI_VISION_MODELS). Update it when Google does.
+# suggestions come from two sources, best first:
+#   1. LEARNED (account-accurate): Gemini 429 bodies carry google.rpc.QuotaFailure
+#      metadata stating the violated quota and its exact per-account value —
+#      parsed by learn_from_gemini_429() at both 429 sites and kept here
+#      (in-memory). This is the ONLY source that reflects your real limits.
+#   2. PUBLISHED (approximate): the static table below — conservative, ballpark
+#      free-tier starting points. Real free-tier limits vary by account, model,
+#      tier and region and change over time, so these are a safe default only,
+#      NOT a promise for any given account. See Google's canonical page:
+#      https://ai.google.dev/gemini-api/docs/rate-limits — and set your own in
+#      Settings → rate_limits (the "Suggest" button prefers learned values).
 # LM Studio is local (no meaningful ceiling) and 9Router rotates pooled
 # accounts/keys on 429 internally — its whole job — so neither gets a
 # suggestion; suggest() returns None for them.
 
-# Longest-prefix-ish match: first substring hit wins, so order specific → generic.
+# Substring match, specific → generic (first hit wins). Values are conservative
+# approximations that the app self-corrects from real 429s — see the note above.
 SUGGESTED_GEMINI = (
-    ("gemini-3.1-flash-lite", {"rpm": 15, "rpd": 500}),   # verified RPD 500
-    ("flash-lite",            {"rpm": 15, "rpd": 20}),    # verified RPD 20
-    ("embedding",             {"rpm": 100, "rpd": 1000}),
-    ("",                      {"rpm": 10, "rpd": 20}),    # any other Gemini model
+    ("embedding",  {"rpm": 100, "rpd": 1000}),  # text-embedding free tier (approx)
+    ("flash-lite", {"rpm": 15,  "rpd": 500}),   # lite models: largest allowance (approx)
+    ("",           {"rpm": 10,  "rpd": 250}),   # any other Gemini model (conservative)
 )
 
 _learned: dict[tuple[str, str], dict[str, int]] = {}  # (provider, model) -> {window: value}

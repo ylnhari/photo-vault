@@ -116,9 +116,100 @@ def test_cannot_start_two_jobs():
     fake = _fake_indexer(["a", "b", "c"], slow)
     with patch("jobs.Indexer", return_value=fake):
         mgr.start("vision")
+        # vision holds {catalog, inference}; embed holds {inference,...} —
+        # they share the provider, so the second start is refused.
         with pytest.raises(RuntimeError, match="already running"):
             mgr.start("embed")
         _wait_idle(mgr)
+
+
+def _wait_all_idle(mgr, timeout=5.0):
+    start = time.time()
+    while time.time() - start < timeout:
+        if not mgr.any_active():
+            return
+        time.sleep(0.02)
+    raise AssertionError("jobs did not finish in time")
+
+
+def test_disjoint_jobs_run_concurrently():
+    """faces (local: FACE_DIR + faces collection) shares nothing with vision
+    (catalog + provider), so the two must run at the same time."""
+    mgr = JobManager()
+    def slow(img_id, **k):
+        time.sleep(0.05)
+        return "ok"
+    fake = _fake_indexer(["a", "b", "c"], slow)
+    fake.get_faces_pending.return_value = [(i, {}) for i in ["x", "y", "z"]]
+    fake.detect_faces_one.side_effect = lambda img_id, **k: "faces:1"
+    with patch("jobs.Indexer", return_value=fake):
+        v = mgr.start("vision")
+        f = mgr.start("faces")            # must NOT raise — disjoint resources
+        assert v["active"] is True and f["active"] is True
+        # both show up as concurrently active
+        st = mgr.status()
+        assert set(st["active_types"]) == {"vision", "faces"}
+        assert len(st["jobs"]) == 2
+        _wait_all_idle(mgr)
+
+
+def test_faces_conflicts_when_faces_during_embed_on():
+    """With faces-during-embed ON, an embed job also owns the faces resource,
+    so a standalone faces job must be refused while it runs."""
+    import pytest
+    mgr = JobManager()
+    def slow(img_id, **k):
+        time.sleep(0.05)
+        return "ok"
+    fake = _fake_indexer(["a", "b", "c"], slow)
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("jobs.settings_mod.load",
+               lambda: {"vision_concurrency": 1, "faces_during_embed": True}):
+        mgr.start("embed")
+        with pytest.raises(RuntimeError, match="already running"):
+            mgr.start("faces")
+        _wait_all_idle(mgr)
+
+
+def test_embed_and_faces_concurrent_when_faces_during_embed_off():
+    """With faces-during-embed OFF, embed drops the faces resource, so a
+    GPU faces job can run alongside embedding — the user's target scenario."""
+    mgr = JobManager()
+    def slow(img_id, **k):
+        time.sleep(0.05)
+        return "ok"
+    fake = _fake_indexer(["a", "b", "c"], slow)
+    fake.get_faces_pending.return_value = [(i, {}) for i in ["x", "y"]]
+    fake.detect_faces_one.side_effect = lambda img_id, **k: "faces:0"
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("jobs.settings_mod.load",
+               lambda: {"vision_concurrency": 1, "faces_during_embed": False}):
+        mgr.start("embed")
+        f = mgr.start("faces")            # allowed now
+        assert f["active"] is True
+        _wait_all_idle(mgr)
+
+
+def test_stop_targets_single_job_by_id():
+    """stop(job_id) halts only that job; a disjoint concurrent job keeps
+    running."""
+    mgr = JobManager()
+    def slow(img_id, **k):
+        time.sleep(0.05)
+        return "ok"
+    fake = _fake_indexer([str(i) for i in range(40)], slow)
+    fake.get_faces_pending.return_value = [(str(i), {}) for i in range(40)]
+    fake.detect_faces_one.side_effect = lambda img_id, **k: (time.sleep(0.05) or "faces:0")
+    with patch("jobs.Indexer", return_value=fake):
+        v = mgr.start("vision")
+        f = mgr.start("faces")
+        time.sleep(0.08)
+        mgr.stop(v["id"])                 # stop only vision
+        _wait_all_idle(mgr)
+        vs = mgr.status(v["id"])
+        fs = mgr.status(f["id"])
+        assert vs["stopped"] is True
+        assert fs["stopped"] is False
 
 
 def test_reset_clears_finished_state():
@@ -502,11 +593,22 @@ def test_embed_job_records_substitution_for_recovery():
     assert mgr.status()["substitution"] is None
 
 
+def _inject_active_job(mgr, jtype="vision", resources=("inference",), **state_fields):
+    """Install a synthetic active job into the manager (no worker thread) so
+    status()/_render can be exercised on a known state."""
+    from jobs import _Job
+    st = mgr._idle_state()
+    st.update({"active": True, "type": jtype, "id": "test-1",
+               "resources": list(resources), **state_fields})
+    j = _Job("test-1", jtype, set(resources), st)
+    with mgr._lock:
+        mgr._jobs[j.id] = j
+    return j
+
+
 def test_status_reports_eta_and_rate_while_active():
     mgr = JobManager()
-    with mgr._lock:
-        mgr._state.update({"active": True, "total": 10, "done": 5,
-                           "started_at": time.time() - 50})
+    _inject_active_job(mgr, total=10, done=5, started_at=time.time() - 50)
     s = mgr.status()
     # 5 done in 50s → 0.1/s → 5 remaining ≈ 50s, 6/min
     assert s["eta_seconds"] == pytest.approx(50, abs=3)
@@ -519,9 +621,7 @@ def test_status_eta_none_when_idle_or_nothing_done():
     assert s["eta_seconds"] is None
     assert s["rate_per_min"] is None
     assert s["rate_wait"] == {}
-    with mgr._lock:
-        mgr._state.update({"active": True, "total": 10, "done": 0,
-                           "started_at": time.time()})
+    _inject_active_job(mgr, total=10, done=0, started_at=time.time())
     s = mgr.status()
     assert s["eta_seconds"] is None
 
@@ -560,3 +660,73 @@ def test_rate_limit_cancel_in_vision_batch_leaves_items_pending():
     assert s["ok"] == 0
     assert s["done"] == 0
     assert s["aborted"] is False
+
+
+# ── video jobs ────────────────────────────────────────────────────────────────
+
+def test_video_vision_runs_through_parallel_path_with_video_compute():
+    """video_vision selects video items and captions them via
+    compute_video_caption (not the still-image compute_caption)."""
+    mgr = JobManager()
+    fake = MagicMock()
+    fake.get_video_vision_pending.return_value = [("v1", {}), ("v2", {})]
+    calls = []
+    def _vcompute(img_id, *a, **k):
+        calls.append(img_id)
+        return ("gemini:gemma", '{"caption":"a clip"}')
+    fake.compute_video_caption.side_effect = _vcompute
+    fake.record_caption = MagicMock()
+    # If the job ever fell back to the photo path this would be hit instead:
+    fake.compute_caption.side_effect = AssertionError("used photo compute for a video")
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("jobs.settings_mod.load", lambda: {"vision_concurrency": 1}):
+        mgr.start("video_vision", vision_provider="9router", vision_model="gemini/gemma")
+        s = _wait_idle(mgr)
+    assert s["ok"] == 2 and s["fail"] == 0
+    assert set(calls) == {"v1", "v2"}
+    assert fake.record_caption.call_count == 2
+
+
+def test_video_faces_runs_sequentially():
+    mgr = JobManager()
+    fake = MagicMock()
+    fake.get_video_faces_pending.return_value = [("v1", {}), ("v2", {})]
+    fake.video_faces_one.side_effect = lambda img_id, **k: f"video-faces:1"
+    with patch("jobs.Indexer", return_value=fake):
+        mgr.start("video_faces")
+        s = _wait_idle(mgr)
+    assert s["ok"] == 2 and s["done"] == 2
+    assert fake.video_faces_one.call_count == 2
+
+
+def test_video_frames_setting_flows_to_both_video_jobs():
+    """The configured keyframes-per-video reaches compute_video_caption
+    (video_vision) and video_faces_one (video_faces), clamped to bounds."""
+    # video_vision: settings say 7 → each compute call gets frames=7
+    mgr = JobManager()
+    fake = MagicMock()
+    fake.get_video_vision_pending.return_value = [("v1", {})]
+    seen = {}
+    def _vcompute(img_id, *a, frames=4, **k):
+        seen["vision"] = frames
+        return ("gemini:gemma", '{"caption":"a clip"}')
+    fake.compute_video_caption.side_effect = _vcompute
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("jobs.settings_mod.load", lambda: {"vision_concurrency": 1, "video_frames": 7}):
+        mgr.start("video_vision", vision_provider="9router", vision_model="gemini/gemma")
+        _wait_idle(mgr)
+    assert seen["vision"] == 7
+
+    # video_faces: an out-of-range value is clamped (99 → 12)
+    mgr = JobManager()
+    fake = MagicMock()
+    fake.get_video_faces_pending.return_value = [("v1", {})]
+    def _vfaces(img_id, frames=4, **k):
+        seen["faces"] = frames
+        return "video-faces:1"
+    fake.video_faces_one.side_effect = _vfaces
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("jobs.settings_mod.load", lambda: {"faces_during_embed": True, "video_frames": 99}):
+        mgr.start("video_faces")
+        _wait_idle(mgr)
+    assert seen["faces"] == 12  # clamped to VIDEO_FRAMES_MAX

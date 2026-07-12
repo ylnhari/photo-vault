@@ -70,15 +70,17 @@ export const api = {
   // Settings
   getSettings: () => j("GET", "/api/settings"),
   saveSettings: (s) => j("PUT", "/api/settings", s),
+  faceProviders: () => j("GET", "/api/face-providers"),
   resetSettings: () => j("DELETE", "/api/settings"),
   rateLimitSuggest: (provider, model) =>
     j("GET", `/api/rate-limits/suggest?provider=${encodeURIComponent(provider)}${model ? `&model=${encodeURIComponent(model)}` : ""}`),
 
   // Indexing jobs
   indexStart: (cfg) => j("POST", "/api/index/start", cfg),
-  indexStop: () => j("POST", "/api/index/stop"),
+  // body optional: { job_id } targets one job; omitted acts on all.
+  indexStop: (body) => j("POST", "/api/index/stop", body),
   indexProgress: () => j("GET", "/api/index/progress"),
-  indexReset: () => j("POST", "/api/index/reset"),
+  indexReset: (body) => j("POST", "/api/index/reset", body),
   providerModels: () => j("GET", "/api/provider-models"),
   backupStatus: () => j("GET", "/api/backup/status"),
   dedupePending: () => j("GET", "/api/dedupe/pending"),
@@ -154,7 +156,18 @@ export const api = {
   thumbUrl: (id) => `/api/image?size=thumb&id=${encodeURIComponent(id)}${_tokenQS()}`,
   mediumUrl: (id) => `/api/image?size=medium&id=${encodeURIComponent(id)}${_tokenQS()}`,
   fullUrl: (id) => `/api/image?size=full&id=${encodeURIComponent(id)}${_tokenQS()}`,
+  // <video> can't send Authorization headers either — token rides as a query param.
+  videoUrl: (id) => `/api/video?id=${encodeURIComponent(id)}${_tokenQS()}`,
 };
+
+// Seconds → "m:ss" / "h:mm:ss" for the duration pill on video cards.
+export function fmtDuration(s) {
+  s = Math.round(s || 0);
+  if (s <= 0) return "";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const mm = h ? String(m).padStart(2, "0") : String(m);
+  return (h ? `${h}:` : "") + `${mm}:${String(sec).padStart(2, "0")}`;
+}
 
 function _tokenQS() {
   return _token ? `&_t=${encodeURIComponent(_token)}` : "";

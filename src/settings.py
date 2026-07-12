@@ -45,9 +45,25 @@ DEFAULTS: dict = {
     # knob the truncation error message points at. 0 → the code default (4096).
     "vision_max_tokens": 4096,
 
+    # How many keyframes to sample per video for captioning + face detection.
+    # A video is analyzed by extracting this many frames evenly across the clip
+    # (avoiding the black start/end), captioning each with the vision model, and
+    # folding them into ONE caption + one search vector. So a video costs
+    # ~video_frames vision calls, NOT one-per-actual-frame. Higher = richer
+    # coverage of long/varied clips but proportionally more calls/quota; lower =
+    # faster & cheaper. Clamped to 1..12 by the API. 4 is a sensible default.
+    "video_frames": 4,
+
     # Whether the embed stage also runs face detection inline. Turn off to keep
     # face detection a fully separate, user-triggered stage (the "faces" job).
     "faces_during_embed": True,
+
+    # Which accelerator InsightFace face detection runs on. "auto" picks the
+    # fastest execution provider the installed onnxruntime wheel exposes
+    # (GPU/NPU over CPU); an explicit id from faces.available_accelerators()
+    # (e.g. "openvino:GPU", "openvino:NPU", "cuda", "dml", "cpu") pins it.
+    # CPU is always the fallback if the chosen accelerator is unavailable.
+    "face_provider": "auto",
 
     # DBSCAN face-clustering parameters (advanced).
     "face_cluster_eps": 0.5,
@@ -69,10 +85,12 @@ DEFAULTS: dict = {
     # by ratelimit.acquire() before every provider inference call; counters
     # are in-memory sliding windows that reset on server restart.
     # LM Studio is local and 9Router rotates pooled accounts internally, so
-    # both default to unlimited. Gemini gets a real free-tier default (from
-    # the AI-Studio-verified numbers in ratelimit.SUGGESTED_GEMINI, sized for
-    # the primary gemini-3.1-flash-lite model) — all-zeros would mean every
-    # fresh install hammers the free tier into 429s by default.
+    # both default to unlimited. Gemini gets a conservative, approximate
+    # free-tier default (a low pace that shouldn't 429 on a typical free key) —
+    # all-zeros would mean every fresh install hammers the free tier into 429s
+    # by default. Real limits vary by account/tier/model and change over time
+    # (https://ai.google.dev/gemini-api/docs/rate-limits); the app learns your
+    # actual caps from real 429s, and you can set exact values in Settings.
     "rate_limits": {
         "lm_studio": {"rps": 0, "rpm": 0, "rph": 0, "rpd": 0},
         "gemini":    {"rps": 0, "rpm": 10, "rph": 0, "rpd": 500},

@@ -12,6 +12,9 @@ Everything runs on your machine. No cloud subscription. No data leaves your devi
   clothing style, mood, location type — all searchable via dropdowns
 - **Multi-model embeddings**: Index with LM Studio's embed model or Gemini — both stored,
   switch the active search model anytime from the UI without re-indexing
+- **Videos too**: Videos are first-class — browsed in the timeline with a ▶/duration badge,
+  played inline (seekable), and made searchable by captioning a few sampled keyframes.
+  Photos and videos can live in one folder or separate folders — your choice, never forced.
 
 ## Before you start — choose your services
 
@@ -45,14 +48,43 @@ when LM Studio is offline.
 
 ### Face recognition
 
-InsightFace runs on CPU automatically. No setup needed. CUDA is used if available.
+InsightFace runs on the **CPU by default** — no setup needed, works on every machine. For big
+libraries you can offload it to a GPU/NPU; see **GPU/NPU acceleration** below. Either way,
+**Index & Manage → Face detection → "Face detection runs on"** shows exactly which accelerators
+your install exposes and lets you pick one (the list is auto-detected, never hardcoded).
+
+## GPU/NPU acceleration (optional)
+
+Face detection is the one CPU-heavy stage. It runs on CPU out of the box; to accelerate it,
+install **one** onnxruntime accelerator wheel and restart. They're mutually exclusive (all
+provide the same `onnxruntime` module), so use the matching `make accel-*` target — it swaps
+cleanly, and the run targets use `uv run --no-sync` so your choice isn't reverted:
+
+| Command | Hardware | Notes |
+|---|---|---|
+| `make accel-cpu` | any | the default; always available |
+| `make accel-openvino` | Intel Arc iGPU + **AI Boost NPU** (Core Ultra) | NPU measured **~14× faster** than CPU here; pins `openvino==2025.4.1` (the onnxruntime bridge needs an exact match) |
+| `make accel-nvidia` | NVIDIA GPU | needs a matching CUDA/cuDNN runtime |
+| `make accel-directml` | any DirectX 12 GPU on Windows (Intel/AMD/NVIDIA) | fully self-contained — no external runtime |
+
+Then restart the server and pick the device in **Settings → "Face detection runs on"**
+(e.g. *Intel NPU (OpenVINO)*). `make accel-show` prints the active wheel + providers.
+`make install` / `uv sync` resets to the CPU wheel — re-run an accel target afterward.
+
+> On Windows there's no `make`; run the two lines from the target directly, e.g.
+> `uv pip uninstall onnxruntime onnxruntime-gpu onnxruntime-directml` then
+> `uv pip install --reinstall "onnxruntime-openvino==1.24.1" "openvino==2025.4.1"`,
+> and start the server with `uv run --no-sync python src/serve.py`.
 
 ## Architecture
 
 FastAPI backend (Python) + Svelte single-page app (Vite). The backend modules do all the work —
 indexing, vision, embeddings, faces, search — and expose a JSON API. The SPA is the only UI.
 Indexing runs as a **background job**: progress streams to the UI, a Stop button works mid-run,
-and the page never freezes. Everything is local; your photos and index never leave your machine.
+and the page never freezes. **Independent jobs run concurrently** — e.g. GPU/NPU face detection
+alongside LM-Studio embedding — while jobs that would collide (two that write the same catalog
+records, or two that drive the same model) are automatically serialized. Everything is local;
+your photos and index never leave your machine.
 
 ## Platform support
 
@@ -121,6 +153,29 @@ make web       # terminal 2 — Vite dev server on :5173 (proxies /api → :8768
 
 6. After indexing: use **Search**, browse **Timeline**, register people in **People**
 
+## Videos
+
+Videos are catalogued alongside photos and need no separate setup:
+
+- **Browse & play**: they appear in the Timeline and grids by capture date with a ▶ badge and
+  duration pill; the lightbox plays them inline via a range-streaming endpoint (seekable).
+- **Searchable**: **Index & Manage → Video analysis** understands each video the production way:
+  **shot-based keyframes** (adaptive scene detection, not blind uniform sampling) are sent
+  **together, in one multimodal call** to your chosen Vision provider so the model reasons across
+  the clip temporally (motion, how the scene evolves) — not per-frame. Faces are detected across
+  those keyframes and **grouped into the distinct people** in the clip (sparse-keyframe face
+  tracking), so People counts and matches are accurate. All of this uses the **same provider you
+  pick** for photos — never forced local or cloud.
+- **Speech search (optional)**: enable local **Whisper ASR** with `make video-ai` and spoken words
+  in videos are transcribed, folded into the caption, and made searchable — all on-device, no API.
+  Also installs `ffprobe` (via static-ffmpeg) for robust metadata (fps/rotation/audio). Both are
+  optional: without them, captioning still works (metadata falls back to an ffmpeg parse; no
+  transcript).
+- **Your folders, your way**: keep everything in one folder (scan/import treat a mixed folder
+  as-is) *or* keep videos in a separate folder (add it to Scan; Import can file videos into
+  their own tree). Audio and other non-media files are simply ignored — a mixed folder never
+  breaks a scan. All frame extraction uses a bundled `imageio-ffmpeg` (no user install).
+
 ## Import & consolidate
 
 **Index & Manage → Import** merges any staging folder — Google Takeout extract, pen-drive
@@ -170,10 +225,12 @@ Both LM Studio and Gemini can be active simultaneously — LM Studio is always t
 make test                            # or: uv run python -m pytest tests/ -q
 ```
 
-450+ tests covering: embeddings, vision, search, indexer, validator, tagger, ingest, backup,
-rate limiting, the cross-platform filesystem layer, the background job manager, and the
-FastAPI endpoints. All external calls mocked — no services needed to run tests, and the
-full OS matrix (Windows/macOS/Linux behavior) is exercised on whatever OS runs them.
+500+ tests covering: embeddings, vision, video (ffmpeg mocked), faces + execution-provider
+selection, search, indexer, validator, tagger, ingest, backup, rate limiting, the
+cross-platform filesystem layer, the concurrent background job manager, and the FastAPI
+endpoints. All external calls mocked — no services (and no real
+ffmpeg) needed to run tests, and the full OS matrix (Windows/macOS/Linux behavior) is
+exercised on whatever OS runs them.
 
 ## File structure
 
@@ -183,10 +240,12 @@ src/
   serve.py        ← launcher (reads port from ../ports.json → 8768)
   jobs.py         ← background indexing job manager (worker thread, stop, fail-abort)
   vision.py       ← LM Studio vision → 12 attributes JSON (Gemini fallback); records model used
+  video.py        ← all ffmpeg use (bundled imageio-ffmpeg): probe + poster + keyframe frames
   embeddings.py   ← LM Studio embed model (Gemini fallback); multi-model registry
   indexer.py      ← scan + index + gap detection + caption history; per-model ChromaDB collections
   search.py       ← semantic search + attribute filters + person filter
-  faces.py        ← InsightFace face detection/embedding (CPU + CUDA auto)
+  faces.py        ← InsightFace face detection/embedding; auto-detects execution providers
+                    (CPU / OpenVINO GPU+NPU / CUDA / DirectML), user-selectable in Settings
   tagger.py       ← person registration from reference images
   clustering.py   ← DBSCAN face clustering
   scanner.py / metadata.py ← recursive image discovery + EXIF

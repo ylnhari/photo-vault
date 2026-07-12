@@ -30,12 +30,6 @@ from constants import DATA_DIR
 
 STATE_PATH = os.path.join(DATA_DIR, "backup_state.json")
 
-# Video files are invisible to photo-root mirroring — videos are out of the
-# app's scope for now, and some live INSIDE destination photo trees where a
-# purge would delete them as extras. Kept in sync with ingest's video set.
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm",
-                    ".3gp", ".mts", ".m2ts", ".wmv"}
-
 # robocopy exit codes are a bitmask; < 8 means "no failures" (0 = nothing to
 # do, 1 = files copied, 2 = extras deleted at dest, 4 = mismatches fixed).
 _ROBOCOPY_OK_BELOW = 8
@@ -56,14 +50,14 @@ def get_dest() -> str | None:
 
 def _label(src: str) -> str:
     """Folder-name-safe label for a source root, e.g.
-    'C:\\Users\\ylnha\\Pictures' → 'C_Users_ylnha_Pictures'."""
+    'C:\\Photos\\Pictures' → 'C_Photos_Pictures'."""
     return re.sub(r"[:\\/]+", "_", src).strip("_")
 
 
 def backup_roots() -> list[tuple[str, str]]:
     """[(src, dest)] pairs to mirror: every included scan folder lands at
-    <dest>/<its basename> (so C:\\Users\\ylnha\\Pictures backed up to D:\\
-    becomes simply D:\\Pictures — Hari's requested layout), plus data/ under
+    <dest>/<its basename> (so C:\\Photos\\Pictures backed up to D:\\ becomes
+    simply D:\\Pictures — a flat, human-readable layout), plus data/ under
     <dest>/photo-vault-data so captions/faces/index restore along with the
     pixels. If two included folders share a basename, the full sanitized
     path label is used for both to keep them apart."""
@@ -164,15 +158,14 @@ def backup_one(src: str) -> str:
     Raises on copy failure so the job counts it as a fail.
 
     Two mirroring modes, same on every OS:
-      - Photo folders: additive (no purge) with video files invisible —
-        videos are out of the app's scope for now, and some live INSIDE the
-        destination photo tree; a purge would delete them as extras. No purge
-        also means a photo deleted on the laptop lingers in the backup — the
-        safer failure mode until video handling lands and strict mirroring
-        returns.
-      - photo-vault's own data/: strict mirror (purge extras) — it has no
-        videos, and stale ChromaDB segment files from older runs must never
-        mix into a restore.
+      - Scan folders (photos AND videos): additive (no purge). Videos are
+        first-class catalog rows now, so they get mirrored like photos. No
+        purge is deliberate: some destination trees already hold unrelated
+        media, and additive mode never deletes an extra at the destination —
+        so a file removed on the laptop lingers in the backup (the safer
+        failure mode) and pre-existing drive-side content is left untouched.
+      - photo-vault's own data/: strict mirror (purge extras) — stale ChromaDB
+        segment files from older runs must never mix into a restore.
     """
     dest_map = dict(backup_roots())
     dst = dest_map.get(src)
@@ -192,8 +185,10 @@ def backup_one(src: str) -> str:
 
 def _mirror_robocopy(src: str, dst: str, purge: bool) -> str:
     """Windows engine: robocopy — built in, incremental, unattended-safe."""
-    video_globs = [f"*{ext}" for ext in sorted(VIDEO_EXTENSIONS)]
-    mode = ["/MIR"] if purge else (["/E", "/XF"] + video_globs)
+    # /MIR (strict, purge) for data/; /E (additive, keep dest extras) for scan
+    # roots. Both include videos — additive mode is what protects any unrelated
+    # media already sitting at the destination, not an extension filter.
+    mode = ["/MIR"] if purge else ["/E"]
     cmd = [
         "robocopy", src, dst, *mode, "/R:1", "/W:1",
         # /FFT: FAT-style 2-second timestamp granularity, /DST: tolerate DST
@@ -212,8 +207,17 @@ def _mirror_robocopy(src: str, dst: str, purge: bool) -> str:
     m = _SUMMARY_RE.search(proc.stdout or "")
     if m:
         total, copied, skipped, _mismatch, failed, extras = (int(g) for g in m.groups())
+        # "Extras" = files at the destination not in the source. Only /MIR
+        # (purge, used for data/) actually deletes them; the additive /E scan
+        # mirror leaves them in place, so don't claim a removal that didn't
+        # happen.
+        extras_note = (
+            f" · {extras} removed at dest" if (extras and purge)
+            else f" · {extras} extra kept at dest" if extras
+            else ""
+        )
         return (f"mirrored — {copied} copied · {skipped} unchanged"
-                + (f" · {extras} removed at dest" if extras else "")
+                + extras_note
                 + (f" · {failed} FAILED" if failed else ""))
     return "mirrored"
 
@@ -238,7 +242,6 @@ def _mirror_python(src: str, dst: str, purge: bool) -> str:
     clean success."""
     copied = unchanged = removed = failed = 0
     first_error = None
-    skip_videos = not purge  # photo roots skip videos; data/ has none
 
     for dirpath, dirnames, filenames in os.walk(src):
         platformfs.skip_system_dirs(dirnames)
@@ -252,8 +255,6 @@ def _mirror_python(src: str, dst: str, purge: bool) -> str:
             dirnames[:] = []
             continue
         for name in filenames:
-            if skip_videos and os.path.splitext(name)[1].lower() in VIDEO_EXTENSIONS:
-                continue
             sp = os.path.join(dirpath, name)
             dp = os.path.join(out_dir, name)
             try:

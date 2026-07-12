@@ -729,3 +729,59 @@ def test_get_redundant_copies_lists_uid_path_items():
         "u2": {"path": "p2"},
     })
     assert idx.get_redundant_copies() == ["u1::x", "u1::y"]
+
+
+# ── video support ─────────────────────────────────────────────────────────────
+
+def test_is_video_by_media_type_and_extension_fallback():
+    from indexer import is_video
+    assert is_video({"media_type": "video"}) is True
+    assert is_video({"media_type": "image"}) is False
+    # legacy rows with no media_type fall back to the extension
+    assert is_video({"path": "/x/clip.MP4"}) is True
+    assert is_video({"path": "/x/photo.jpg"}) is False
+    assert is_video({}) is False
+
+
+def test_aggregate_video_captions_merges_frames():
+    import json
+    from indexer import _aggregate_video_captions
+    frames = [
+        json.dumps({"caption": "a dog", "scene": "park", "mood": "happy",
+                    "objects": ["dog", "ball"], "occasion": "outing"}),
+        json.dumps({"caption": "a dog runs across a green field chasing a ball",
+                    "scene": "park", "mood": "calm",
+                    "objects": ["dog", "grass"], "occasion": "outing"}),
+        json.dumps({"caption": "closeup", "scene": "field", "mood": "happy",
+                    "objects": ["ball"], "occasion": "outing"}),
+    ]
+    merged = json.loads(_aggregate_video_captions(frames))
+    # majority vote across frames
+    assert merged["scene"] == "park"     # 2 park vs 1 field
+    assert merged["mood"] == "happy"     # 2 happy vs 1 calm
+    assert merged["occasion"] == "outing"
+    # objects unioned
+    assert set(merged["objects"]) == {"dog", "ball", "grass"}
+    # representative caption = the longest single frame caption
+    assert merged["caption"].startswith("a dog runs across")
+
+
+def _idx_with(catalog):
+    """An Indexer wired to an in-memory catalog (no disk/Chroma)."""
+    from indexer import Indexer
+    idx = Indexer.__new__(Indexer)
+    idx.image_catalog = {"images": catalog}
+    return idx
+
+
+def test_get_vision_pending_excludes_videos_but_video_selector_includes_them():
+    catalog = {
+        "p1": {"media_type": "image"},                       # photo, uncaptioned
+        "v1": {"media_type": "video"},                       # video, uncaptioned
+        "p2": {"media_type": "image", "caption_json": "{}"},  # photo, captioned
+    }
+    idx = _idx_with(catalog)
+    photo_pending = {i for i, _ in idx.get_vision_pending()}
+    video_pending = {i for i, _ in idx.get_video_vision_pending()}
+    assert photo_pending == {"p1"}          # v1 not in the photo queue
+    assert video_pending == {"v1"}          # v1 is in the video queue

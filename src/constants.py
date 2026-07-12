@@ -85,12 +85,12 @@ _load_env()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
-# Prefer highest-rate-limit models first; escalate only if 429/404/503
-# Ordered by verified free-tier daily quota on this account (AI Studio ->
-# Rate Limit, 2026-07-04) — gemini-2.0-flash* variants showed 0/0 (unavailable
-# on this project/tier) and were dropped; gemini-3.1-flash-lite has by far the
-# best quota (RPD 500 vs 20 for the rest) plus the cleanest JSON-mode output
-# in testing, so it goes first.
+# Tried in order; escalate to the next only on 429/404/503. Ordered lightest-
+# first: the "flash-lite" tier generally carries the largest free-tier request
+# allowance and gives clean JSON-mode output, so it leads, with heavier flash
+# models as fallbacks. Exact free-tier quotas vary by account, tier and region
+# and change over time (https://ai.google.dev/gemini-api/docs/rate-limits), so
+# this is an ordering heuristic, not a guarantee for any specific account.
 GEMINI_VISION_MODELS = [
     "gemini-3.1-flash-lite",
     "gemini-2.5-flash-lite",

@@ -1,4 +1,5 @@
 import json
+import os
 import pytest
 from unittest.mock import patch, MagicMock
 import urllib.error
@@ -285,6 +286,74 @@ def test_register_model_same_dimension_again_does_not_raise(tmp_path):
     with patch("embeddings.EMBEDDING_REGISTRY_PATH", reg_path):
         register_model("lm_studio", "model-a", 768)
         register_model("lm_studio", "model-a", 768)  # same dimension: no raise
+
+
+def test_register_model_skips_disk_write_for_same_day_reembed(tmp_path):
+    """register_model runs on every embed; re-registering an already-known
+    model the same day must NOT rewrite the registry file (that per-image
+    churn is what raced the UI's reads and aborted a whole embed job)."""
+    from embeddings import register_model
+    reg_path = str(tmp_path / "reg.json")
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", reg_path):
+        register_model("lm_studio", "model-a", 768)  # first: writes
+        with patch("embeddings._save_registry") as save:
+            register_model("lm_studio", "model-a", 768)  # same day: no write
+            register_model("lm_studio", "model-a", 768)
+        save.assert_not_called()
+
+
+def test_register_model_writes_when_day_advances(tmp_path):
+    """A genuinely new calendar day should still refresh last_used once."""
+    from embeddings import register_model, get_registry
+    reg_path = str(tmp_path / "reg.json")
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", reg_path):
+        register_model("lm_studio", "model-a", 768)
+        # Backdate stored last_used to yesterday so the day-change branch fires.
+        reg = get_registry()
+        reg["models"]["model-a"]["last_used"] = "2000-01-01T00:00:00"
+        from embeddings import _save_registry
+        _save_registry(reg)
+        with patch("embeddings._save_registry") as save:
+            register_model("lm_studio", "model-a", 768)
+        save.assert_called_once()
+
+
+def test_save_registry_retries_transient_permission_error(tmp_path):
+    """The Windows os.replace sharing-violation (a UI read holding the file
+    open) is transient — _save_registry must retry it, not fail the embed."""
+    from embeddings import _save_registry
+    reg_path = str(tmp_path / "reg.json")
+    calls = {"n": 0}
+    real_replace = os.replace
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] < 3:  # first two attempts hit a sharing violation
+            raise PermissionError(5, "Access is denied")
+        return real_replace(src, dst)
+
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", reg_path), \
+         patch("embeddings.os.replace", side_effect=flaky_replace), \
+         patch("embeddings._time.sleep"):
+        _save_registry({"active_model": "m", "models": {}})
+
+    assert calls["n"] == 3
+    assert json.loads((tmp_path / "reg.json").read_text())["active_model"] == "m"
+
+
+def test_save_registry_reraises_after_exhausting_retries(tmp_path):
+    """If the violation never clears, re-raise (so it's counted as a real
+    failure) and don't leak the .tmp file."""
+    from embeddings import _save_registry
+    reg_path = str(tmp_path / "reg.json")
+
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", reg_path), \
+         patch("embeddings.os.replace", side_effect=PermissionError(5, "denied")), \
+         patch("embeddings._time.sleep"):
+        with pytest.raises(PermissionError):
+            _save_registry({"active_model": "m", "models": {}})
+
+    assert not (tmp_path / "reg.json.tmp").exists()  # temp cleaned up
 
 
 # ── _is_connection_error ──────────────────────────────────────────────────────

@@ -31,6 +31,12 @@ src/
                     consecutive-failure abort); API polls status(), calls stop()
   vision.py       ← LM Studio first → Gemini fallback; get_image_caption(with_model=True)
                     returns (text, model_label) so the vision model is recorded per caption
+  video.py        ← the ONLY home for ffmpeg (bundled imageio-ffmpeg): probe() for
+                    duration/dims/codec/capture_time, poster_frame(), extract_frames() for
+                    keyframes. Videos are first-class catalog rows (media_type="video"); the
+                    photo vision/faces selectors exclude them and the video_vision/video_faces
+                    jobs caption/face them from sampled keyframes (aggregated to one caption/
+                    one vector per video). Nothing else may shell out to ffmpeg.
   embeddings.py   ← LM Studio /v1/embeddings first → Gemini text-embedding-004 fallback;
                     multi-model registry; one ChromaDB collection per model
   indexer.py      ← scan + vision + embed + ChromaDB; caption_json + caption_model +
@@ -43,7 +49,11 @@ src/
   clustering.py   ← DBSCAN face clustering
   scanner.py / metadata.py ← recursive image discovery + EXIF
   ingest.py       ← import & consolidate: staging folder → library (content-hash
-                    dedupe incl. videos via media_hashes.json, YYYY/MM layout)
+                    dedupe incl. videos via media_hashes.json, YYYY/MM layout).
+                    media filter ("both"/"photos"/"videos") + videos route to a
+                    SEPARATE tree (video_dest, default = a scanned Videos root)
+                    so photos/videos can be kept apart — never forced; one mixed
+                    folder + "both" also works. Audio/other files are ignored.
   backup.py       ← opportunistic incremental mirror of scan folders + data/ to
                     backup_dest (robocopy on Windows, stdlib mirror elsewhere;
                     photo roots additive+video-invisible, data/ strict mirror);
@@ -68,7 +78,8 @@ tests/            ← pytest; all external calls mocked; test_jobs + test_api in
 ## API endpoints (all under /api)
 health, status, scan, index/start|stop|progress|reset, search (GET+POST), recent, filters,
 timeline, people (GET+POST), models (+models/active), image (GET thumb/full, DELETE),
-meta, cleanup-missing. Indexing runs as a background job — never blocks a request.
+video (GET, HTTP-range → seekable playback), meta, cleanup-missing. Indexing runs as a
+background job — never blocks a request. Job types include video_vision + video_faces.
 
 ## Deps (with-deps project)
 ```bash

@@ -32,6 +32,7 @@ def test_status(client):
     fake.get_embed_eligible_ids.return_value = []
     fake.get_vision_model_summary.return_value = {}
     fake.get_faces_stats.return_value = {"total": 0, "detected": 0, "pending": 0}
+    fake.get_video_faces_stats.return_value = {"total": 0, "detected": 0, "pending": 0}
     with (
         patch("api.Indexer", return_value=fake),
         patch("api.settings_mgr.load", return_value={}),
@@ -256,6 +257,7 @@ def test_status_empty_catalog(client):
     fake.get_embed_eligible_ids.return_value = []
     fake.get_vision_model_summary.return_value = {}
     fake.get_faces_stats.return_value = {"total": 0, "detected": 0, "pending": 0}
+    fake.get_video_faces_stats.return_value = {"total": 0, "detected": 0, "pending": 0}
     with patch("api.Indexer", return_value=fake), patch("api.folder_mgr") as fm:
         fm.get_effective_scan_dirs.return_value = []
         r = client.get("/api/status")
@@ -889,3 +891,64 @@ def test_vision_model_label_none_for_9router():
     assert settings_mod.vision_model_label(
         {"vision_provider": "lm_studio", "vision_model": "m"}
     ) == "lm_studio:m"
+
+
+# ── video streaming + range requests ──────────────────────────────────────────
+
+def test_parse_range_variants():
+    import api
+    assert api._parse_range("bytes=0-99", 1000) == (0, 99)
+    assert api._parse_range("bytes=100-", 1000) == (100, 999)   # open-ended
+    assert api._parse_range("bytes=-50", 1000) == (950, 999)    # suffix range
+    assert api._parse_range("bytes=0-100000", 1000) == (0, 999)  # clamped to size
+    assert api._parse_range("bytes=2000-3000", 1000) is None     # past EOF
+    assert api._parse_range("bytes=abc", 1000) is None
+    assert api._parse_range("kbytes=0-1", 1000) is None
+
+
+def test_video_full_request_advertises_ranges(client, tmp_path):
+    import api
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(b"VIDEODATA" * 100)
+    with patch("api._resolve_indexed_path", return_value=str(vid)):
+        r = client.get("/api/video?id=abc")
+    assert r.status_code == 200
+    assert r.headers["accept-ranges"] == "bytes"
+    assert r.headers["content-type"] == "video/mp4"
+
+
+def test_video_range_request_returns_206_partial(client, tmp_path):
+    import api
+    data = bytes(range(256)) * 8  # 2048 bytes
+    vid = tmp_path / "clip.mp4"
+    vid.write_bytes(data)
+    with patch("api._resolve_indexed_path", return_value=str(vid)):
+        r = client.get("/api/video?id=abc", headers={"Range": "bytes=10-19"})
+    assert r.status_code == 206
+    assert r.headers["content-range"] == f"bytes 10-19/{len(data)}"
+    assert r.headers["content-length"] == "10"
+    assert r.content == data[10:20]
+
+
+def test_video_404_when_not_indexed(client):
+    with patch("api._resolve_indexed_path", return_value=None):
+        r = client.get("/api/video?id=nope")
+    assert r.status_code == 404
+
+
+def test_timeline_card_carries_media_type(client):
+    catalog = {"images": {
+        "vid1": {"path": "/x/movie.mp4", "filename": "movie.mp4",
+                 "media_type": "video", "duration_s": 12.5,
+                 "metadata": {"date": "2023:06:01 10:00:00"}, "created_at": 1},
+        "pic1": {"path": "/x/photo.jpg", "filename": "photo.jpg",
+                 "media_type": "image", "metadata": {"date": "2023:06:02 10:00:00"},
+                 "created_at": 2},
+    }}
+    with patch("api.load_catalog_cached", return_value=catalog):
+        r = client.get("/api/timeline?year=2023")
+    assert r.status_code == 200
+    cards = {c["id"]: c for c in r.json()["photos"]}
+    assert cards["vid1"]["media_type"] == "video"
+    assert cards["vid1"]["duration_s"] == 12.5
+    assert cards["pic1"]["media_type"] == "image"

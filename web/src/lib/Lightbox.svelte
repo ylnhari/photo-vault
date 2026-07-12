@@ -1,5 +1,5 @@
 <script>
-  import { api } from "./api.js";
+  import { api, fmtDuration } from "./api.js";
   import { createEventDispatcher, onMount, onDestroy } from "svelte";
   import { onActivateKey } from "./keyboard.js";
 
@@ -128,6 +128,7 @@
 
   $: gps = meta && meta.gps_lat != null && meta.gps_lon != null
     ? { lat: meta.gps_lat, lon: meta.gps_lon } : null;
+  $: isVideo = !!meta && meta.media_type === "video";
 </script>
 
 <div class="overlay" on:click|self={close} role="presentation">
@@ -146,12 +147,26 @@
     <div class="content">
       <div class="imgwrap">
         {#key currentId}
-          <img src={api.mediumUrl(currentId)} alt="" decoding="async" />
+          {#if isVideo}
+            <!-- Streamed via /api/video (HTTP range → seekable). Poster is the
+                 same frame the grid shows so it doesn't flash black before play. -->
+            <video src={api.videoUrl(currentId)} poster={api.thumbUrl(currentId)}
+                   controls autoplay playsinline preload="metadata">
+              <track kind="captions" />
+            </video>
+          {:else}
+            <img src={api.mediumUrl(currentId)} alt="" decoding="async" />
+          {/if}
         {/key}
       </div>
       <div class="side col">
         {#if err}<p style="color:var(--danger)">{err}</p>{/if}
         {#if meta}
+          {#if isVideo}
+            <div><span class="muted">Type:</span> Video</div>
+            {#if meta.duration_s}<div><span class="muted">Duration:</span> {fmtDuration(meta.duration_s)}</div>{/if}
+            {#if meta.width && meta.height}<div><span class="muted">Resolution:</span> {meta.width}×{meta.height}</div>{/if}
+          {/if}
           {#each ATTRS as [k, label]}
             {#if meta[k] && meta[k] !== "unknown"}
               <div><span class="muted">{label}:</span> {meta[k]}</div>
@@ -258,7 +273,7 @@
     color: var(--muted); background: var(--surface2); padding: 2px 8px; border-radius: 10px; }
   .content { display: grid; grid-template-columns: 1.6fr 1fr; gap: 0; max-height: 90vh; }
   .imgwrap { background: #000; display: flex; align-items: center; justify-content: center; }
-  .imgwrap img { max-width: 100%; max-height: 90vh; object-fit: contain; }
+  .imgwrap img, .imgwrap video { max-width: 100%; max-height: 90vh; object-fit: contain; }
   /* Extra top padding keeps the first metadata line clear of the ✕ button.
      max-height must be set here (not just inherited from .content/.box) —
      otherwise the grid row stretches to the panel's full content height and

@@ -52,6 +52,51 @@ _PROMPT = (
 # original "objects" field.
 _LIST_KEYS = ("objects", "animals", "vehicles", "food_items", "activities", "dominant_colors")
 
+# The JSON-schema portion of _PROMPT (everything from the first "{"), reused by
+# the video prompt so photos and videos share one attribute schema.
+_SCHEMA_BLOCK = _PROMPT[_PROMPT.index("{"):]
+
+
+def _video_prompt(n_frames: int, transcript: str = "") -> str:
+    """Prompt for whole-VIDEO understanding from N chronological frames (+ an
+    optional speech transcript). Asks the model to reason across the frames as
+    one clip — motion/activity/evolution — not caption each frame in isolation.
+    Same output schema as photos so everything downstream is identical."""
+    speech = ""
+    if transcript:
+        speech = (
+            " The spoken words in this video (auto-transcribed) are:\n"
+            f'"""{transcript[:1500]}"""\n'
+            "Use the speech to inform the caption, occasion, mood and activities "
+            "(e.g. a birthday song → occasion=birthday)."
+        )
+    return (
+        f"You are analyzing a VIDEO, provided as {n_frames} still frames sampled "
+        "in chronological order (frame 1 = earliest, last frame = latest). Reason "
+        "across ALL the frames together as a single clip — the activity, how the "
+        "scene and people evolve over time — NOT each frame separately." + speech +
+        " Respond ONLY with valid JSON (no markdown, no explanation) describing "
+        "the video as a whole, using these exact keys and allowed values:\n"
+        + _SCHEMA_BLOCK
+    )
+
+
+def encode_image_bytes(data: bytes, max_size=(1024, 1024)):
+    """Base64-encode an in-memory JPEG (a video keyframe), resized like
+    encode_image so a multi-frame prompt stays a sane payload size."""
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img = ImageOps.exif_transpose(img)
+            img.thumbnail(max_size)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG")
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception as e:
+        print(f"[vision] encode(bytes) error: {e}")
+        return None
+
 _lm_client = None
 
 
@@ -723,6 +768,164 @@ def get_image_caption(
                     json.dumps({"error": f"LM Studio offline; Gemini failed: {ge}"}),
                     "error",
                 )
+        return _ret(json.dumps({"error": str(e)}), "error")
+
+
+def _oai_video_content(prompt: str, frames_b64: list[str]) -> list[dict]:
+    """OpenAI-style multimodal message content: the prompt + one image part per
+    frame (used by both LM Studio and 9Router, which share the OpenAI SDK)."""
+    return [{"type": "text", "text": prompt}] + [
+        {"type": "image_url",
+         "image_url": {"url": f"data:image/jpeg;base64,{b}"}}
+        for b in frames_b64
+    ]
+
+
+def _call_lm_studio_video(frames_b64: list[str], prompt: str, model: str = None) -> str:
+    client = _get_lm_client()
+
+    def _one(max_tok):
+        ratelimit.acquire("lm_studio")
+        response = client.chat.completions.create(
+            model=model or "vision-model",
+            messages=[{"role": "user", "content": _oai_video_content(prompt, frames_b64)}],
+            max_tokens=max_tok,
+        )
+        choice = response.choices[0]
+        return choice.message.content.strip(), choice.finish_reason
+
+    return _caption_with_escalation(_one, "LM Studio (video)")
+
+
+def _call_9router_video(frames_b64: list[str], prompt: str, model: str) -> tuple[str, str]:
+    if not model:
+        raise ValueError("9Router requires an explicit vision model id")
+    if _9r_cooldown.get(model, 0) > time.time():
+        raise RuntimeError(f"9Router model {model} in post-429 cooldown — skipping")
+    client = _get_9router_client()
+    served = {"model": None}
+
+    def _one(max_tok):
+        ratelimit.acquire("9router")
+        try:
+            response = client.chat.completions.create(
+                model=model, stream=False,
+                messages=[{"role": "user", "content": _oai_video_content(prompt, frames_b64)}],
+                max_tokens=max_tok,
+            )
+        except Exception as e:
+            if "429" in str(e):
+                _9r_cooldown[model] = time.time() + _RATE_LIMIT_COOLDOWN_SEC
+            raise
+        served["model"] = getattr(response, "model", None)
+        choice = response.choices[0]
+        return choice.message.content.strip(), choice.finish_reason
+
+    text = _caption_with_escalation(_one, f"9Router:{model} (video)")
+    s = served["model"]
+    used = model if (not s or s in model) else s
+    return text, used
+
+
+def _call_gemini_video(frames_b64: list[str], prompt: str, model: str = None) -> tuple[str, str]:
+    def _payload(max_tok):
+        parts = [{"text": prompt}] + [
+            {"inline_data": {"mime_type": "image/jpeg", "data": b}} for b in frames_b64
+        ]
+        return json.dumps({
+            "contents": [{"parts": parts}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": max_tok,
+                                 "response_mime_type": "application/json"},
+        }).encode("utf-8")
+
+    candidates = ([model] + [m for m in GEMINI_VISION_MODELS if m != model]) if model else list(GEMINI_VISION_MODELS)
+    now = time.time()
+    candidates = [m for m in candidates if _gemini_cooldown.get(m, 0) <= now] or candidates
+    last_err = None
+    for m in candidates:
+        def _one(max_tok, _m=m):
+            ratelimit.acquire("gemini")
+            url = f"{GEMINI_BASE}/models/{_m}:generateContent?key={GEMINI_API_KEY}"
+            req = urllib.request.Request(url, data=_payload(max_tok),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                result = json.loads(r.read())
+            cand = result["candidates"][0]
+            parts = cand.get("content", {}).get("parts", [])
+            return (parts[0]["text"].strip() if parts else ""), cand.get("finishReason")
+        try:
+            return _caption_with_escalation(_one, f"gemini:{m} (video)"), m
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 404, 503):
+                if e.code == 429:
+                    _mark_rate_limited(m, e.headers.get("Retry-After") if e.headers else None)
+                last_err = e
+                continue
+            raise
+        except ratelimit.Cancelled:
+            raise
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err or RuntimeError("all Gemini vision models failed for video")
+
+
+def get_video_caption(frame_bytes: list[bytes], transcript: str = "",
+                      force_provider: str = "auto", with_model: bool = False,
+                      model: str = None):
+    """Caption a whole VIDEO in ONE multimodal call: all sampled keyframes sent
+    together (temporal reasoning) plus the optional speech transcript. Same
+    schema + provider selection as get_image_caption — provider is the user's
+    choice ('auto' | 'lm_studio' | 'gemini' | '9router'), never forced local.
+    Returns caption JSON (str) or (caption, model_label) when with_model."""
+    def _ret(text, label):
+        return (text, label) if with_model else text
+
+    frames_b64 = [b for b in (encode_image_bytes(d) for d in frame_bytes) if b]
+    if not frames_b64:
+        return _ret(json.dumps({"error": "no encodable frames"}), "error")
+    prompt = _video_prompt(len(frames_b64), transcript)
+
+    if force_provider == "9router":
+        try:
+            text, used = _call_9router_video(frames_b64, prompt, model)
+            return _ret(text, f"9router:{used}")
+        except ratelimit.Cancelled:
+            raise
+        except Exception as e:
+            return _ret(json.dumps({"error": f"9Router failed: {e}"}), "error")
+    if force_provider == "gemini":
+        try:
+            text, used = _call_gemini_video(frames_b64, prompt, model)
+            return _ret(text, f"gemini:{used}")
+        except ratelimit.Cancelled:
+            raise
+        except Exception as e:
+            return _ret(json.dumps({"error": f"Gemini failed: {e}"}), "error")
+    if force_provider == "lm_studio":
+        try:
+            label = f"lm_studio:{model}" if model else _lm_model_id()
+            return _ret(_call_lm_studio_video(frames_b64, prompt, model), label)
+        except ratelimit.Cancelled:
+            raise
+        except Exception as e:
+            return _ret(json.dumps({"error": f"LM Studio failed: {e}"}), "error")
+
+    # auto: LM Studio first, Gemini on connection failure (mirrors photos)
+    try:
+        label = f"lm_studio:{model}" if model else _lm_model_id()
+        return _ret(_call_lm_studio_video(frames_b64, prompt, model), label)
+    except ratelimit.Cancelled:
+        raise
+    except Exception as e:
+        if _is_connection_error(e):
+            try:
+                text, used = _call_gemini_video(frames_b64, prompt)
+                return _ret(text, f"gemini:{used}")
+            except ratelimit.Cancelled:
+                raise
+            except Exception as ge:
+                return _ret(json.dumps({"error": f"LM Studio offline; Gemini failed: {ge}"}), "error")
         return _ret(json.dumps({"error": str(e)}), "error")
 
 

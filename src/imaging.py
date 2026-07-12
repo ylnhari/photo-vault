@@ -60,11 +60,27 @@ def legacy_derivative_path(img_id: str, suffix: str = "") -> str:
 
 
 def ensure_derivative(src_path: str, out_path: str, max_px: int) -> bool:
-    """Generate a downscaled WebP derivative if missing. False on failure."""
+    """Generate a downscaled WebP derivative if missing. False on failure.
+
+    For a video source there is no still to decode, so we first pull a poster
+    frame via ffmpeg into a temp JPEG and downscale that — the grid/lightbox
+    thumbnail of a video is its poster frame. Same call site works for both
+    media types, so nothing above here special-cases video thumbnails."""
     if os.path.exists(out_path):
         return True
+    tmp_poster = None
     try:
-        with safe_open(src_path) as im:
+        from scanner import is_video_path
+        actual_src = src_path
+        if is_video_path(src_path):
+            import tempfile
+            import video
+            fd, tmp_poster = tempfile.mkstemp(suffix=".jpg", prefix="pv_poster_")
+            os.close(fd)
+            if not video.poster_frame(src_path, tmp_poster):
+                return False
+            actual_src = tmp_poster
+        with safe_open(actual_src) as im:
             # Bake the EXIF orientation into the pixels now — the source's
             # rotation tag doesn't survive into the resized WebP otherwise,
             # so a portrait photo shot with a rotated sensor would render
@@ -77,3 +93,9 @@ def ensure_derivative(src_path: str, out_path: str, max_px: int) -> bool:
     except Exception as e:
         print(f"[imaging] derivative ({max_px}px) failed for {src_path}: {e}")
         return False
+    finally:
+        if tmp_poster and os.path.exists(tmp_poster):
+            try:
+                os.remove(tmp_poster)
+            except OSError:
+                pass

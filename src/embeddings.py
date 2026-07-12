@@ -75,13 +75,36 @@ def _load_registry() -> dict:
 
 def _save_registry(reg: dict):
     """Atomic write: a crash/kill mid-write must never leave a truncated
-    registry file that _load_registry then fails to parse."""
+    registry file that _load_registry then fails to parse.
+
+    On Windows, os.replace raises PermissionError (WinError 5/32) when another
+    process momentarily holds the destination open — the UI polls endpoints
+    that READ this file (/api/models, /api/provider-models) while an embed job
+    rewrites it, and Windows opens the reader's handle without FILE_SHARE_DELETE,
+    so the replace hits a sharing violation. That's transient, not a real
+    failure, so retry the replace briefly before giving up (a whole embed job
+    was aborted by exactly this race)."""
     d = os.path.dirname(EMBEDDING_REGISTRY_PATH) or "."
     os.makedirs(d, exist_ok=True)
     tmp_path = f"{EMBEDDING_REGISTRY_PATH}.tmp"
     with open(tmp_path, "w") as f:
         json.dump(reg, f, indent=2)
-    os.replace(tmp_path, EMBEDDING_REGISTRY_PATH)
+    last_err = None
+    for attempt in range(12):
+        try:
+            os.replace(tmp_path, EMBEDDING_REGISTRY_PATH)
+            return
+        except PermissionError as e:  # transient Windows sharing violation
+            last_err = e
+            _time.sleep(0.05 * (attempt + 1))  # ~0.05..0.6s, ~3.9s total
+    # Exhausted retries — remove the temp so we don't leak .tmp files, then
+    # re-raise so the caller counts a real failure instead of silently losing
+    # the update.
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        pass
+    raise last_err
 
 
 # Guards the load-modify-save sequence in register_model/set_active_model — the
@@ -95,13 +118,23 @@ def register_model(source: str, model_name: str, dimension: int):
     with _registry_lock:
         reg = _load_registry()
         existing = reg["models"].get(model_name)
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        # Only persist to disk when something worth persisting actually changed.
+        # register_model runs on EVERY embed, and a per-image rewrite just to
+        # advance a seconds-resolution last_used is pure churn — 24k disk writes
+        # for a timestamp — and every one of those writes is a chance to lose
+        # the Windows os.replace sharing-violation race above. So touch
+        # last_used at day granularity only.
+        changed = False
         if existing is None:
             reg["models"][model_name] = {
                 "source": source,
                 "dimension": dimension,
                 "collection": collection_name_for(model_name),
-                "first_used": datetime.now().isoformat(timespec="seconds"),
+                "first_used": now_iso,
+                "last_used": now_iso,
             }
+            changed = True
             print(
                 f"[embeddings] Registered new model: {model_name} ({source}, {dimension}d)"
             )
@@ -120,13 +153,19 @@ def register_model(source: str, model_name: str, dimension: int):
                 "sizes in one collection would corrupt search results; "
                 "re-index required (use a fresh model name/collection)."
             )
-        reg["models"].setdefault(model_name, {})["last_used"] = datetime.now().isoformat(
-            timespec="seconds"
-        )
+        else:
+            # Existing, same-dimension model: bump last_used only when the
+            # calendar day advanced, not on every image.
+            prev = existing.get("last_used", "")
+            if prev[:10] != now_iso[:10]:
+                existing["last_used"] = now_iso
+                changed = True
         if reg["active_model"] is None:
             reg["active_model"] = model_name
+            changed = True
             print(f"[embeddings] Active model set to: {model_name}")
-        _save_registry(reg)
+        if changed:
+            _save_registry(reg)
 
 
 def get_registry() -> dict:

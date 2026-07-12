@@ -1,4 +1,5 @@
 import insightface
+import onnxruntime as ort
 import numpy as np
 import cv2
 import os
@@ -7,21 +8,206 @@ from PIL import Image, ImageOps
 
 import db
 import catalog_db
-from constants import FACE_DIR, SIMILARITY_THRESHOLD, IMAGE_CATALOG_PATH
+import settings as settings_mod
+from constants import FACE_DIR, SIMILARITY_THRESHOLD, IMAGE_CATALOG_PATH, DATA_DIR
 
 os.makedirs(FACE_DIR, exist_ok=True)
 
-# CPU + GPU fallback — ONNX picks best available provider automatically
+# Optional Intel GPU/NPU acceleration: if the OpenVINO runtime is installed
+# (`openvino` package, an opt-in extra — see README), importing it HERE, before
+# any onnxruntime InferenceSession is built, registers its DLL directory so
+# onnxruntime's OpenVINO execution-provider bridge can load openvino.dll. It's a
+# harmless no-op when OpenVINO isn't installed (the CPU-only default). This must
+# run before _get_app(); onnxruntime resolves the provider DLL's dependencies at
+# session-creation time, not import time.
+try:
+    import openvino as _openvino  # noqa: F401
+except Exception:
+    _openvino = None
+
+# OpenVINO compiles each model for the target device on first use (tens of
+# seconds for GPU/NPU); a persistent cache turns that into a one-time cost.
+_OV_CACHE_DIR = os.path.join(DATA_DIR, "ov_cache")
+
+# ── Execution-provider (accelerator) selection ───────────────────────────────
+# Face detection runs on whatever execution providers the INSTALLED onnxruntime
+# wheel exposes — which varies by machine (plain CPU wheel, onnxruntime-gpu,
+# onnxruntime-directml, onnxruntime-openvino, …). We don't hardcode a provider
+# anymore: we enumerate what's actually available at runtime (ort.get_available_
+# providers() + OpenVINO's own device list) and let the user pick one in
+# Settings → "face_provider". Whatever they pick, CPU is always appended as a
+# guaranteed fallback so an unavailable/failed accelerator degrades instead of
+# crashing the faces job. See available_accelerators() for the option list the
+# UI renders and _resolve_providers() for choice → onnxruntime args.
+
+# Raw EPs that are never offered as a user choice: Azure is a cloud model-serving
+# EP (not a local accelerator), and TensorRT needs an engine-build step
+# InsightFace doesn't perform. Everything else the wheel reports is fair game.
+_HIDDEN_PROVIDERS = {"AzureExecutionProvider", "TensorrtExecutionProvider"}
+
+# Friendly labels for OpenVINO physical devices (it exposes ONE onnxruntime EP
+# but several devices — iGPU / NPU / CPU — each of which we surface separately).
+_OPENVINO_DEVICE_LABELS = {
+    "GPU": "Intel GPU (OpenVINO)",
+    "NPU": "Intel NPU (OpenVINO)",
+    "CPU": "CPU (OpenVINO)",
+    "AUTO": "OpenVINO Auto-select",
+}
+
+
+def _openvino_devices():
+    """Physical OpenVINO devices (e.g. ['CPU','GPU','NPU']). [] when OpenVINO
+    isn't installed or can't enumerate — callers treat that as 'no OpenVINO'."""
+    try:
+        import openvino as ov  # only present with onnxruntime-openvino / openvino
+        return list(ov.Core().available_devices)
+    except Exception:
+        return []
+
+
+def available_accelerators():
+    """The accelerators a user can choose for face detection, derived from the
+    installed onnxruntime build + OpenVINO device list. Always starts with
+    'auto' and always includes 'cpu' (the guaranteed fallback). Each entry:
+    {id, label, provider, device}. Pure detection — no 'selected'/'active'
+    state (the API layer adds that)."""
+    eps = set(ort.get_available_providers())
+    opts = [{"id": "auto", "label": "Auto (fastest available)",
+             "provider": None, "device": None}]
+    if "OpenVINOExecutionProvider" in eps:
+        for dev in _openvino_devices():
+            base = dev.split(".")[0]  # 'GPU.0' → 'GPU'
+            opts.append({
+                "id": f"openvino:{dev}",
+                "label": _OPENVINO_DEVICE_LABELS.get(base, f"OpenVINO {dev}"),
+                "provider": "OpenVINOExecutionProvider", "device": dev,
+            })
+    if "CUDAExecutionProvider" in eps:
+        opts.append({"id": "cuda", "label": "NVIDIA GPU (CUDA)",
+                     "provider": "CUDAExecutionProvider", "device": None})
+    if "DmlExecutionProvider" in eps:
+        opts.append({"id": "dml", "label": "GPU (DirectML)",
+                     "provider": "DmlExecutionProvider", "device": None})
+    # Any other real EP the wheel exposes (e.g. ROCm) — offer it generically so
+    # detection stays future-proof rather than silently dropping it.
+    known = {"OpenVINOExecutionProvider", "CUDAExecutionProvider",
+             "DmlExecutionProvider", "CPUExecutionProvider"} | _HIDDEN_PROVIDERS
+    for ep in ort.get_available_providers():
+        if ep not in known:
+            opts.append({"id": ep, "label": ep.replace("ExecutionProvider", ""),
+                         "provider": ep, "device": None})
+    opts.append({"id": "cpu", "label": "CPU",
+                 "provider": "CPUExecutionProvider", "device": None})
+    return opts
+
+
+_CPU = "CPUExecutionProvider"
+
+
+def _auto_choice():
+    """Best available accelerator id for 'auto': a dedicated NVIDIA GPU first,
+    then the Intel NPU, then DirectML, then the Intel iGPU, else CPU.
+
+    The NPU outranks the iGPU here on purpose: on Intel Core Ultra hardware the
+    NPU (AI Boost) is purpose-built for sustained CNN inference and measured
+    ~14× faster than CPU for InsightFace detection, while the integrated GPU was
+    actually SLOWER than CPU for these small models (kernel-launch/transfer
+    overhead dominates, plus a long first-run compile). OpenVINO handles the
+    FP32 models fine on the NPU. A machine where the iGPU wins can still pick it
+    explicitly in Settings."""
+    accels = {a["id"]: a for a in available_accelerators()}
+    ov = "OpenVINOExecutionProvider" in ort.get_available_providers()
+    ov_devs = _openvino_devices()
+    if "cuda" in accels:
+        return "cuda"
+    if ov and "NPU" in ov_devs:
+        return "openvino:NPU"
+    if "dml" in accels:
+        return "dml"
+    if ov and "GPU" in ov_devs:
+        return "openvino:GPU"
+    return "cpu"
+
+
+def _resolve_providers(choice):
+    """Map a saved face_provider id → (providers, provider_options) for
+    onnxruntime, always ending in CPU as a guaranteed fallback. Unknown or
+    unavailable choices degrade to CPU rather than raising."""
+    if not choice or choice == "auto":
+        choice = _auto_choice()
+    eps = set(ort.get_available_providers())
+    if choice.startswith("openvino:") and "OpenVINOExecutionProvider" in eps:
+        dev = choice.split(":", 1)[1]
+        if dev in _openvino_devices():
+            try:
+                os.makedirs(_OV_CACHE_DIR, exist_ok=True)
+            except OSError:
+                pass
+            return (["OpenVINOExecutionProvider", _CPU],
+                    [{"device_type": dev, "cache_dir": _OV_CACHE_DIR}, {}])
+    elif choice == "cuda" and "CUDAExecutionProvider" in eps:
+        return (["CUDAExecutionProvider", _CPU], [{}, {}])
+    elif choice == "dml" and "DmlExecutionProvider" in eps:
+        return (["DmlExecutionProvider", _CPU], [{}, {}])
+    elif choice not in ("cpu", "auto") and choice in eps:
+        return ([choice, _CPU], [{}, {}])
+    return ([_CPU], [{}])
+
+
+def resolved_provider_label(choice=None):
+    """Human-readable name of the accelerator a given choice (default: the
+    saved setting) would actually run on — for the UI to show without paying
+    the cost of building the model. Reflects fallback: an unavailable choice
+    reports 'CPU'."""
+    if choice is None:
+        choice = settings_mod.load().get("face_provider", "auto")
+    providers, options = _resolve_providers(choice)
+    primary = providers[0]
+    if primary == "OpenVINOExecutionProvider":
+        dev = options[0].get("device_type", "")
+        return _OPENVINO_DEVICE_LABELS.get(dev.split(".")[0], f"OpenVINO {dev}")
+    for a in available_accelerators():
+        if a["provider"] == primary and a["device"] is None:
+            return a["label"]
+    return primary.replace("ExecutionProvider", "")
+
+
+# The built FaceAnalysis app is cached, keyed by the accelerator choice it was
+# built with — if the user changes face_provider, _get_app() rebuilds on the
+# next call instead of serving a stale session on the old device.
 _face_app = None
+_face_app_choice = None
+
+
+def reset_face_app():
+    """Drop the cached model so the next _get_app() rebuilds (e.g. after the
+    accelerator setting changed)."""
+    global _face_app, _face_app_choice
+    _face_app = None
+    _face_app_choice = None
+
 
 def _get_app():
-    global _face_app
-    if _face_app is None:
-        _face_app = insightface.app.FaceAnalysis(
-            name='buffalo_l',
-            providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
-        )
-        _face_app.prepare(ctx_id=0, det_size=(640, 640))
+    global _face_app, _face_app_choice
+    desired = settings_mod.load().get("face_provider", "auto")
+    if _face_app is not None and _face_app_choice == desired:
+        return _face_app
+    providers, provider_options = _resolve_providers(desired)
+    app = insightface.app.FaceAnalysis(
+        name='buffalo_l',
+        providers=providers,
+        provider_options=provider_options,
+    )
+    # ctx_id=0 targets the first accelerator device; onnxruntime still honors
+    # the providers list above, so a CPU-only resolution runs on CPU regardless.
+    app.prepare(ctx_id=0, det_size=(640, 640))
+    _face_app = app
+    _face_app_choice = desired
+    try:
+        actual = app.models[next(iter(app.models))].session.get_providers()
+        print(f"[faces] face detection running on: {actual} (choice={desired!r})")
+    except Exception:
+        pass
     return _face_app
 
 
@@ -112,6 +298,62 @@ def detect_and_embed_faces(image_path):
         print(f"Face detection error {image_path}: {e}")
         return []
     return [{"bbox": f.bbox.tolist(), "embedding": f.embedding.tolist()} for f in faces]
+
+# Within-video face grouping threshold (cosine similarity of embeddings). Lower
+# than the person-search SIMILARITY_THRESHOLD on purpose: within one clip we want
+# to MERGE the same person seen across frames/angles (so the per-video face set
+# reflects distinct PEOPLE, not raw detections), and merging a bit too eagerly is
+# safer here than splitting one person into several.
+VIDEO_FACE_GROUP_SIM = 0.45
+
+
+def _bbox_area(face: dict) -> float:
+    b = face.get("bbox") or [0, 0, 0, 0]
+    try:
+        return max(0.0, (b[2] - b[0])) * max(0.0, (b[3] - b[1]))
+    except Exception:
+        return 0.0
+
+
+def group_faces(faces: list[dict], threshold: float = VIDEO_FACE_GROUP_SIM) -> list[dict]:
+    """Collapse many face detections (e.g. the same people across a video's
+    keyframes) into ONE representative per distinct person, by greedily
+    clustering on embedding cosine similarity. The representative is the
+    largest-bbox detection in each group (usually the sharpest, most frontal).
+    This is the sparse-keyframe stand-in for face tracking: it turns 'N raw
+    detections' into 'the distinct people in this clip'. Faces without a usable
+    embedding are dropped."""
+    valid = [f for f in faces if f.get("embedding")]
+    if len(valid) <= 1:
+        return valid
+    embs = np.array([f["embedding"] for f in valid], dtype="float32")
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    unit = embs / norms
+
+    groups: list[dict] = []  # {"members": [idx...], "centroid": unit-vector}
+    for i in range(len(valid)):
+        v = unit[i]
+        best_sim, best_g = -1.0, -1
+        for gi, g in enumerate(groups):
+            sim = float(np.dot(v, g["centroid"]))
+            if sim > best_sim:
+                best_sim, best_g = sim, gi
+        if best_g >= 0 and best_sim >= threshold:
+            g = groups[best_g]
+            g["members"].append(i)
+            m = unit[g["members"]].mean(axis=0)
+            n = np.linalg.norm(m) or 1.0
+            g["centroid"] = m / n
+        else:
+            groups.append({"members": [i], "centroid": v})
+
+    reps = []
+    for g in groups:
+        members = [valid[i] for i in g["members"]]
+        reps.append(max(members, key=_bbox_area))
+    return reps
+
 
 def save_face_data(image_id, face_data):
     face_file = os.path.join(FACE_DIR, f"{image_id}.json")

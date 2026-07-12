@@ -14,6 +14,19 @@ from constants import IMAGE_CATALOG_PATH, FACE_DIR, THUMB_DIR
 
 RICH_ATTRIBUTES = ["weather", "occasion", "location_type", "scene", "mood"]
 
+_VIDEO_EXTS = {'.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm',
+               '.3gp', '.mts', '.m2ts', '.wmv'}
+
+
+def is_video(data: dict) -> bool:
+    """True for a video catalog row. Trusts the media_type tag scanner writes,
+    falling back to the file extension so rows catalogued before video support
+    (no media_type key) are still classified correctly."""
+    mt = data.get("media_type")
+    if mt:
+        return mt == "video"
+    return os.path.splitext(data.get("path", ""))[1].lower() in _VIDEO_EXTS
+
 
 def _caption_has_error(text: str) -> bool:
     try:
@@ -30,6 +43,83 @@ def _record_caption_history(img_data: dict, model: str, text: str):
     img_data["caption_history"] = hist
     img_data["caption_json"] = text
     img_data["caption_model"] = model
+
+
+def _aggregate_video_captions(caption_jsons: list[str]) -> str:
+    """Fold several per-keyframe caption JSONs into one video-level caption JSON
+    with the same schema, so everything downstream (parse_vision_attributes,
+    build_embedding_text, the search index) treats a video exactly like a photo.
+
+    Scalar attributes take a majority vote across frames (ignoring 'unknown'/
+    empty); objects are unioned; the representative caption is the longest single
+    frame caption (usually the most descriptive). One vector per video."""
+    from collections import Counter
+    # Read the RAW frame JSON (not parse_vision_attributes, which joins list
+    # fields like objects into strings) so unions stay list-shaped. The merged
+    # output is emitted as raw JSON in the same schema, so the normal
+    # parse_vision_attributes downstream handles it identically to a photo.
+    raws = []
+    for c in caption_jsons:
+        try:
+            raws.append(json.loads(c))
+        except Exception:
+            pass
+    if not raws:
+        raws = [{}]
+    merged = parse_vision_attributes("{}")  # full-schema skeleton (all keys present)
+
+    def vote(key: str):
+        vals = [str(r.get(key)) for r in raws
+                if r.get(key) not in (None, "", "unknown")]
+        return Counter(vals).most_common(1)[0][0] if vals else "unknown"
+
+    for key in ("scene", "location_type", "weather", "season", "time_of_day",
+                "occasion", "group_size", "clothing_style", "mood"):
+        merged[key] = vote(key)
+
+    caps = [r.get("caption", "") for r in raws if r.get("caption")]
+    merged["caption"] = max(caps, key=len) if caps else ""
+
+    peeps = [r.get("people_description", "") for r in raws if r.get("people_description")]
+    merged["people_description"] = max(peeps, key=len) if peeps else ""
+
+    # objects: union across frames, order-preserving, capped. Emit as a LIST so
+    # downstream parse_vision_attributes stringifies it consistently.
+    seen, objs = set(), []
+    for r in raws:
+        for o in (r.get("objects") or []):
+            k = str(o).lower().strip()
+            if k and k not in seen:
+                seen.add(k)
+                objs.append(str(o).strip())
+    merged["objects"] = objs[:20]
+
+    fests = [r.get("festival_name", "") for r in raws if r.get("festival_name")]
+    merged["festival_name"] = fests[0] if fests else ""
+    merged["person_count"] = max((r.get("person_count", 0) or 0) for r in raws)
+
+    return json.dumps(merged)
+
+
+def _attach_transcript(caption_json: str, transcript: str, language: str = None) -> str:
+    """Fold a video's speech transcript into its caption JSON so it's both
+    stored (a `transcript` field, kept in the raw JSON) AND searchable (a short
+    snippet appended to `caption`, which is what gets embedded — parse_vision_
+    attributes drops unknown keys, so speech has to ride along in `caption` to
+    reach the vector). No-op when there's no transcript."""
+    if not transcript:
+        return caption_json
+    try:
+        d = json.loads(caption_json)
+    except Exception:
+        return caption_json
+    d["transcript"] = transcript
+    if language:
+        d["transcript_language"] = language
+    snippet = transcript if len(transcript) <= 400 else transcript[:400] + "…"
+    base = (d.get("caption") or "").rstrip()
+    d["caption"] = (f"{base} Spoken words: {snippet}").strip()
+    return json.dumps(d)
 
 
 def _path_under(path: str, folder: str) -> bool:
@@ -258,11 +348,15 @@ class Indexer:
     # ── Gap detection ─────────────────────────────────────────────────────────
 
     def get_missing(self) -> list[tuple]:
+        """Photos not yet in the active collection (drives the 'full index' job,
+        which captions+embeds each item with the still-image pipeline). Videos
+        are excluded — they have their own keyframe caption job (video_vision)
+        and would otherwise be fed a video file where an image is expected."""
         existing_ids = set(self._collection().get()["ids"])
         return [
             (img_id, img_data)
             for img_id, img_data in self.image_catalog["images"].items()
-            if img_id not in existing_ids
+            if img_id not in existing_ids and not is_video(img_data)
         ]
 
     def get_missing_attributes(self) -> list[tuple]:
@@ -313,19 +407,34 @@ class Indexer:
         return os.path.exists(os.path.join(FACE_DIR, f"{img_id}.json"))
 
     def get_faces_pending(self) -> list[tuple]:
-        """Images that have not yet had face detection run (no face JSON file)."""
+        """Images that have not yet had face detection run (no face JSON file).
+        Videos are excluded here — face detection on a video runs over sampled
+        keyframes via the separate video_faces job, not by handing a video file
+        to the still-image detector."""
         have = self._face_data_ids()
         return [
             (img_id, data)
             for img_id, data in self.image_catalog.get("images", {}).items()
-            if img_id not in have
+            if img_id not in have and not is_video(data)
         ]
 
     def get_faces_stats(self) -> dict:
+        """Photo face-detection progress. Videos are counted separately
+        (get_video_faces_stats) since they run through the keyframe face job,
+        so they must not inflate the photo 'pending' count forever."""
         catalog = self.image_catalog.get("images", {})
-        total = len(catalog)
         have = self._face_data_ids()
-        detected = sum(1 for img_id in catalog if img_id in have)
+        photo_ids = [i for i, d in catalog.items() if not is_video(d)]
+        total = len(photo_ids)
+        detected = sum(1 for i in photo_ids if i in have)
+        return {"total": total, "detected": detected, "pending": total - detected}
+
+    def get_video_faces_stats(self) -> dict:
+        catalog = self.image_catalog.get("images", {})
+        have = self._face_data_ids()
+        vid_ids = [i for i, d in catalog.items() if is_video(d)]
+        total = len(vid_ids)
+        detected = sum(1 for i in vid_ids if i in have)
         return {"total": total, "detected": detected, "pending": total - detected}
 
     def detect_faces_one(self, img_id: str) -> str:
@@ -385,22 +494,43 @@ class Indexer:
         return "thumb:ok"
 
     def get_vision_pending(self) -> list[tuple]:
-        """Images that have not yet been through any vision analysis."""
+        """Still images not yet through any vision analysis. Videos are excluded
+        (captioned by the keyframe-based video_vision job); the still-image
+        caption path can't read a video container."""
         return [
             (img_id, img_data)
             for img_id, img_data in self.image_catalog["images"].items()
-            if not img_data.get("caption_json")
+            if not img_data.get("caption_json") and not is_video(img_data)
         ]
 
     def get_vision_pending_for_model(self, model_label: str) -> list[tuple]:
-        """Images that have not yet been captioned by the given model label."""
+        """Still images not yet captioned by the given model label (videos
+        excluded — see get_vision_pending)."""
         return [
             (img_id, img_data)
             for img_id, img_data in self.image_catalog["images"].items()
-            if not any(
+            if not is_video(img_data) and not any(
                 h.get("model") == model_label
                 for h in img_data.get("caption_history", [])
             )
+        ]
+
+    def get_video_vision_pending(self) -> list[tuple]:
+        """Videos not yet captioned (keyframe-aggregate caption). Mirror of
+        get_vision_pending for the video_vision job."""
+        return [
+            (img_id, img_data)
+            for img_id, img_data in self.image_catalog["images"].items()
+            if is_video(img_data) and not img_data.get("caption_json")
+        ]
+
+    def get_video_faces_pending(self) -> list[tuple]:
+        """Videos not yet run through keyframe face detection."""
+        have = self._face_data_ids()
+        return [
+            (img_id, data)
+            for img_id, data in self.image_catalog.get("images", {}).items()
+            if is_video(data) and img_id not in have
         ]
 
     def get_embed_eligible_ids(self, caption_source_model: str = None) -> set[str]:
@@ -460,7 +590,16 @@ class Indexer:
 
     def get_stage_stats(self) -> dict:
         catalog = self.image_catalog.get("images", {})
-        captioned = sum(1 for img in catalog.values() if img.get("caption_json"))
+        # Photos and videos are captioned by different jobs (still-image vs
+        # keyframe), so count them separately — otherwise uncaptioned videos
+        # would inflate "photos pending" and captioned videos would inflate
+        # "photos done". total_scanned stays all-media for the overall figure.
+        photos = [d for d in catalog.values() if not is_video(d)]
+        videos = [d for d in catalog.values() if is_video(d)]
+        photo_total = len(photos)
+        captioned = sum(1 for d in photos if d.get("caption_json"))
+        video_total = len(videos)
+        video_captioned = sum(1 for d in videos if d.get("caption_json"))
 
         reg = get_registry()
         active_model = reg.get("active_model")
@@ -480,8 +619,12 @@ class Indexer:
         total = len(catalog)
         return {
             "total_scanned": total,
+            "photo_total": photo_total,
             "vision_done": captioned,
-            "vision_pending": total - captioned,
+            "vision_pending": photo_total - captioned,
+            "video_total": video_total,
+            "video_vision_done": video_captioned,
+            "video_vision_pending": video_total - video_captioned,
             "active_model": active_model,
             "active_model_embedded": active_embedded,
             "embed_pending": max(0, captioned - active_embedded),
@@ -547,6 +690,94 @@ class Indexer:
         if persist:
             self._save_catalog()
         return note
+
+    # ── Video single-item ops (keyframe-based) ─────────────────────────────────
+
+    def compute_video_caption(self, img_id: str, force_provider: str = "auto",
+                              model: str = None, frames: int = 4) -> tuple[str, str]:
+        """Caption a whole VIDEO the production way: sample SHOT-BASED keyframes,
+        transcribe the speech track (local Whisper, if any), then send all frames
+        together WITH the transcript in ONE multimodal call so the model reasons
+        across the clip temporally (not per-frame majority-vote). Provider is the
+        user's choice (never forced local). Parallel-safe (catalog reads + network
+        only). Returns (model_label, caption_json); raises on total failure.
+        ratelimit.Cancelled (Stop) propagates so the video stays pending."""
+        import video
+        import transcribe
+        from vision import get_video_caption
+        path = self.image_catalog["images"][img_id]["path"]
+        meta = video.probe(path)
+        frame_bytes = video.extract_keyframes(path, max_frames=max(1, frames))
+        if not frame_bytes:
+            # Corrupt/unsupported video: RECORD a placeholder caption rather than
+            # raising. Raising counts it a failure AND leaves it caption-less, so
+            # it stays 'pending' and gets retried on every pass forever (a job
+            # that can never reach 100%). A recorded placeholder takes it out of
+            # the pending set permanently and honestly labels it.
+            ph = parse_vision_attributes("{}")
+            ph["caption"] = "Unreadable video — no decodable frames."
+            return "skipped:unreadable", json.dumps(ph)
+        # Speech → text (empty when no audio / no speech / ASR not installed).
+        tr = transcribe.transcribe_video(path, has_audio=(meta or {}).get("has_audio"))
+        transcript = tr.get("text", "")
+        # Cancelled deliberately not caught — it must escape to the worker.
+        text, vmodel = get_video_caption(
+            frame_bytes, transcript=transcript, force_provider=force_provider,
+            with_model=True, model=model)
+        if _caption_has_error(text):
+            raise RuntimeError(json.loads(text).get("error", "video vision failed"))
+        v = validate_vision_output(text)
+        if not v["valid"]:
+            raise RuntimeError(v["warning"] or "invalid video caption")
+        return vmodel, _attach_transcript(text, transcript, tr.get("language"))
+
+    def video_vision_one(self, img_id: str, force_provider: str = "auto",
+                         model: str = None, frames: int = 4,
+                         persist: bool = True) -> str:
+        """Caption one video (keyframe-aggregate) and store it like a photo caption."""
+        vmodel, text = self.compute_video_caption(
+            img_id, force_provider=force_provider, model=model, frames=frames)
+        self.record_caption(img_id, vmodel, text)
+        if persist:
+            self._save_catalog()
+        return f"video-vision:{vmodel}"
+
+    def video_faces_one(self, img_id: str, frames: int = 4) -> str:
+        """Detect faces across SHOT-BASED keyframes, then GROUP them into the
+        distinct PEOPLE in the clip (faces.group_faces — the sparse-keyframe
+        stand-in for face tracking) and persist those under this video's id, so
+        People/face-search include the video with an accurate person set rather
+        than the raw over-counted union. Skips (not fails) a missing/undecodable
+        file, matching detect_faces_one."""
+        import tempfile
+        import video
+        from faces import group_faces
+        path = self.image_catalog["images"][img_id].get("path", "")
+        if not os.path.exists(path):
+            return "video-faces:skipped (file missing)"
+        frame_bytes = video.extract_keyframes(path, max_frames=max(1, frames))
+        if not frame_bytes:
+            # Corrupt/unsupported: record an EMPTY face set so this video leaves
+            # the faces-pending set permanently instead of being retried on every
+            # pass (which loops the job forever). Distinct from 'file missing'
+            # below, which is left pending in case the file reappears.
+            save_face_data(img_id, [])
+            index_faces(img_id, [])
+            return "video-faces:0 people (undecodable video)"
+        raw = []
+        with tempfile.TemporaryDirectory(prefix="pv_vface_") as tmp:
+            for i, data in enumerate(frame_bytes):
+                fp = os.path.join(tmp, f"f{i}.jpg")
+                with open(fp, "wb") as f:
+                    f.write(data)
+                try:
+                    raw.extend(detect_and_embed_faces(fp))
+                except Exception as e:
+                    print(f"[indexer] video face frame {i} failed for {img_id}: {e}")
+        people = group_faces(raw)
+        save_face_data(img_id, people)
+        index_faces(img_id, people)
+        return f"video-faces:{len(people)} people ({len(raw)} detections)"
 
     # ── Physical dedupe (byte-identical extra copies) ────────────────────────
 
@@ -802,6 +1033,10 @@ def build_embed_payload(img_data: dict, caption_json: str,
         "metadata_json": json.dumps(meta),
         "embedding_source": embed_source,
         "embedding_model": model_name,
+        # Carried into search/recent cards so the grid badges videos and the
+        # lightbox knows to use the <video> player. duration_s is 0 for images.
+        "media_type": "video" if is_video(img_data) else "image",
+        "duration_s": float(img_data.get("duration_s") or 0),
     }
 
 

@@ -20,7 +20,8 @@
   let err = "";
   let errAt = "";
   const TYPE_SCOPE = { scan: "folders", ingest: "import", backup: "backup",
-                       dhash: "dupes", dedupe: "dupes" };
+                       dhash: "dupes", dedupe: "dupes",
+                       video_vision: "video", video_faces: "video" };
   const typeScope = (t) => TYPE_SCOPE[t] || t || "";
   function fail(scope, msg) { err = msg; errAt = scope; }
   function clearErr() { err = ""; errAt = ""; }
@@ -30,6 +31,17 @@
   // ── provider model catalogue ─────────────────────────────────────────────────
   let pmodels = { lm_studio: [], lm_studio_types: {}, gemini_vision: [], gemini_embed: [], gemini_cooldowns: {},
                   ninerouter_vision: [], ninerouter_embed: [], ninerouter_cooldowns: {} };
+
+  // Face-detection accelerators auto-detected from the installed onnxruntime
+  // build (options), plus what the current choice actually resolves to (active).
+  let faceProviders = { options: [{ id: "auto", label: "Auto (fastest available)" }], selected: "auto", active: "" };
+  async function loadFaceProviders() {
+    try { faceProviders = await api.faceProviders(); } catch {}
+  }
+  // True once any real accelerator (not just auto/cpu) is installed — drives the
+  // "install a GPU/NPU wheel" hint on the picker.
+  $: faceAccelAvailable = (faceProviders.options || []).some(
+    (o) => o.id !== "auto" && o.id !== "cpu");
 
   // ── app settings ─────────────────────────────────────────────────────────────
   // Provider rate limits: 0 = unlimited. The grid below binds straight into
@@ -91,6 +103,12 @@
 
   // ── ingest / dedupe / backup ─────────────────────────────────────────────────
   let stagingPath = "";
+  // Import media filter — "both" | "photos" | "videos". Never forces the user
+  // to split: "both" imports a mixed folder as-is; photos → <dest>/YYYY/MM,
+  // videos → their own <videoDest>/YYYY/MM. videoDest blank = server default
+  // (a scanned Videos root, else <dest>/Videos).
+  let ingestMedia = "both";
+  let videoDest = "";
   let dedupeCount = 0;
   let backupSt = { configured: false, dest: null, available: false, days_since: null };
 
@@ -126,6 +144,7 @@
     const which = picker;
     picker = null;
     if (which === "source") return validateSource(path);
+    if (which === "video_dest") { videoDest = path; return; }
     if (which === "ingest_dest") {
       settings.ingest_dest = path;
       await saveSettings();               // server validates; err shows reason
@@ -172,7 +191,8 @@
     full: "Full index", reanalyze: "Re-analyze", faces: "Face detection",
     thumbs: "Thumbnails", dhash: "Duplicate scan", scan: "Scanning folders",
     ingest: "Import & consolidate", dedupe: "Removing duplicate copies",
-    backup: "Backup" };
+    backup: "Backup", video_vision: "Video captioning",
+    video_faces: "Video face detection" };
 
   onMount(async () => {
     if (!$health.loaded) refreshHealth();
@@ -185,7 +205,7 @@
     // and leave the whole tab blank.
     try {
       job = await api.indexProgress();
-      if (job.active) startPolling();
+      if (job.any_active) startPolling();
     } catch (e) {
       console.error("indexProgress failed on mount", e);
       fail("", "Could not load job status.");
@@ -196,6 +216,7 @@
       loadOrphaned(),
       loadDedupeCount(),
       loadBackupStatus(),
+      loadFaceProviders(),
       api.providerModels().then(r => { pmodels = r; }).catch(() => {}),
     ]);
   });
@@ -266,6 +287,9 @@
   $: missingAttrs = $status.missing_attrs || 0;
   $: facesPending = $status.faces_pending || 0;
   $: facesDone = $status.faces_done || 0;
+  $: videoTotal = $status.video_total || 0;
+  $: videoVisionPending = $status.video_vision_pending || 0;
+  $: videoFacesPending = $status.video_faces_pending || 0;
   $: thumbsPending = $status.thumbs_pending || 0;
   $: dhashPending = $status.dhash_pending || 0;
   $: trashCount = $status.trash_count || 0;
@@ -288,10 +312,11 @@
   // one-vector-space-per-collection rule is what aborted the run) and re-run.
   let switchingServed = false;
   async function switchToServedAndRerun() {
-    if (!job?.substitution?.suggested) return;
+    const sub = jobOf("embed")?.substitution;
+    if (!sub?.suggested) return;
     switchingServed = true;
     settings.embed_provider = "9router";
-    settings.embed_model = job.substitution.suggested;
+    settings.embed_model = sub.suggested;
     await saveSettings();
     if (!err) await start("embed");
     switchingServed = false;
@@ -320,7 +345,8 @@
     clearInterval(poll);
     poll = setInterval(async () => {
       job = await api.indexProgress();
-      if (!job.active) {
+      // Jobs can run concurrently now — keep polling until EVERY job is idle.
+      if (!(job.any_active)) {
         clearInterval(poll);
         await Promise.all([refreshStatus(), refreshModels()]);
         loadFolderConfig();  // scan jobs update folder stats
@@ -330,6 +356,32 @@
         dispatch("indexed");
       }
     }, 1000);
+  }
+
+  // ── multi-job derivations ────────────────────────────────────────────────────
+  // `job` is the raw progress response: a primary snapshot PLUS `.jobs[]` (all
+  // tracked jobs), `.job_resources` (type → resource list), `.any_active`.
+  // Jobs whose resource sets are disjoint run concurrently, so the UI keys each
+  // section off ITS OWN job, and only blocks a section when starting it would
+  // conflict with a running job.
+  $: jobsList = (job && Array.isArray(job.jobs)) ? job.jobs
+              : (job && job.type ? [job] : []);
+  $: activeJobs = jobsList.filter((j) => j.active);
+  $: anyActive = job ? (job.any_active ?? activeJobs.length > 0) : false;
+  $: activeResources = new Set(activeJobs.flatMap((j) => j.resources || []));
+
+  // Most-recent job (active or recently-finished) of a given type, or null.
+  function jobOf(type) { return jobsList.find((j) => j.type === type) || null; }
+  function resourcesFor(type) {
+    return (job && job.job_resources && job.job_resources[type]) || [];
+  }
+  // Display name(s) of running job(s) that would block starting `type`
+  // (shared resource); "" when `type` can start right now.
+  function conflictFor(type) {
+    const need = new Set(resourcesFor(type));
+    const blockers = activeJobs.filter((j) => (j.resources || []).some((r) => need.has(r)));
+    if (!blockers.length) return "";
+    return [...new Set(blockers.map((j) => TITLES_BY_TYPE[j.type] || j.type))].join(", ");
   }
 
   $: noServices = $health.loaded && !$health.lm_studio && !$health.gemini && !$health.ninerouter;
@@ -346,8 +398,8 @@
                   : [lmState.vision_loaded && `vision: ${lmState.vision_loaded}`,
                      lmState.embed_loaded && `embed: ${lmState.embed_loaded}`]
                       .filter(Boolean).join(" · ") || "online — no model loaded";
-  $: running = job && job.active;
-  $: scanRunning = running && job.type === "scan";
+  $: running = anyActive;                                   // any job at all
+  $: scanRunning = activeJobs.some((j) => j.type === "scan");
   $: st = $status;
 
   // Catch up when a job was started from elsewhere (another tab, another
@@ -363,11 +415,11 @@
   // dependency as far as Svelte's compiler is concerned.)
   let syncingFromGlobal = false;
   const unsubJobStatus = jobStatus.subscribe(($js) => {
-    if ($js.active && !(job && job.active) && !syncingFromGlobal) {
+    if ($js.active && !(job && job.any_active) && !syncingFromGlobal) {
       syncingFromGlobal = true;
       api.indexProgress().then((j) => {
         job = j;
-        if (j.active) startPolling();
+        if (j.any_active) startPolling();
         syncingFromGlobal = false;
       }).catch(() => { syncingFromGlobal = false; });
     }
@@ -379,35 +431,42 @@
     // Save settings first if dirty
     if (settingsDirty) await saveSettings();
     try {
-      job = await api.indexStart({ ...buildCfg(type), ...extra });
-      if (job.active) startPolling();
+      // indexStart returns the started job; re-pull progress for the full
+      // (possibly concurrent) picture so other running jobs stay visible.
+      await api.indexStart({ ...buildCfg(type), ...extra });
+      job = await api.indexProgress();
+      if (job.any_active) startPolling();
       else { await refreshStatus(); dispatch("indexed"); }
     } catch (e) { fail(typeScope(type), e.message); }
   }
-  async function stop() {
+  async function stopJob(type) {
+    const j = jobOf(type);
     try {
-      job = await api.indexStop();
+      await api.indexStop(j ? { job_id: j.id } : undefined);
+      job = await api.indexProgress();
     } catch (e) {
       // Return the button to a clickable state instead of leaving it stuck
       // on "Stopping…" forever after a transient failure.
       stopRequesting = false;
-      fail(typeScope(job?.type), e.message);
+      fail(typeScope(type), e.message);
     }
   }
-  async function retry() {
-    const type = job.type;
+  async function retry(type) {
     clearErr();
+    const j = jobOf(type);
     try {
-      await api.indexReset();
-      job = await api.indexStart(buildCfg(type));
-      if (job.active) startPolling();
+      if (j) await api.indexReset({ job_id: j.id });
+      await api.indexStart(buildCfg(type));
+      job = await api.indexProgress();
+      if (job.any_active) startPolling();
     } catch (e) { fail(typeScope(type), e.message); }
   }
-  async function clearJob() {
-    const scope = typeScope(job?.type);
+  async function clearJob(type) {
+    const scope = typeScope(type);
     clearErr();
     try {
-      await api.indexReset();
+      const j = jobOf(type);
+      if (j) await api.indexReset({ job_id: j.id });
       job = await api.indexProgress();
     } catch (e) { fail(scope, e.message); }
   }
@@ -545,11 +604,6 @@
     dispatch("indexed");
   }
 
-  // Takes job as an argument so template conditions reference `job` directly —
-  // Svelte only re-evaluates {#if} expressions whose identifiers change, so a
-  // hidden `job` dependency inside the helper would freeze the condition at its
-  // first value and the JobPanel (with its Stop button) would never appear.
-  const jobIs = (j, t) => j && (j.active || j.finished) && j.type === t;
   function fmtDate(iso) { return iso ? iso.slice(0, 16).replace("T", " ") : "never scanned"; }
 
   function modelTypeLabel(id, provider) {
@@ -842,11 +896,35 @@
         spend hidden reasoning tokens against this budget. Truncated captions also grow the
         budget automatically, so this is rarely needed.</span>
     </label>
+    <label class="row" style="gap:8px; font-size:13px; flex-wrap:wrap">
+      Keyframes per video
+      <input type="number" bind:value={settings.video_frames} min="1" max="12" step="1"
+             on:change={markDirty} style="width:60px" />
+      <span class="hint">How many frames each video is sampled at for captioning &amp; face
+        detection — a video costs about this many vision calls (not one per actual frame).
+        Higher = richer coverage of long clips but more calls/quota; lower = faster &amp;
+        cheaper. Default 4.</span>
+    </label>
     <label class="row" style="gap:8px; font-size:13px">
       <input type="checkbox" bind:checked={settings.faces_during_embed}
              on:change={markDirty} style="width:auto" />
       Detect faces during embedding
       <span class="hint">(off → run face detection separately below)</span>
+    </label>
+    <label class="row" style="gap:8px; font-size:13px; flex-wrap:wrap">
+      Face detection runs on
+      <select bind:value={settings.face_provider} on:change={markDirty} style="max-width:280px">
+        {#each faceProviders.options as opt (opt.id)}
+          <option value={opt.id}>{opt.label}</option>
+        {/each}
+      </select>
+      <span class="hint">Auto-detected from what's installed — no hardcoding. “Auto” picks the
+        fastest available (GPU/NPU over CPU); CPU is always the fallback if a chosen accelerator
+        is unavailable.{#if faceProviders.active} Currently resolves to <b>{faceProviders.active}</b>.{/if}
+        Applies to the next face-detection run.
+        {#if !faceAccelAvailable}<br>Only CPU detected. To use an Intel GPU/NPU or a discrete GPU,
+        install an accelerator wheel (<code>make accel-openvino</code> / <code>accel-nvidia</code> /
+        <code>accel-directml</code>) and restart — see the README.{/if}</span>
     </label>
   </div>
 
@@ -956,10 +1034,10 @@
   {/if}
 
   <div style="margin-top:16px">
-    {#if jobIs(job, "scan")}
-      <JobPanel {job} bind:stopRequested={stopRequesting} on:stop={stop} on:retry={retry} on:clear={clearJob} />
-    {:else if running}
-      <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
+    {#if jobOf("scan")}
+      <JobPanel job={jobOf("scan")} bind:stopRequested={stopRequesting} on:stop={() => stopJob("scan")} on:retry={() => retry("scan")} on:clear={() => clearJob("scan")} />
+    {:else if conflictFor("scan")}
+      <div class="blocked-row">⏸ Blocked — <b>{conflictFor("scan")}</b> is running, stop it first</div>
     {:else}
       <button class="primary" on:click={scan}
               disabled={folderConfig.included.length === 0}>
@@ -982,35 +1060,58 @@
     photos & videos are copied in, organized by year/month. Originals are never touched.
     Afterwards, run <b>Scan</b> above — only the new photos go through captioning.
   </p>
-  {#if jobIs(job, "ingest")}
-    <JobPanel {job} bind:stopRequested={stopRequesting} on:stop={stop} on:retry={retry} on:clear={clearJob} />
-  {:else if running}
-    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
+  {#if jobOf("ingest")}
+    <JobPanel job={jobOf("ingest")} bind:stopRequested={stopRequesting} on:stop={() => stopJob("ingest")} on:retry={() => retry("ingest")} on:clear={() => clearJob("ingest")} />
+  {:else if conflictFor("ingest")}
+    <div class="blocked-row">⏸ Blocked — <b>{conflictFor("ingest")}</b> is running, stop it first</div>
   {:else}
     <div class="pickrow">
       <span class="cfg-label" style="margin:0">From</span>
       <code class="pathbox" title={stagingPath}>{stagingPath || "no folder selected"}</code>
       <button class="sm" on:click={() => picker = "source"}>📂 Browse…</button>
     </div>
+    <!-- Media filter: import everything, or just photos / just videos. A mixed
+         folder needs no splitting — pick "Both" and it Just Works. -->
     <div class="pickrow">
-      <span class="cfg-label" style="margin:0">Into</span>
-      <code class="pathbox" title={settings.ingest_dest}>{settings.ingest_dest || "…\\Imported"}<span class="hint">\YYYY\MM</span></code>
-      <button class="ghost sm" on:click={() => picker = "ingest_dest"}>Change…</button>
+      <span class="cfg-label" style="margin:0">Include</span>
+      <div class="seg" role="radiogroup" aria-label="Which media to import">
+        {#each [["both","Photos + videos"],["photos","Photos only"],["videos","Videos only"]] as [val, lbl]}
+          <label class="seg-opt" class:on={ingestMedia === val}>
+            <input type="radio" bind:group={ingestMedia} value={val} /> {lbl}
+          </label>
+        {/each}
+      </div>
     </div>
+    {#if ingestMedia !== "videos"}
+      <div class="pickrow">
+        <span class="cfg-label" style="margin:0">Photos into</span>
+        <code class="pathbox" title={settings.ingest_dest}>{settings.ingest_dest || "…\\Imported"}<span class="hint">\YYYY\MM</span></code>
+        <button class="ghost sm" on:click={() => picker = "ingest_dest"}>Change…</button>
+      </div>
+    {/if}
+    {#if ingestMedia !== "photos"}
+      <div class="pickrow">
+        <span class="cfg-label" style="margin:0">Videos into</span>
+        <code class="pathbox" title={videoDest}>{videoDest || "auto — your Videos root"}<span class="hint">\YYYY\MM</span></code>
+        <button class="ghost sm" on:click={() => picker = "video_dest"}>Change…</button>
+      </div>
+    {/if}
     {#if srcChecking}
       <p class="hint">Checking folder…</p>
     {:else if srcCheck && !srcCheck.ok}
       <p class="warn-text" style="font-size:13px">✋ {srcCheck.reason}</p>
     {:else if srcCheck}
       <p class="ok-text" style="font-size:13px">
-        ✓ Ready: {srcCheck.media_files.toLocaleString()} photos & videos
-        ({fmtGB(srcCheck.media_bytes)} GB) will be checked; duplicates are skipped
-        automatically{srcCheck.other_files ? ` · ${srcCheck.other_files.toLocaleString()} non-media files ignored` : ""}.
+        ✓ Ready: {(srcCheck.photo_files ?? 0).toLocaleString()} photos, {(srcCheck.video_files ?? 0).toLocaleString()} videos
+        ({fmtGB(srcCheck.media_bytes)} GB){ingestMedia !== "both" ? ` — importing ${ingestMedia} only` : ""};
+        duplicates are skipped automatically{srcCheck.other_files ? ` · ${srcCheck.other_files.toLocaleString()} non-media files ignored` : ""}.
       </p>
     {/if}
     <div style="margin-top:10px">
       <button class="primary" disabled={!srcCheck?.ok}
-              on:click={() => start("ingest", { source_path: stagingPath.trim() })}>
+              on:click={() => start("ingest", { source_path: stagingPath.trim(),
+                                                ingest_media: ingestMedia,
+                                                ingest_video_dest: videoDest.trim() || null })}>
         📥 Import new files
       </button>
     </div>
@@ -1029,16 +1130,16 @@
   {:else}
     <p class="hint">{visionPending} image{visionPending === 1 ? "" : "s"} pending (any model)</p>
   {/if}
-  {#if jobIs(job, "vision")}
-    <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+  {#if jobOf("vision")}
+    <JobPanel job={jobOf("vision")} on:stop={() => stopJob("vision")} on:retry={() => retry("vision")} on:clear={() => clearJob("vision")} />
   {:else if visionPending === 0}
     {#if totalScanned > 0}
       <p class="ok-text">✓ All photos have captions{selectedVisionLabel ? ` from ${selectedVisionLabel}` : ""}.</p>
     {:else}
       <p class="hint">No photos scanned yet — start with section A.</p>
     {/if}
-  {:else if running}
-    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
+  {:else if conflictFor("vision")}
+    <div class="blocked-row">⏸ Blocked — <b>{conflictFor("vision")}</b> is running, stop it first</div>
   {:else}
     <button class="primary" on:click={() => start("vision")} disabled={noServices || visionCfgIncomplete}
             title={visionCfgIncomplete ? "Pick a 9Router vision model in Run configuration first" : ""}>
@@ -1063,16 +1164,17 @@
   {:else}
     <p class="hint">Source: latest caption · {embedPending} pending</p>
   {/if}
-  {#if jobIs(job, "embed")}
-    <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
-    {#if !job.active && job.substitution}
+  {#if jobOf("embed")}
+    {@const ej = jobOf("embed")}
+    <JobPanel job={ej} on:stop={() => stopJob("embed")} on:retry={() => retry("embed")} on:clear={() => clearJob("embed")} />
+    {#if !ej.active && ej.substitution}
       <div class="confirm-card" style="margin-top:10px">
-        <span class="warn-text">⚠ 9Router is serving <code>{job.substitution.served}</code>
-        instead of <code>{job.substitution.requested}</code> — the run was stopped so vectors
+        <span class="warn-text">⚠ 9Router is serving <code>{ej.substitution.served}</code>
+        instead of <code>{ej.substitution.requested}</code> — the run was stopped so vectors
         from two models never mix in one search index.</span>
         <div class="row" style="gap:10px; margin-top:10px">
           <button class="primary" on:click={switchToServedAndRerun} disabled={switchingServed}>
-            {switchingServed ? "Switching…" : `Switch to ${job.substitution.suggested} & re-run`}
+            {switchingServed ? "Switching…" : `Switch to ${ej.substitution.suggested} & re-run`}
           </button>
           <span class="hint">Uses its own fresh collection; pending is recomputed, nothing is lost.</span>
         </div>
@@ -1082,8 +1184,8 @@
     <p class="ok-text">✓ All eligible captions are embedded.</p>
   {:else if embedPending === 0}
     <p class="hint">Run vision analysis first (B).</p>
-  {:else if running}
-    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
+  {:else if conflictFor("embed")}
+    <div class="blocked-row">⏸ Blocked — <b>{conflictFor("embed")}</b> is running, stop it first</div>
   {:else}
     <button class="primary" on:click={() => start("embed")} disabled={noServices || embedCfgIncomplete}
             title={embedCfgIncomplete ? "Pick a 9Router embedding model in Run configuration first" : ""}>
@@ -1103,16 +1205,16 @@
   </SectionHead>
   <p class="hint">{facesDone} done · {facesPending} pending.
     {settings.faces_during_embed ? "Also runs automatically during embedding." : "Runs only when you start it here."}</p>
-  {#if jobIs(job, "faces")}
-    <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+  {#if jobOf("faces")}
+    <JobPanel job={jobOf("faces")} on:stop={() => stopJob("faces")} on:retry={() => retry("faces")} on:clear={() => clearJob("faces")} />
   {:else if facesPending === 0}
     {#if totalScanned > 0}
       <p class="ok-text">✓ All photos have been scanned for faces.</p>
     {:else}
       <p class="hint">No photos scanned yet — start with section A.</p>
     {/if}
-  {:else if running}
-    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
+  {:else if conflictFor("faces")}
+    <div class="blocked-row">⏸ Blocked — <b>{conflictFor("faces")}</b> is running, stop it first</div>
   {:else}
     <button class="primary" on:click={() => start("faces")}>
       ▶ Detect faces in {facesPending} photo{facesPending === 1 ? "" : "s"}
@@ -1121,6 +1223,42 @@
   <ErrLine {err} at={errAt} scope="faces" onclear={clearErr} />
 </div>
 
+<!-- C3: Video analysis (keyframe captioning + faces) -->
+{#if videoTotal > 0}
+<div class="card">
+  <SectionHead icon="🎬" color="#6366f1" title="Video analysis">
+    <span class="hint" style="font-weight:400">(caption + find faces in videos, from sampled keyframes)</span>
+  </SectionHead>
+  <p class="hint">{videoTotal.toLocaleString()} video{videoTotal === 1 ? "" : "s"} in the library ·
+    {videoVisionPending.toLocaleString()} to caption · {videoFacesPending.toLocaleString()} to scan for faces.
+    Videos are captioned from a few sampled frames using your Vision model above, then searchable like photos.</p>
+  {#if jobOf("video_vision")}
+    <JobPanel job={jobOf("video_vision")} on:stop={() => stopJob("video_vision")} on:retry={() => retry("video_vision")} on:clear={() => clearJob("video_vision")} />
+  {/if}
+  {#if jobOf("video_faces")}
+    <JobPanel job={jobOf("video_faces")} on:stop={() => stopJob("video_faces")} on:retry={() => retry("video_faces")} on:clear={() => clearJob("video_faces")} />
+  {/if}
+  {#if !jobOf("video_vision") && !jobOf("video_faces")}
+    <div class="row" style="gap:8px; flex-wrap:wrap">
+      <button class="primary" disabled={videoVisionPending === 0 || !!conflictFor("video_vision")}
+              on:click={() => start("video_vision")}
+              title={conflictFor("video_vision") ? `${conflictFor("video_vision")} is running` : ""}>
+        ▶ Caption {videoVisionPending.toLocaleString()} video{videoVisionPending === 1 ? "" : "s"}
+      </button>
+      <button disabled={videoFacesPending === 0 || !!conflictFor("video_faces")}
+              on:click={() => start("video_faces")}
+              title={conflictFor("video_faces") ? `${conflictFor("video_faces")} is running` : ""}>
+        🙂 Find faces in {videoFacesPending.toLocaleString()} video{videoFacesPending === 1 ? "" : "s"}
+      </button>
+    </div>
+    {#if videoVisionPending === 0 && videoFacesPending === 0}
+      <p class="ok-text" style="margin-top:8px">✓ All videos captioned and scanned for faces.</p>
+    {/if}
+  {/if}
+  <ErrLine {err} at={errAt} scope="video" onclear={clearErr} />
+</div>
+{/if}
+
 <!-- Thumbnails: pregenerate grid previews -->
 <div class="card">
   <SectionHead icon="🖼" color="#f59e0b" title="Thumbnails">
@@ -1128,16 +1266,16 @@
   </SectionHead>
   <p class="hint">{thumbsPending} photo{thumbsPending === 1 ? "" : "s"} without a thumbnail.
     Missing ones are still generated on demand — this just does it ahead of time.</p>
-  {#if jobIs(job, "thumbs")}
-    <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+  {#if jobOf("thumbs")}
+    <JobPanel job={jobOf("thumbs")} on:stop={() => stopJob("thumbs")} on:retry={() => retry("thumbs")} on:clear={() => clearJob("thumbs")} />
   {:else if thumbsPending === 0}
     {#if totalScanned > 0}
       <p class="ok-text">✓ Every photo has a thumbnail.</p>
     {:else}
       <p class="hint">No photos scanned yet — start with section A.</p>
     {/if}
-  {:else if running}
-    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
+  {:else if conflictFor("thumbs")}
+    <div class="blocked-row">⏸ Blocked — <b>{conflictFor("thumbs")}</b> is running, stop it first</div>
   {:else}
     <button class="primary" on:click={() => start("thumbs")}>
       ▶ Generate {thumbsPending} thumbnail{thumbsPending === 1 ? "" : "s"}
@@ -1156,14 +1294,14 @@
        dHash near-dupes below: these are the SAME file sitting in several
        places, so removing them is loss-free (one canonical copy always kept,
        removals go to the Recycle Bin). -->
-  {#if jobIs(job, "dedupe")}
-    <JobPanel {job} bind:stopRequested={stopRequesting} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+  {#if jobOf("dedupe")}
+    <JobPanel job={jobOf("dedupe")} bind:stopRequested={stopRequesting} on:stop={() => stopJob("dedupe")} on:retry={() => retry("dedupe")} on:clear={() => clearJob("dedupe")} />
   {:else if dedupeCount > 0}
     <div class="row" style="gap:10px; margin-bottom:12px; flex-wrap:wrap; align-items:center">
       <span class="hint"><b>{dedupeCount}</b> exact duplicate cop{dedupeCount === 1 ? "y" : "ies"} on disk
         (same bytes, multiple locations — found during scans)</span>
-      {#if running}
-        <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running</div>
+      {#if conflictFor("dedupe")}
+        <div class="blocked-row">⏸ Blocked — <b>{conflictFor("dedupe")}</b> is running</div>
       {:else}
         <button class="sm" on:click={() => start("dedupe")}
                 title="Keeps one canonical file per photo; extra copies go to the Recycle Bin">
@@ -1174,12 +1312,12 @@
   {:else if totalScanned > 0}
     <p class="hint" style="margin-bottom:10px">No exact duplicate copies recorded — scans note them automatically.</p>
   {/if}
-  {#if jobIs(job, "dhash")}
-    <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+  {#if jobOf("dhash")}
+    <JobPanel job={jobOf("dhash")} on:stop={() => stopJob("dhash")} on:retry={() => retry("dhash")} on:clear={() => clearJob("dhash")} />
   {:else if dhashPending > 0}
     <p class="hint">{dhashPending} photo{dhashPending === 1 ? "" : "s"} not fingerprinted yet.</p>
-    {#if running}
-      <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
+    {#if conflictFor("dhash")}
+      <div class="blocked-row">⏸ Blocked — <b>{conflictFor("dhash")}</b> is running, stop it first</div>
     {:else}
       <button class="primary" on:click={() => start("dhash")}>
         ▶ Fingerprint {dhashPending} photo{dhashPending === 1 ? "" : "s"}
@@ -1273,16 +1411,16 @@
   <SectionHead icon="⚡" color="#22c55e" title="D · Full index">
     <span class="hint" style="font-weight:400">(caption + embed in one pass)</span>
   </SectionHead>
-  {#if jobIs(job, "full")}
-    <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+  {#if jobOf("full")}
+    <JobPanel job={jobOf("full")} on:stop={() => stopJob("full")} on:retry={() => retry("full")} on:clear={() => clearJob("full")} />
   {:else if missingFull === 0}
     {#if totalScanned > 0}
       <p class="ok-text">✓ All scanned photos are in the index.</p>
     {:else}
       <p class="hint">No photos scanned yet — start with section A.</p>
     {/if}
-  {:else if running}
-    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
+  {:else if conflictFor("full")}
+    <div class="blocked-row">⏸ Blocked — <b>{conflictFor("full")}</b> is running, stop it first</div>
   {:else}
     <p class="hint">First-time setup: runs B then C for everything not yet indexed.</p>
     <button class="primary" on:click={() => start("full")} disabled={noServices || visionCfgIncomplete || embedCfgIncomplete}
@@ -1301,16 +1439,16 @@
   <SectionHead icon="🔄" color="#fb923c" title="E · Re-analyze">
     <span class="hint" style="font-weight:400">(refresh captions + re-embed)</span>
   </SectionHead>
-  {#if jobIs(job, "reanalyze")}
-    <JobPanel {job} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+  {#if jobOf("reanalyze")}
+    <JobPanel job={jobOf("reanalyze")} on:stop={() => stopJob("reanalyze")} on:retry={() => retry("reanalyze")} on:clear={() => clearJob("reanalyze")} />
   {:else if missingAttrs === 0}
     {#if totalScanned > 0}
       <p class="ok-text">✓ All indexed photos have full attributes.</p>
     {:else}
       <p class="hint">No photos scanned yet — start with section A.</p>
     {/if}
-  {:else if running}
-    <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running, stop it first</div>
+  {:else if conflictFor("reanalyze")}
+    <div class="blocked-row">⏸ Blocked — <b>{conflictFor("reanalyze")}</b> is running, stop it first</div>
   {:else}
     <button on:click={() => start("reanalyze")} disabled={noServices || visionCfgIncomplete || embedCfgIncomplete}
             title={visionCfgIncomplete || embedCfgIncomplete ? "Pick 9Router model(s) in Run configuration first" : ""}>
@@ -1361,8 +1499,8 @@
   {#if backupMsg}
     <p class="warn-text" style="font-size:13px; margin-bottom:10px">✋ {backupMsg}</p>
   {/if}
-  {#if jobIs(job, "backup")}
-    <JobPanel {job} bind:stopRequested={stopRequesting} on:stop={stop} on:retry={retry} on:clear={clearJob} />
+  {#if jobOf("backup")}
+    <JobPanel job={jobOf("backup")} bind:stopRequested={stopRequesting} on:stop={() => stopJob("backup")} on:retry={() => retry("backup")} on:clear={() => clearJob("backup")} />
   {:else if backupSt.configured}
     <div class="row" style="gap:10px; flex-wrap:wrap; align-items:center">
       {#if backupSt.available}
@@ -1377,8 +1515,8 @@
       {:else}
         <span class="chip warn-text">never backed up</span>
       {/if}
-      {#if running}
-        <div class="blocked-row">⏸ Blocked — <b>{TITLES_BY_TYPE[job.type] || job.type}</b> is running</div>
+      {#if conflictFor("backup")}
+        <div class="blocked-row">⏸ Blocked — <b>{conflictFor("backup")}</b> is running</div>
       {:else if backupSt.available}
         <button class="primary" on:click={() => start("backup")}>💾 Back up now</button>
       {/if}
@@ -1391,13 +1529,21 @@
 
 <FolderPicker open={picker !== null}
               title={picker === "source" ? "Import from which folder?"
-                   : picker === "ingest_dest" ? "Where should imports be filed? (must be inside a scanned folder)"
+                   : picker === "ingest_dest" ? "Where should imported photos be filed? (must be inside a scanned folder)"
+                   : picker === "video_dest" ? "Where should imported videos be filed? (must be inside a scanned folder)"
                    : "Back up to which folder? (SD card / pen drive / other drive)"}
               on:select={(e) => onPickFolder(e.detail.path)}
               on:close={() => picker = null} />
 
 <style>
   .pickrow { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .seg { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+  .seg-opt { display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+    font-size: 13px; padding: 5px 10px; border: 1px solid var(--border);
+    border-radius: 8px; background: var(--surface2); user-select: none; }
+  .seg-opt.on { border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 16%, transparent); }
+  .seg-opt input { width: auto; margin: 0; }
   .pathbox { flex: 1; min-width: 0; padding: 6px 10px; border: 1px solid var(--border);
     border-radius: 8px; background: var(--surface2); font-size: 12px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

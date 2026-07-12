@@ -21,11 +21,16 @@ dependencies = [
     "scikit-learn>=1.3.0",
     "reverse-geocoder>=1.5.1",
     "sqlite-vec>=0.1.9",
+    "imageio-ffmpeg>=0.4.9",
 ]
 
 [project.optional-dependencies]
-gpu = ["onnxruntime-gpu>=1.16.0"]
 dev = ["pytest>=7.0.0", "httpx>=0.27"]
+# Face-detection GPU/NPU acceleration is NOT a normal extra: every accelerator
+# wheel (onnxruntime-gpu / -directml / -openvino) provides the same `onnxruntime`
+# module as the CPU default, so they can't be installed side by side. Swap with
+# `make accel-openvino` / `accel-nvidia` / `accel-directml` / `accel-cpu`
+# instead. See README "GPU/NPU acceleration (optional)".
 
 [build-system]
 requires      = ["setuptools>=65"]

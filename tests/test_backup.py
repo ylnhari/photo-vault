@@ -73,7 +73,7 @@ _SUMMARY = """
 """
 
 
-def test_backup_one_photo_root_copies_without_purge_and_skips_videos(env, monkeypatch):
+def test_backup_one_scan_root_copies_without_purge_and_includes_videos(env, monkeypatch):
     tmp_path, pics = env
     monkeypatch.setattr(os, "name", "nt")  # force the robocopy engine
     proc = MagicMock(returncode=3, stdout=_SUMMARY)
@@ -81,11 +81,13 @@ def test_backup_one_photo_root_copies_without_purge_and_skips_videos(env, monkey
         note = backup.backup_one(str(pics))
     cmd = run.call_args[0][0]
     assert cmd[0] == "robocopy" and cmd[1] == str(pics)
-    # photo roots: additive copy (no /MIR — drive-side videos must survive)
-    # with video files invisible to robocopy entirely
+    # scan roots: additive copy (no /MIR — drive-side extras must survive),
+    # and videos are now first-class, so NO /XF exclusion filter
     assert "/MIR" not in cmd and "/E" in cmd
-    assert "/XF" in cmd and "*.mp4" in cmd
+    assert "/XF" not in cmd and "*.mp4" not in cmd
     assert "5 copied" in note and "115 unchanged" in note
+    # additive mode does NOT delete extras — report them as kept, not removed
+    assert "2 extra kept at dest" in note and "removed" not in note
     assert backup.status()["last_backup_at"] is not None
 
 
@@ -94,9 +96,11 @@ def test_backup_one_data_root_uses_strict_mirror(env, monkeypatch):
     monkeypatch.setattr(os, "name", "nt")
     proc = MagicMock(returncode=1, stdout=_SUMMARY)
     with patch("backup.subprocess.run", return_value=proc) as run:
-        backup.backup_one(backup.DATA_DIR)
+        note = backup.backup_one(backup.DATA_DIR)
     cmd = run.call_args[0][0]
     assert "/MIR" in cmd and "/XF" not in cmd
+    # strict mirror DOES delete extras — report the removal
+    assert "2 removed at dest" in note
 
 
 def test_backup_one_failure_raises(env, monkeypatch):
@@ -125,17 +129,17 @@ def _tree(base, spec):
         p.write_bytes(content)
 
 
-def test_python_mirror_copies_and_skips_videos_without_purge(tmp_path):
+def test_python_mirror_copies_videos_and_photos_without_purge(tmp_path):
     src, dst = tmp_path / "src", tmp_path / "dst"
     _tree(src, {"2023/a.jpg": b"aa", "2023/clip.mp4": b"vv", "b.png": b"bb"})
-    # a pre-existing extra at dest must SURVIVE a no-purge photo mirror
+    # a pre-existing extra at dest must SURVIVE a no-purge mirror
     _tree(dst, {"old-video.mov": b"keepme"})
     note = backup._mirror_python(str(src), str(dst), purge=False)
     assert (dst / "2023" / "a.jpg").read_bytes() == b"aa"
     assert (dst / "b.png").read_bytes() == b"bb"
-    assert not (dst / "2023" / "clip.mp4").exists()   # video invisible
+    assert (dst / "2023" / "clip.mp4").read_bytes() == b"vv"  # videos included now
     assert (dst / "old-video.mov").exists()           # extras kept (no purge)
-    assert "2 copied" in note
+    assert "3 copied" in note
 
 
 def test_python_mirror_incremental_second_run_copies_nothing(tmp_path):

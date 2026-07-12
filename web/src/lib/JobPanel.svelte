@@ -10,7 +10,9 @@
                    dhash: "Duplicate scan", scan: "Scanning folders",
                    ingest: "Importing & consolidating",
                    dedupe: "Removing duplicate copies",
-                   backup: "Backing up" };
+                   backup: "Backing up",
+                   video_vision: "Captioning videos",
+                   video_faces: "Detecting faces in videos" };
 
   // Each job type gets its own accent so the panel reads as a continuation
   // of that section's identity, not a generic grey status box.

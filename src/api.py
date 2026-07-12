@@ -164,6 +164,12 @@ class ScanReq(BaseModel):
     dirs: list[str] = []  # empty → use folder registry
 
 
+class JobRef(BaseModel):
+    # Optional target for stop/reset — a specific job id from the progress
+    # `jobs` list. Omitted → act on all jobs (back-compat single-job behavior).
+    job_id: str | None = None
+
+
 class IndexReq(BaseModel):
     type: str
     vision_provider: str = "auto"
@@ -173,6 +179,8 @@ class IndexReq(BaseModel):
     caption_source_model: str | None = None
     max_fail: int = 5
     source_path: str | None = None  # ingest only: the staging folder to import
+    ingest_media: str = "both"      # ingest only: "both" | "photos" | "videos"
+    ingest_video_dest: str | None = None  # ingest only: override video destination
 
 
 class PersonReq(BaseModel):
@@ -206,7 +214,11 @@ class SettingsReq(BaseModel):
     max_fail: int | None = None
     vision_concurrency: int | None = None
     vision_max_tokens: int | None = None
+    video_frames: int | None = None
     faces_during_embed: bool | None = None
+    # Accelerator for face detection — an id from /api/face-providers
+    # ("auto" | "openvino:GPU" | "openvino:NPU" | "cuda" | "dml" | "cpu" | …).
+    face_provider: str | None = None
     face_cluster_eps: float | None = None
     face_cluster_min_samples: int | None = None
     # {provider: {rps|rpm|rph|rpd: int}} — client-side request ceilings,
@@ -317,6 +329,9 @@ def status():
     em = s.get("embed_model")  # embed model (raw name, no provider prefix)
 
     total = stage.get("total_scanned", 0)
+    # Vision progress is a photo-only ratio (videos are captioned by their own
+    # keyframe job), so use the photo count as the denominator here.
+    photo_total = stage.get("photo_total", total)
 
     # Legacy pending counts (used by backward-compat code paths)
     legacy_vision_pending = len(idx.get_vision_pending())
@@ -325,7 +340,7 @@ def status():
     # Model-specific vision counts
     if vm_label:
         model_vision_pending_list = idx.get_vision_pending_for_model(vm_label)
-        vision_done = total - len(model_vision_pending_list)
+        vision_done = photo_total - len(model_vision_pending_list)
         vision_pending = len(model_vision_pending_list)
     else:
         vision_done = stage.get("vision_done", 0)
@@ -341,6 +356,7 @@ def status():
     embed_pending = max(0, eligible - embed_done)
 
     faces = idx.get_faces_stats()
+    video_faces = idx.get_video_faces_stats()
 
     return {
         # Legacy fields kept for backward compat
@@ -367,9 +383,18 @@ def status():
                 "pending": embed_pending,
             },
             "faces": faces,  # {total, detected, pending}
+            "video": {
+                "total": stage.get("video_total", 0),
+                "vision_done": stage.get("video_vision_done", 0),
+                "vision_pending": stage.get("video_vision_pending", 0),
+                "faces": video_faces,
+            },
         },
         "faces_pending": faces["pending"],
         "faces_done": faces["detected"],
+        "video_total": stage.get("video_total", 0),
+        "video_vision_pending": stage.get("video_vision_pending", 0),
+        "video_faces_pending": video_faces["pending"],
         "thumbs_pending": idx.count_thumbs_missing(),
         "dhash_pending": sum(
             1 for d in idx.image_catalog.get("images", {}).values()
@@ -392,6 +417,11 @@ def put_settings(req: SettingsReq):
     # back to its default/auto behavior, while an omitted field leaves the
     # existing stored value untouched.
     patch = req.model_dump(exclude_unset=True)
+    # Keyframes-per-video: clamp to the same sane bounds the job uses, so a bad
+    # value can't be persisted (the job re-clamps too, as defense in depth).
+    if "video_frames" in patch and patch["video_frames"] is not None:
+        from jobs import _clamp_video_frames
+        patch["video_frames"] = _clamp_video_frames(patch["video_frames"])
     # Destination settings go through the same validators as the pre-flight
     # UI, so a rule violation is refused with the same friendly explanation.
     if patch.get("ingest_dest"):
@@ -404,7 +434,31 @@ def put_settings(req: SettingsReq):
         v = backup_mod.validate_dest(patch["backup_dest"])
         if not v["ok"]:
             raise HTTPException(422, v["reason"])
-    return settings_mgr.update(patch)
+    updated = settings_mgr.update(patch)
+    # Changing the face accelerator must drop the cached FaceAnalysis session so
+    # the next faces run rebuilds on the newly chosen device (it's keyed by
+    # choice, but reset eagerly so a later same-process read can't serve stale).
+    if "face_provider" in patch:
+        import faces
+        faces.reset_face_app()
+    return updated
+
+
+@app.get("/api/face-providers")
+def face_providers():
+    """Accelerators available for face detection on this machine — auto-detected
+    from the installed onnxruntime build (never hardcoded), so the UI can offer
+    only what will actually run. `selected` is the saved setting; `active` is
+    what that choice resolves to after CPU-fallback (an unavailable pick shows
+    CPU)."""
+    import faces
+    s = settings_mgr.load()
+    selected = s.get("face_provider", "auto")
+    return {
+        "options": faces.available_accelerators(),
+        "selected": selected,
+        "active": faces.resolved_provider_label(selected),
+    }
 
 
 @app.delete("/api/settings")
@@ -666,9 +720,18 @@ def index_start(req: IndexReq):
         v = ingest_mod.validate_source(req.source_path)
         if not v["ok"]:
             raise HTTPException(422, v["reason"])
-        dv = ingest_mod.validate_dest(ingest_mod.default_dest() or "")
-        if not dv["ok"]:
-            raise HTTPException(422, dv["reason"])
+        media = req.ingest_media if req.ingest_media in ("both", "photos", "videos") else "both"
+        # Validate only the destinations this run will actually write to: the
+        # photo dest when importing photos, the video dest when importing videos.
+        if media in ("both", "photos"):
+            dv = ingest_mod.validate_dest(ingest_mod.default_dest() or "")
+            if not dv["ok"]:
+                raise HTTPException(422, dv["reason"])
+        if media in ("both", "videos"):
+            vdest = req.ingest_video_dest or ingest_mod.default_video_dest() or ""
+            dvv = ingest_mod.validate_dest(vdest)
+            if not dvv["ok"]:
+                raise HTTPException(422, f"Video destination: {dvv['reason']}")
     if req.type == "backup":
         import backup as backup_mod
         bs = backup_mod.status()
@@ -687,6 +750,8 @@ def index_start(req: IndexReq):
             caption_source_model=req.caption_source_model,
             vision_model_label=vml,
             source_path=req.source_path,
+            ingest_media=req.ingest_media,
+            ingest_video_dest=req.ingest_video_dest,
         )
     except RuntimeError as e:
         raise HTTPException(409, str(e))
@@ -791,8 +856,10 @@ def provider_models():
 
 
 @app.post("/api/index/stop")
-def index_stop():
-    manager.stop()
+def index_stop(req: JobRef | None = None):
+    # With a job_id → stop just that job (jobs can run concurrently now);
+    # without → stop every active job (back-compat with the old single-job UI).
+    manager.stop(req.job_id if req else None)
     return manager.status()
 
 
@@ -802,8 +869,8 @@ def index_progress():
 
 
 @app.post("/api/index/reset")
-def index_reset():
-    manager.reset()
+def index_reset(req: JobRef | None = None):
+    manager.reset(req.job_id if req else None)
     return manager.status()
 
 
@@ -887,6 +954,8 @@ def _card(img_id: str, meta: dict) -> dict:
         "year": meta.get("year", ""),
         "occasion": meta.get("occasion", ""),
         "exists": os.path.exists(meta.get("path", "")),
+        "media_type": meta.get("media_type", "image"),
+        "duration_s": meta.get("duration_s", 0),
     }
 
 
@@ -919,6 +988,8 @@ def _cards_for_ids(ids: list[str]) -> list[dict]:
                 "year": m.get("year", ""),
                 "occasion": m.get("occasion", ""),
                 "exists": os.path.exists(path),
+                "media_type": m.get("media_type") or c.get("media_type", "image"),
+                "duration_s": m.get("duration_s") or c.get("duration_s", 0),
             }
         )
     return cards
@@ -1099,6 +1170,10 @@ def timeline(year: str | None = None, offset: int = 0, limit: int = 60):
             "filename": data.get("filename", ""),
             "date": date,  # "YYYY:MM:DD hh:mm:ss" — the UI groups by month
             "exists": os.path.exists(data.get("path", "")),
+            # Catalog-driven, so videos show in the timeline right after Scan —
+            # no embedding needed for the browse-and-play surface.
+            "media_type": data.get("media_type", "image"),
+            "duration_s": data.get("duration_s", 0),
         }
 
     limit = max(1, min(limit, 500))
@@ -1373,6 +1448,17 @@ _EXT_MIME = {
     ".bmp": "image/bmp",
     ".tif": "image/tiff",
     ".tiff": "image/tiff",
+    # Videos — browsers are picky about the exact type for <video> playback.
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+    ".3gp": "video/3gpp",
+    ".wmv": "video/x-ms-wmv",
+    ".mts": "video/mp2t",
+    ".m2ts": "video/mp2t",
 }
 
 
@@ -1433,6 +1519,76 @@ def image(id: str = Query(...), thumb: bool = False, size: str = "full"):
     return resp or _placeholder_thumb()
 
 
+# Cap one 206 response so an open-ended `bytes=0-` can't pull a multi-GB video
+# into memory — the browser simply requests the next slice. 4 MiB is plenty for
+# smooth seeking while keeping memory bounded and Content-Length exact.
+_VIDEO_MAX_SLICE = 4 * 1024 * 1024
+
+
+def _parse_range(range_header: str, file_size: int) -> tuple[int, int] | None:
+    """Parse a single-range 'bytes=start-end' header into inclusive (start, end)
+    byte offsets, or None if unparseable/unsatisfiable. Only the single-range
+    form is supported — all a <video> element ever sends for seeking."""
+    if not range_header or not range_header.strip().lower().startswith("bytes="):
+        return None
+    spec = range_header.split("=", 1)[1].split(",", 1)[0].strip()
+    start_s, _, end_s = spec.partition("-")
+    try:
+        if start_s == "":              # suffix range: bytes=-N (last N bytes)
+            n = int(end_s)
+            if n <= 0:
+                return None
+            start = max(0, file_size - n)
+            end = file_size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s else file_size - 1
+    except ValueError:
+        return None
+    end = min(end, file_size - 1)
+    if start > end or start >= file_size:
+        return None
+    return start, end
+
+
+@app.get("/api/video")
+def video_stream(id: str = Query(...), request: Request = None):
+    """Stream a catalogued video with HTTP range support so the <video> element
+    can seek (206 Partial Content). Path is resolved only via the catalog/vector
+    metadata — the id is never used as a filesystem path (same arbitrary-read
+    guard as /api/image)."""
+    path = _resolve_indexed_path(id)
+    if not path:
+        raise HTTPException(404, "not an indexed video, or file missing on disk")
+    file_size = os.path.getsize(path)
+    media_type = _guess_media_type(path)
+    range_header = request.headers.get("range") if request is not None else None
+    rng = _parse_range(range_header, file_size) if range_header else None
+
+    if rng is None:
+        # No/!unsatisfiable range → whole file, but advertise range support so
+        # the browser knows it can seek on the next request.
+        return FileResponse(
+            path, media_type=media_type,
+            headers={**_IMMUTABLE_CACHE, "Accept-Ranges": "bytes"},
+        )
+
+    start, end = rng
+    end = min(end, start + _VIDEO_MAX_SLICE - 1)  # bound this slice
+    with open(path, "rb") as f:
+        f.seek(start)
+        data = f.read(end - start + 1)
+
+    headers = {
+        **_IMMUTABLE_CACHE,
+        "Accept-Ranges": "bytes",
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Content-Length": str(len(data)),
+    }
+    return Response(content=data, status_code=206, media_type=media_type,
+                    headers=headers)
+
+
 @app.get("/api/similar")
 def similar(id: str = Query(...), top_k: int = Query(24, ge=1, le=_MAX_RESULT_LIMIT)):
     """Photos most similar to the given one, by its stored caption embedding
@@ -1460,8 +1616,19 @@ def similar(id: str = Query(...), top_k: int = Query(24, ge=1, le=_MAX_RESULT_LI
 @app.get("/api/meta")
 def meta(id: str = Query(...)):
     m = _chroma_meta(id)
-    if not m:
+    cat = load_catalog_cached().get("images", {}).get(id)
+    if not m and not cat:
         raise HTTPException(404, "no metadata (not indexed)")
+    # Merge in catalog media info so a video that hasn't been captioned/embedded
+    # yet still reports its type, duration and dimensions (P0 browse surface).
+    m = dict(m or {})
+    if cat:
+        m.setdefault("path", cat.get("path", ""))
+        m.setdefault("filename", cat.get("filename", ""))
+        m["media_type"] = m.get("media_type") or cat.get("media_type", "image")
+        for k in ("duration_s", "width", "height", "codec"):
+            if cat.get(k) is not None:
+                m.setdefault(k, cat.get(k))
     return m
 
 

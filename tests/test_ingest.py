@@ -145,7 +145,10 @@ def test_stale_cache_entries_pruned_so_deleted_files_reimport(env):
     staging, library = env
     ts = time.mktime((2020, 5, 5, 9, 0, 0, 0, 0, -1))
     v = _write(staging / "clip.mp4", b"video-bytes-2", ts)
-    s1 = ingest.IngestSession(str(staging), catalog_images={}, dest=str(library))
+    # Keep the video in the library tree for this cache test (videos otherwise
+    # route to their own tree — see test_videos_land_in_separate_tree).
+    s1 = ingest.IngestSession(str(staging), catalog_images={},
+                              dest=str(library), video_dest=str(library))
     note = s1.ingest_one(str(v))
     s1.close()
     assert note.startswith("imported")
@@ -153,7 +156,8 @@ def test_stale_cache_entries_pruned_so_deleted_files_reimport(env):
     # its hash must NOT keep claiming "in library" forever.
     imported = next((library / "2020" / "05").iterdir())
     imported.unlink()
-    s2 = ingest.IngestSession(str(staging), catalog_images={}, dest=str(library))
+    s2 = ingest.IngestSession(str(staging), catalog_images={},
+                              dest=str(library), video_dest=str(library))
     assert s2.ingest_one(str(v)).startswith("imported")
     s2.close()
 
@@ -201,4 +205,74 @@ def test_source_stats_counts_media_and_ignores_rest(tmp_path):
     _write(src / "b.mp4", b"y" * 200)
     _write(src / "readme.txt", b"z")
     s = ingest.source_stats(str(src))
-    assert s == {"media_files": 2, "media_bytes": 300, "other_files": 1}
+    assert s == {"media_files": 2, "photo_files": 1, "video_files": 1,
+                 "media_bytes": 300, "other_files": 1}
+
+
+# ── video routing + media filter ──────────────────────────────────────────────
+
+def test_ext_wanted_media_filter():
+    assert ingest._ext_wanted(".jpg", "both") and ingest._ext_wanted(".mp4", "both")
+    assert ingest._ext_wanted(".jpg", "photos") and not ingest._ext_wanted(".mp4", "photos")
+    assert ingest._ext_wanted(".mp4", "videos") and not ingest._ext_wanted(".jpg", "videos")
+    assert not ingest._ext_wanted(".mp3", "both")   # audio is ignored entirely
+
+
+def test_videos_land_in_separate_tree(env):
+    staging, library = env
+    videos = library / "Videos"; videos.mkdir()
+    ts = time.mktime((2023, 6, 15, 12, 0, 0, 0, 0, -1))
+    _write(staging / "clip.mp4", b"video-bytes", ts)
+    _write(staging / "pic.jpg", b"photo-bytes", ts)
+    s = ingest.IngestSession(str(staging), catalog_images={},
+                             dest=str(library), video_dest=str(videos))
+    vnote = s.ingest_one(str(staging / "clip.mp4"))
+    pnote = s.ingest_one(str(staging / "pic.jpg"))
+    # video under the Videos tree, photo under the library tree
+    assert (videos / "2023" / "06" / "clip.mp4").exists()
+    assert (library / "2023" / "06" / "pic.jpg").exists()
+    assert not (library / "2023" / "06" / "clip.mp4").exists()
+    assert "imported" in vnote and "imported" in pnote
+
+
+def test_media_filter_skips_other_type(env):
+    staging, library = env
+    _write(staging / "clip.mp4", b"vv")
+    _write(staging / "pic.jpg", b"pp")
+    # photos-only session must skip the video
+    s = ingest.IngestSession(str(staging), catalog_images={},
+                             dest=str(library), media="photos")
+    note = s.ingest_one(str(staging / "clip.mp4"))
+    assert "skipped" in note and "filtered" in note
+
+
+def test_source_stats_splits_photos_and_videos(env):
+    staging, _ = env
+    _write(staging / "a.jpg", b"a")
+    _write(staging / "b.png", b"b")
+    _write(staging / "c.mp4", b"c")
+    _write(staging / "notes.txt", b"x")   # ignored
+    st = ingest.source_stats(str(staging))
+    assert st["photo_files"] == 2
+    assert st["video_files"] == 1
+    assert st["other_files"] == 1
+    assert st["media_files"] == 3
+
+
+def test_default_video_dest_prefers_scanned_videos_root(tmp_path, monkeypatch):
+    import folders, settings as settings_mod
+    vroot = tmp_path / "Videos"; vroot.mkdir()
+    monkeypatch.setattr(settings_mod, "load", lambda: {})
+    monkeypatch.setattr(folders, "get_effective_scan_dirs",
+                        lambda: [str(tmp_path / "Pictures"), str(vroot)])
+    assert ingest.default_video_dest() == str(vroot)
+
+
+def test_list_staging_files_honors_media_filter(env):
+    staging, _ = env
+    _write(staging / "a.jpg", b"a")
+    _write(staging / "b.mp4", b"b")
+    both = ingest.list_staging_files(str(staging), media="both")
+    vids = ingest.list_staging_files(str(staging), media="videos")
+    assert len(both) == 2
+    assert len(vids) == 1 and vids[0].endswith("b.mp4")

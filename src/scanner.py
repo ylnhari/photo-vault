@@ -8,8 +8,19 @@ from pathlib import Path
 from datetime import datetime
 import catalog_db
 
-# Supported image formats
+# Supported still-image formats
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.webp', '.bmp'}
+# Supported video container formats. Videos are catalogued as first-class media
+# (media_type="video") alongside photos; ingest.py imports this same set so
+# import-dedup and scanning agree on what counts as a video.
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm',
+                    '.3gp', '.mts', '.m2ts', '.wmv'}
+MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+
+
+def is_video_path(path) -> bool:
+    """True when a path's extension names a video container (case-insensitive)."""
+    return Path(path).suffix.lower() in VIDEO_EXTENSIONS
 
 # Windows file attributes for cloud/offline files (OneDrive, SharePoint, etc.)
 _FILE_ATTRIBUTE_OFFLINE = 0x1000
@@ -152,9 +163,9 @@ def _is_excluded(abs_path_norm: str, excluded: set[str]) -> bool:
     return False
 
 
-def _iter_images(root: Path, excluded: set[str]):
+def _iter_media(root: Path, excluded: set[str]):
     """
-    Yield image Paths under root, skipping excluded dirs and handling
+    Yield image and video Paths under root, skipping excluded dirs and handling
     errors gracefully (broken symlinks, permission errors, circular symlinks).
     Uses os.walk so we can skip entire subtrees efficiently.
 
@@ -201,12 +212,38 @@ def _iter_images(root: Path, excluded: set[str]):
 
         for fname in filenames:
             p = Path(dirpath) / fname
-            if p.suffix.lower() not in IMAGE_EXTENSIONS:
+            if p.suffix.lower() not in MEDIA_EXTENSIONS:
                 continue
             # Skip circular-symlink targets (already-visited inodes on Unix)
             if p.is_symlink() and not p.exists():
                 continue
             yield p
+
+
+def _media_fields(path: Path) -> dict:
+    """media_type plus, for videos, probe metadata (duration/dims/codec) and a
+    capture date derived from the container's creation_time. Images keep the
+    existing EXIF path. Probe failures degrade to a video row with null
+    fields — the file is still catalogued, browsable, and re-probable later."""
+    if is_video_path(path):
+        import video
+        info = video.probe(str(path)) or {}
+        meta: dict = {}
+        if info.get("capture_time"):
+            meta["date"] = info["capture_time"]
+        if info.get("width"):
+            meta["width"] = str(info["width"])
+        if info.get("height"):
+            meta["height"] = str(info["height"])
+        return {
+            "media_type": "video",
+            "duration_s": info.get("duration_s"),
+            "width": info.get("width"),
+            "height": info.get("height"),
+            "codec": info.get("codec"),
+            "metadata": meta,
+        }
+    return {"media_type": "image", "metadata": get_metadata(path)}
 
 
 def load_existing_data(output_file):
@@ -276,7 +313,7 @@ def scan_directory(
     moved_ids: list[str] = []
 
     print(f"Scanning: {root_dir}")
-    for path in _iter_images(root, excluded):
+    for path in _iter_media(root, excluded):
         # Skip Windows cloud-placeholder files to avoid triggering downloads
         if not _is_locally_available(path):
             continue
@@ -353,7 +390,7 @@ def scan_directory(
                 "size_bytes": stats.st_size,
                 "created_at": stats.st_ctime,
                 "sig": sig,
-                "metadata": get_metadata(path),
+                **_media_fields(path),
             }
             added += 1
 

@@ -96,42 +96,57 @@ def get_defaults() -> list[str]:
     if system == "Windows":
         candidates = [
             os.path.join(home, "Pictures"),
+            os.path.join(home, "Videos"),
             os.path.join(home, "OneDrive", "Pictures"),
+            os.path.join(home, "OneDrive", "Videos"),
             os.path.join(home, "OneDrive", "Camera Roll"),
         ]
     elif system == "Darwin":
         candidates = [
             os.path.join(home, "Pictures"),
+            os.path.join(home, "Movies"),   # macOS names the video home "Movies"
         ]
     else:  # Linux / other
         candidates = [
             os.path.join(home, "Pictures"),
+            os.path.join(home, "Videos"),
         ]
-        # The real pictures dir is localized on many systems (~/Bilder,
-        # ~/Images, …) — the XDG user-dirs config names it authoritatively.
+        # The real media dirs are localized on many systems (~/Bilder, ~/Videos
+        # → ~/Vídeos, …) — the XDG user-dirs config names them authoritatively.
         xdg = _xdg_pictures_dir(home)
         if xdg and xdg not in candidates:
             candidates.insert(0, xdg)
+        xdgv = _xdg_user_dir(home, "XDG_VIDEOS_DIR")
+        if xdgv and xdgv not in candidates:
+            candidates.insert(1, xdgv)
 
+    # Photos and videos both seeded: the one-folder user gets Pictures; the
+    # picky user gets Videos as its own scanned root too. Only dirs that exist.
     return [p for p in candidates if os.path.isdir(p)]
 
 
-def _xdg_pictures_dir(home: str) -> str | None:
-    """Parse XDG_PICTURES_DIR from ~/.config/user-dirs.dirs (freedesktop
-    user-dirs spec) — lines look like: XDG_PICTURES_DIR="$HOME/Bilder"."""
+def _xdg_user_dir(home: str, key: str) -> str | None:
+    """Parse a localized user dir (key like XDG_PICTURES_DIR / XDG_VIDEOS_DIR)
+    from ~/.config/user-dirs.dirs (freedesktop user-dirs spec) — lines look
+    like: XDG_PICTURES_DIR="$HOME/Bilder"."""
     cfg = os.path.join(
         os.environ.get("XDG_CONFIG_HOME", os.path.join(home, ".config")),
         "user-dirs.dirs")
+    prefix = key + "="
     try:
         with open(cfg, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("XDG_PICTURES_DIR="):
+                if line.startswith(prefix):
                     val = line.split("=", 1)[1].strip().strip('"')
                     return val.replace("$HOME", home)
     except OSError:
         pass
     return None
+
+
+def _xdg_pictures_dir(home: str) -> str | None:
+    return _xdg_user_dir(home, "XDG_PICTURES_DIR")
 
 
 # ── bootstrap ─────────────────────────────────────────────────────────────────

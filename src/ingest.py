@@ -23,11 +23,8 @@ import exifread
 
 import platformfs
 from constants import DATA_DIR
-from scanner import IMAGE_EXTENSIONS, content_uid, _sig, _is_locally_available
-
-VIDEO_EXTENSIONS = {'.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm',
-                    '.3gp', '.mts', '.m2ts', '.wmv'}
-MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+from scanner import (IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, MEDIA_EXTENSIONS,
+                     content_uid, _sig, _is_locally_available)
 
 # Persistent hash cache for media the catalog doesn't track (videos) and for
 # everything ever ingested. by_path holds a cheap size+mtime signature so
@@ -73,6 +70,33 @@ def default_dest() -> str | None:
         return None
     local = [d for d in dirs if "onedrive" not in d.lower()]
     return os.path.join((local or dirs)[0], "Imported")
+
+
+def default_video_dest() -> str | None:
+    """Where imported VIDEOS land by default — this is only a default; the user
+    can always override it (or point everything at one folder).
+
+    Preference order, matching "keep videos in their own Videos root":
+      1. explicit settings.ingest_video_dest (the user's chosen video root)
+      2. a scanned folder that already IS a videos root (basename 'Videos',
+         non-cloud preferred) — imports land straight in the library's video
+         tree, picked up by the next Scan with no extra config
+      3. else a 'Videos' subfolder of the photo destination — still separate
+         from photos (<dest>/Videos/YYYY/MM vs <dest>/YYYY/MM) and still inside
+         a scanned folder, so it works for the one-folder user too.
+    """
+    import settings as settings_mod
+    v = settings_mod.load().get("ingest_video_dest")
+    if v:
+        return v
+    from folders import get_effective_scan_dirs
+    video_roots = [d for d in get_effective_scan_dirs()
+                   if os.path.basename(os.path.normpath(d)).lower() == "videos"]
+    if video_roots:
+        local = [d for d in video_roots if "onedrive" not in d.lower()]
+        return (local or video_roots)[0]
+    photo = default_dest()
+    return os.path.join(photo, "Videos") if photo else None
 
 
 def _norm(p: str) -> str:
@@ -133,32 +157,45 @@ def validate_dest(dest: str) -> dict:
     return {"ok": True, "reason": None}
 
 
+def _ext_wanted(ext: str, media: str) -> bool:
+    """Media-filter predicate. media: 'both' (default), 'photos', or 'videos'."""
+    if media == "photos":
+        return ext in IMAGE_EXTENSIONS
+    if media == "videos":
+        return ext in VIDEO_EXTENSIONS
+    return ext in MEDIA_EXTENSIONS
+
+
 def source_stats(src: str) -> dict:
-    """What an import would look at: media file count and total size (plus
+    """What an import would look at: photo/video counts and total size (plus
     how many non-media files will be ignored). Powers the pre-flight preview
-    so the user sees the scope before committing."""
-    media_files = 0
-    media_bytes = 0
-    other_files = 0
+    so the user sees the scope — and the photo/video split — before committing."""
+    photo_files = video_files = other_files = media_bytes = 0
     for dirpath, dirnames, filenames in os.walk(src):
         platformfs.skip_system_dirs(dirnames)
         for name in filenames:
             p = Path(dirpath) / name
-            if p.suffix.lower() in MEDIA_EXTENSIONS:
-                media_files += 1
-                try:
-                    media_bytes += p.stat().st_size
-                except OSError:
-                    pass
+            ext = p.suffix.lower()
+            if ext in IMAGE_EXTENSIONS:
+                photo_files += 1
+            elif ext in VIDEO_EXTENSIONS:
+                video_files += 1
             else:
                 other_files += 1
-    return {"media_files": media_files, "media_bytes": media_bytes,
-            "other_files": other_files}
+                continue
+            try:
+                media_bytes += p.stat().st_size
+            except OSError:
+                pass
+    return {"media_files": photo_files + video_files,
+            "photo_files": photo_files, "video_files": video_files,
+            "media_bytes": media_bytes, "other_files": other_files}
 
 
-def list_staging_files(source: str) -> list[str]:
-    """All media files under the staging folder (recursive), skipping cloud
-    placeholders. Sorted for deterministic run order."""
+def list_staging_files(source: str, media: str = "both") -> list[str]:
+    """Media files under the staging folder (recursive), skipping cloud
+    placeholders. `media` filters to photos-only, videos-only, or both.
+    Sorted for deterministic run order."""
     root = Path(source)
     if not root.is_dir():
         raise ValueError(f"staging folder not found: {source}")
@@ -169,7 +206,7 @@ def list_staging_files(source: str) -> list[str]:
         platformfs.skip_system_dirs(dirnames)
         for name in filenames:
             p = Path(dirpath) / name
-            if p.suffix.lower() in MEDIA_EXTENSIONS and _is_locally_available(p):
+            if _ext_wanted(p.suffix.lower(), media) and _is_locally_available(p):
                 out.append(str(p))
     return sorted(out)
 
@@ -199,12 +236,18 @@ class IngestSession:
     media-hash cache, refreshing video hashes for library folders), then
     ingest_one() per staging file. close() persists the cache."""
 
-    def __init__(self, source: str, catalog_images: dict, dest: str = None):
+    def __init__(self, source: str, catalog_images: dict, dest: str = None,
+                 video_dest: str = None, media: str = "both"):
         self.source = str(Path(source).resolve())
+        self.media = media if media in ("both", "photos", "videos") else "both"
         self.dest = dest or default_dest()
         if not self.dest:
             raise ValueError("no destination: configure a scan folder or ingest_dest")
         self.dest = str(Path(self.dest).resolve())
+        # Videos land in their own subtree (user preference). Resolved lazily to
+        # the photo dest's Videos/ subfolder when not given explicitly.
+        vd = video_dest or default_video_dest() or os.path.join(self.dest, "Videos")
+        self.video_dest = str(Path(vd).resolve())
         self.cache = _load_media_cache()
         self._dirty = 0
         # Self-heal: drop cache entries whose file no longer exists. Without
@@ -261,7 +304,9 @@ class IngestSession:
 
     def _dest_path(self, src: str, uid: str) -> Path:
         d = _media_date(src)
-        folder = Path(self.dest) / f"{d.year:04d}" / f"{d.month:02d}"
+        # Videos to their own tree (<video_dest>/YYYY/MM), photos to <dest>/YYYY/MM.
+        base = self.video_dest if Path(src).suffix.lower() in VIDEO_EXTENSIONS else self.dest
+        folder = Path(base) / f"{d.year:04d}" / f"{d.month:02d}"
         folder.mkdir(parents=True, exist_ok=True)
         base = Path(src).name
         target = folder / base
@@ -274,6 +319,10 @@ class IngestSession:
     def ingest_one(self, src: str) -> str:
         """Ingest one staging file. Returns a job-log note; notes containing
         'skipped' land in the job's skipped bucket, not ok/fail."""
+        is_vid = Path(src).suffix.lower() in VIDEO_EXTENSIONS
+        # Honor the media filter even if a caller passes an unfiltered file list.
+        if (self.media == "photos" and is_vid) or (self.media == "videos" and not is_vid):
+            return "skipped (filtered out by media selection)"
         uid = content_uid(src)
         if uid in self.seen:
             return "skipped (duplicate — already in library)"
@@ -287,7 +336,7 @@ class IngestSession:
         if self._dirty >= 25:
             _save_media_cache(self.cache)
             self._dirty = 0
-        rel = os.path.relpath(target, self.dest)
+        rel = os.path.relpath(target, self.video_dest if is_vid else self.dest)
         return f"imported → {rel}"
 
     def close(self):

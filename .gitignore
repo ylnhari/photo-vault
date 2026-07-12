@@ -9,3 +9,12 @@ dist/
 *.log
 *.egg-info/
 .pytest_cache/
+
+# Machine-local overrides & backups (never shared)
+CLAUDE.local.md
+CLAUDE.local.*
+data.bak-*/
+*.stackdump
+
+# Local scratch / sandbox artifacts
+reg_sandbox*.json

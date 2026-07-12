@@ -1,14 +1,23 @@
 """Background indexing job manager.
 
-Single-user, single-job model: one indexing pass runs at a time in a worker
-thread. The API polls `status()` for live progress and calls `stop()` to abort.
-Unlike the old Streamlit one-photo-per-rerun hack, this is a real background
-task — the UI never blocks. Stop granularity depends on job type: "vision"
-(_run_vision_parallel) and "embed" (_run_embed_batched) check between batches
-(sized by vision_concurrency and EMBED_BATCH respectively, so up to one
-batch's worth of in-flight work can finish after Stop is pressed); every other
-job type (faces/thumbs/dhash/full/reanalyze/scan/ingest/dedupe/backup) runs
-via _run_sequential and checks between every individual item.
+Concurrent-but-safe job model. Jobs run in worker threads; the API polls
+`status()` for live progress and calls `stop()` to abort. More than one job can
+run at once, but ONLY when they touch disjoint resources — see JOB_RESOURCES.
+The old blanket "one job at a time" lock was over-restrictive: face detection is
+local compute that writes only FACE_DIR + the faces ChromaDB collection, so it
+shares nothing with a captioning/embedding pass and can overlap it. What must
+still serialize: two jobs that both mutate image catalog records (last-writer
+clobbers, since each job edits a private in-memory copy of the whole record),
+and two jobs that both drive a provider (LM Studio model-load thrash). Those
+are expressed as shared resources, and start() refuses a job whose resources
+overlap a running one.
+
+Stop granularity depends on job type: "vision" (_run_vision_parallel) and
+"embed" (_run_embed_batched) check between batches (sized by vision_concurrency
+and EMBED_BATCH respectively, so up to one batch's worth of in-flight work can
+finish after Stop is pressed); every other job type (faces/thumbs/dhash/full/
+reanalyze/scan/ingest/dedupe/backup) runs via _run_sequential and checks
+between every individual item.
 """
 import os
 import threading
@@ -21,7 +30,8 @@ from indexer import Indexer, resolve_caption_json, build_embed_payload
 from vision import parse_vision_attributes, build_embedding_text
 
 JOB_TYPES = ("vision", "embed", "full", "reanalyze", "faces", "thumbs",
-             "dhash", "scan", "ingest", "dedupe", "backup")
+             "dhash", "scan", "ingest", "dedupe", "backup",
+             "video_vision", "video_faces")
 
 # Captions per /v1/embeddings request during embed jobs. LM Studio accepts a
 # list, so one round-trip embeds the whole chunk.
@@ -31,23 +41,85 @@ EMBED_BATCH = 16
 # image — turns the old O(n^2) full-file rewrite into O(n).
 SAVE_EVERY = 25
 
+# Bounds for keyframes-per-video. Floor 1 (at least one frame or there's nothing
+# to caption); ceiling 12 keeps the per-video cost/quota sane on the free tier.
+VIDEO_FRAMES_MIN, VIDEO_FRAMES_MAX = 1, 12
+
+# ── Resource model (concurrency policy) ──────────────────────────────────────
+# Exclusive resources a job holds for its whole run. Two jobs may run
+# concurrently iff their resource sets are DISJOINT.
+RES_CATALOG = "catalog"            # mutates image records in the catalog DB
+RES_INFERENCE = "inference"        # drives a provider (LM Studio/Gemini/9Router)
+RES_EMBED_COL = "embed_collection" # writes the embedding ChromaDB collection + registry
+RES_FACES = "faces"                # writes FACE_DIR + the faces ChromaDB collection
+RES_THUMBS = "thumbs"              # writes THUMB_DIR
+RES_BACKUP = "backup"              # filesystem mirror to the backup dest
+
+# Base resources per job type. embed/full/reanalyze pick up RES_FACES too when
+# faces-during-embed is on (added in _resources_for, since it depends on a
+# runtime setting). An unknown type is treated as needing everything, so it can
+# never accidentally overlap something it shouldn't.
+JOB_RESOURCES = {
+    "vision":       {RES_CATALOG, RES_INFERENCE},
+    "video_vision": {RES_CATALOG, RES_INFERENCE},
+    "embed":        {RES_INFERENCE, RES_EMBED_COL},
+    "full":         {RES_CATALOG, RES_INFERENCE, RES_EMBED_COL},
+    "reanalyze":    {RES_CATALOG, RES_INFERENCE, RES_EMBED_COL},
+    "faces":        {RES_FACES},
+    "video_faces":  {RES_FACES},
+    "thumbs":       {RES_THUMBS},
+    "dhash":        {RES_CATALOG},
+    "scan":         {RES_CATALOG},
+    "ingest":       {RES_CATALOG},
+    "dedupe":       {RES_CATALOG, RES_EMBED_COL, RES_FACES},
+    "backup":       {RES_BACKUP},
+}
+
+# How many finished jobs to keep visible (for the UI's "Done"/retry panel)
+# before pruning the oldest. Active jobs are never pruned.
+_MAX_FINISHED_KEPT = 8
+
+
+def _clamp_video_frames(value) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return 4
+    return max(VIDEO_FRAMES_MIN, min(VIDEO_FRAMES_MAX, n))
+
+
+class _Job:
+    """One running/finished job: its own progress state + stop flag + the
+    resources it holds. Kept tiny; the state dict is what status() renders."""
+    __slots__ = ("id", "type", "resources", "stop", "thread", "state")
+
+    def __init__(self, jid: str, jtype: str, resources: set, state: dict):
+        self.id = jid
+        self.type = jtype
+        self.resources = resources
+        self.stop = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.state = state
+
 
 class JobManager:
     def __init__(self):
-        self._lock = threading.RLock()  # reentrant: start() calls status() while holding it
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
-        self._state = self._idle_state()
-        # Let Stop interrupt a rate-limit sleep inside a provider call — a
-        # full rpm/rpd window could otherwise hold the worker for minutes to
-        # hours after the user pressed Stop. Providers raise
-        # ratelimit.Cancelled when this fires mid-wait; the runners treat it
-        # as "stopped", never as a per-image failure.
-        ratelimit.set_cancel_event(self._stop)
+        # Reentrant: start() calls status()/_render() while holding it.
+        self._lock = threading.RLock()
+        self._jobs: dict[str, _Job] = {}
+        self._counter = 0
+        # ratelimit uses a single module-level cancel event to interrupt a
+        # provider sleep on Stop. Only one inference-holding job runs at a time
+        # (they share RES_INFERENCE), so each such job points this at its own
+        # stop event while it runs and resets it to a neutral (never-set) event
+        # when it ends — see _run. Start neutral so a stray acquire() before any
+        # job never thinks it's been cancelled.
+        ratelimit.set_cancel_event(threading.Event())
 
     @staticmethod
     def _idle_state() -> dict:
         return {
+            "id": None, "resources": [],
             "active": False, "type": None, "total": 0, "done": 0,
             "ok": 0, "fail": 0, "skipped": 0, "failed_ids": [], "log": [],
             "aborted": False, "stopped": False, "finished": False, "error": None,
@@ -57,6 +129,37 @@ class JobManager:
             "embed_provider": "auto", "embed_model": None,
             "caption_source_model": None,
         }
+
+    # ── resource policy ───────────────────────────────────────────────────────
+    @staticmethod
+    def _resources_for(jtype: str, cfg: dict) -> set:
+        res = set(JOB_RESOURCES.get(
+            jtype, {RES_CATALOG, RES_INFERENCE, RES_EMBED_COL, RES_FACES}))
+        # embed/full/reanalyze also run face detection inline when the setting
+        # is on, so they then contend with a standalone faces job.
+        if jtype in ("embed", "full", "reanalyze"):
+            try:
+                faces_on = bool(settings_mod.load().get("faces_during_embed", True))
+            except Exception:
+                faces_on = True
+            if faces_on:
+                res.add(RES_FACES)
+        return res
+
+    def _active_resources(self) -> set:
+        held = set()
+        for j in self._jobs.values():
+            if j.state["active"]:
+                held |= j.resources
+        return held
+
+    def _prune_finished(self):
+        finished = [j for j in self._jobs.values() if not j.state["active"]]
+        if len(finished) <= _MAX_FINISHED_KEPT:
+            return
+        finished.sort(key=lambda j: j.state.get("started_at") or 0)
+        for j in finished[:len(finished) - _MAX_FINISHED_KEPT]:
+            self._jobs.pop(j.id, None)
 
     # ── public API ──────────────────────────────────────────────────────────
     def _pending_ids(self, jtype: str, cfg: dict) -> list[str]:
@@ -81,6 +184,10 @@ class JobManager:
             items = idx.get_missing_attributes()
         elif jtype == "faces":
             items = idx.get_faces_pending()
+        elif jtype == "video_vision":
+            items = idx.get_video_vision_pending()
+        elif jtype == "video_faces":
+            items = idx.get_video_faces_pending()
         elif jtype == "thumbs":
             items = idx.get_thumbs_pending()
         elif jtype == "dhash":
@@ -97,7 +204,7 @@ class JobManager:
             src = cfg.get("source_path")
             if not src:
                 raise ValueError("ingest requires a source folder")
-            return list_staging_files(src)
+            return list_staging_files(src, media=cfg.get("ingest_media", "both"))
         elif jtype == "dedupe":
             # 'uid::path' items — recorded byte-identical extra copies.
             return idx.get_redundant_copies()
@@ -115,7 +222,8 @@ class JobManager:
     def start(self, jtype: str, vision_provider: str = "auto", max_fail: int = 5,
               vision_model: str = None, embed_provider: str = "auto",
               embed_model: str = None, caption_source_model: str = None,
-              vision_model_label: str = None, source_path: str = None) -> dict:
+              vision_model_label: str = None, source_path: str = None,
+              ingest_media: str = "both", ingest_video_dest: str = None) -> dict:
         if jtype not in JOB_TYPES:
             raise ValueError(f"unknown job type: {jtype}")
         # max_fail <= 0 would abort the job after the very first batch
@@ -134,8 +242,6 @@ class JobManager:
             {"vision_provider": vision_provider, "vision_model": vision_model}
         )
         with self._lock:
-            if self._state["active"]:
-                raise RuntimeError("a job is already running")
             cfg = {
                 "vision_provider": vision_provider, "vision_model": vision_model,
                 "embed_provider": embed_provider, "embed_model": embed_model,
@@ -143,11 +249,37 @@ class JobManager:
                 "vision_model_label": vision_model_label,
                 "max_fail": max_fail,
                 "source_path": source_path,
+                "ingest_media": ingest_media if ingest_media in
+                                ("both", "photos", "videos") else "both",
+                "ingest_video_dest": ingest_video_dest,
+                # Keyframes sampled per video for video_vision/video_faces.
+                # Read once at job start (like vision_concurrency) so the job
+                # runs at a stable value even if Settings change mid-run.
+                "video_frames": _clamp_video_frames(
+                    settings_mod.load().get("video_frames", 4)),
             }
+            # Concurrency gate: refuse only if this job's resources overlap a
+            # RUNNING job's. Disjoint jobs (e.g. faces alongside embed) proceed.
+            needed = self._resources_for(jtype, cfg)
+            conflict = needed & self._active_resources()
+            if conflict:
+                others = sorted({
+                    j.type for j in self._jobs.values()
+                    if j.state["active"] and (j.resources & needed)
+                })
+                raise RuntimeError(
+                    f"'{jtype}' can't start — a conflicting job is already "
+                    f"running ({', '.join(others)}; shared: "
+                    f"{', '.join(sorted(conflict))})"
+                )
+
+            self._prune_finished()
+            self._counter += 1
+            jid = f"{jtype}-{self._counter}"
+            state = self._idle_state()
             ids = self._pending_ids(jtype, cfg)
-            self._stop.clear()
-            self._state = self._idle_state()
-            self._state.update({
+            state.update({
+                "id": jid, "resources": sorted(needed),
                 "active": True, "type": jtype, "total": len(ids),
                 "started_at": time.time(),
                 "vision_provider": vision_provider, "vision_model": vision_model,
@@ -155,58 +287,126 @@ class JobManager:
                 "caption_source_model": caption_source_model,
                 "max_fail": max_fail,
             })
+            job = _Job(jid, jtype, needed, state)
+            self._jobs[jid] = job
             if not ids:
-                self._state.update({"active": False, "finished": True})
-                return self.status()
-            self._thread = threading.Thread(
-                target=self._run, args=(jtype, ids, cfg), daemon=True
+                state.update({"active": False, "finished": True})
+                return self._render(state)
+            job.thread = threading.Thread(
+                target=self._run, args=(job, jtype, ids, cfg), daemon=True
             )
-            self._thread.start()
-        return self.status()
+            job.thread.start()
+            return self._render(state)
 
-    def stop(self):
-        self._stop.set()
-
-    def status(self) -> dict:
+    def stop(self, job_id: str = None):
+        """Stop one job (by id) or, with no id, every active job."""
         with self._lock:
-            s = dict(self._state)
-            s["log"] = list(s["log"][-30:])
-            s["failed_ids"] = list(s["failed_ids"])
-            s["model_counts"] = dict(s["model_counts"])
-            # ETA from the cumulative average rate so far. Deliberately
-            # includes time spent waiting on rate limits — an ETA that
-            # ignored the throttle would read absurdly optimistic the moment
-            # a window fills.
-            s["eta_seconds"] = None
-            s["rate_per_min"] = None
-            if s["active"] and s["done"] and s["started_at"]:
-                elapsed = time.time() - s["started_at"]
-                if elapsed > 0:
-                    rate = s["done"] / elapsed
-                    s["eta_seconds"] = round(max(0, s["total"] - s["done"]) / rate)
-                    s["rate_per_min"] = round(rate * 60, 1)
-            # Which providers (if any) are currently sleeping on a rate-limit
-            # window, so the UI can say WHY the bar froze.
-            s["rate_wait"] = ratelimit.waiting() if s["active"] else {}
-            return s
+            for j in self._jobs.values():
+                if j.state["active"] and (job_id is None or j.id == job_id):
+                    j.stop.set()
 
-    def reset(self):
-        """Clear a finished/aborted job back to idle (only when not active)."""
+    def _primary(self) -> "_Job | None":
+        """The job status() (no id) describes for single-job/back-compat
+        callers: the most-recently-started ACTIVE job, else the most recent
+        job overall."""
         with self._lock:
-            if not self._state["active"]:
-                self._state = self._idle_state()
+            active = [j for j in self._jobs.values() if j.state["active"]]
+            pool = active or list(self._jobs.values())
+            if not pool:
+                return None
+            return max(pool, key=lambda j: j.state.get("started_at") or 0)
+
+    def any_active(self) -> bool:
+        with self._lock:
+            return any(j.state["active"] for j in self._jobs.values())
+
+    def active_types(self) -> set:
+        with self._lock:
+            return {j.type for j in self._jobs.values() if j.state["active"]}
+
+    def _render(self, state: dict) -> dict:
+        """Per-job snapshot with derived fields (ETA, rate, trimmed log)."""
+        s = dict(state)
+        s["log"] = list(s["log"][-30:])
+        s["failed_ids"] = list(s["failed_ids"])
+        s["model_counts"] = dict(s["model_counts"])
+        # ETA from the cumulative average rate so far. Deliberately includes
+        # time spent waiting on rate limits — an ETA that ignored the throttle
+        # would read absurdly optimistic the moment a window fills.
+        s["eta_seconds"] = None
+        s["rate_per_min"] = None
+        if s["active"] and s["done"] and s["started_at"]:
+            elapsed = time.time() - s["started_at"]
+            if elapsed > 0:
+                rate = s["done"] / elapsed
+                s["eta_seconds"] = round(max(0, s["total"] - s["done"]) / rate)
+                s["rate_per_min"] = round(rate * 60, 1)
+        # Which providers (if any) are currently sleeping on a rate-limit
+        # window — only meaningful for the inference job that owns the provider.
+        infer = RES_INFERENCE in set(s.get("resources") or [])
+        s["rate_wait"] = ratelimit.waiting() if (s["active"] and infer) else {}
+        return s
+
+    def status(self, job_id: str = None) -> dict:
+        """Job status. With job_id → that job (or idle if unknown). Without →
+        the primary job's snapshot (back-compat single-job shape) PLUS a `jobs`
+        list of every tracked job and a `job_resources` map so the UI can tell
+        which job types would currently conflict."""
+        with self._lock:
+            if job_id is not None:
+                j = self._jobs.get(job_id)
+                return self._render(j.state if j else self._idle_state())
+            primary = self._primary()
+            base = self._render(primary.state if primary else self._idle_state())
+            jobs = sorted(self._jobs.values(),
+                          key=lambda j: j.state.get("started_at") or 0, reverse=True)
+            base["jobs"] = [self._render(j.state) for j in jobs]
+            base["any_active"] = any(j.state["active"] for j in self._jobs.values())
+            base["active_types"] = sorted(self.active_types())
+            base["job_resources"] = {
+                t: sorted(self._resources_for(t, {})) for t in JOB_TYPES
+            }
+            return base
+
+    def reset(self, job_id: str = None):
+        """Clear finished/aborted job(s) — one by id, or all non-active."""
+        with self._lock:
+            if job_id is not None:
+                j = self._jobs.get(job_id)
+                if j and not j.state["active"]:
+                    self._jobs.pop(job_id, None)
+                return
+            for jid in [jid for jid, j in self._jobs.items()
+                        if not j.state["active"]]:
+                self._jobs.pop(jid, None)
 
     # ── worker ────────────────────────────────────────────────────────────────
 
-    def _run(self, jtype, ids, cfg):
+    def _run(self, job, jtype, ids, cfg):
         idx = Indexer()  # private mutable catalog copy for this job
+        is_infer = RES_INFERENCE in job.resources
+        if is_infer:
+            # Only one inference job runs at a time, so it's safe for it to own
+            # the module-level cancel event for its lifetime.
+            ratelimit.set_cancel_event(job.stop)
         try:
             if jtype == "vision":
-                self._run_vision_parallel(idx, ids, cfg)
+                self._run_vision_parallel(job, idx, ids, cfg)
+            elif jtype == "video_vision":
+                # Same network-bound parallel path, but each item is a video:
+                # sample keyframes → caption each → fold into one caption.
+                # Bind the per-video keyframe count so the parallel path (which
+                # calls compute(id, provider, model)) applies the configured value.
+                import functools
+                compute = functools.partial(
+                    idx.compute_video_caption, frames=cfg.get("video_frames", 4))
+                self._run_vision_parallel(job, idx, ids, cfg,
+                                          compute=compute,
+                                          label="video-vision")
             elif jtype == "embed":
-                self._run_embed_batched(idx, ids, cfg)
+                self._run_embed_batched(job, idx, ids, cfg)
             else:
-                self._run_sequential(idx, jtype, ids, cfg)
+                self._run_sequential(job, idx, jtype, ids, cfg)
         except Exception as e:
             # Without this, an unexpected bug in a runner (as opposed to a
             # per-image failure, which the runners already catch) would only
@@ -219,22 +419,30 @@ class JobManager:
             print(f"[jobs] worker thread crashed: {e}")
             traceback.print_exc()
             with self._lock:
-                self._state["aborted"] = True
-                self._state["error"] = str(e)
-                self._state["log"].append(
+                job.state["aborted"] = True
+                job.state["error"] = str(e)
+                job.state["log"].append(
                     {"kind": "fail", "id": None, "note": f"job crashed: {e}", "file": ""}
                 )
         finally:
+            if is_infer:
+                ratelimit.set_cancel_event(threading.Event())  # neutral again
             with self._lock:
-                self._state["active"] = False
-                self._state["finished"] = True
+                job.state["active"] = False
+                job.state["finished"] = True
 
-    def _run_vision_parallel(self, idx, ids, cfg):
+    def _run_vision_parallel(self, job, idx, ids, cfg, compute=None, label="vision"):
         """
-        Vision is network-bound, so caption N images concurrently. Captions are
+        Vision is network-bound, so caption N items concurrently. Captions are
         computed in worker threads (no shared mutation), then applied + saved on
         this thread in batches. Stop is honored between batches.
+
+        `compute` is the per-item captioner — idx.compute_caption for photos,
+        idx.compute_video_caption for videos; both take (id, provider, model),
+        return (model_label, caption_json), and raise ratelimit.Cancelled on
+        Stop. `label` only tags the progress log line.
         """
+        compute = compute or idx.compute_caption
         vp, vm = cfg["vision_provider"], cfg["vision_model"]
         max_fail = cfg["max_fail"]
         try:
@@ -246,8 +454,8 @@ class JobManager:
         i, n = 0, len(ids)
         with ThreadPoolExecutor(max_workers=conc) as ex:
             while i < n:
-                if self._stop.is_set():
-                    self._update(stopped=True)
+                if job.stop.is_set():
+                    self._update(job, stopped=True)
                     break
                 # A 9Router 429 means every pooled key/account for the model is
                 # momentarily dry — but pools refill (per-minute windows, key
@@ -257,18 +465,18 @@ class JobManager:
                 # Stop stays responsive via the 1s ticks.
                 if vp == "9router" and vm:
                     from vision import ninerouter_cooldowns
-                    while not self._stop.is_set():
+                    while not job.stop.is_set():
                         wait = ninerouter_cooldowns().get(vm, 0)
                         if wait <= 0:
                             break
                         time.sleep(min(1.0, wait))
-                    if self._stop.is_set():
-                        self._update(stopped=True)
+                    if job.stop.is_set():
+                        self._update(job, stopped=True)
                         break
                 batch = ids[i:i + conc]
                 i += len(batch)
                 futures = {
-                    ex.submit(idx.compute_caption, bid, vp, vm): bid for bid in batch
+                    ex.submit(compute, bid, vp, vm): bid for bid in batch
                 }
                 # Collect results, then apply sequentially (catalog mutation is
                 # single-threaded; only the network calls ran in parallel).
@@ -296,11 +504,11 @@ class JobManager:
                         idx.record_caption(bid, vmodel, text)
                         consecutive = 0
                         icon = "cloud" if vmodel and "gemini" in vmodel.lower() else "ok"
-                        self._update(ok=1, done=1, model_used=vmodel,
-                                     log=(icon, bid, f"vision:{vmodel}", fname))
+                        self._update(job, ok=1, done=1, model_used=vmodel,
+                                     log=(icon, bid, f"{label}:{vmodel}", fname))
                     else:
                         consecutive += 1
-                        self._update(fail=1, done=1, failed_id=bid, log=("fail", bid, errm, fname))
+                        self._update(job, fail=1, done=1, failed_id=bid, log=("fail", bid, errm, fname))
                 idx._save_catalog()  # one write per batch, not per image
                 # Gated on consecutive > 0 so this can only ever fire because
                 # of real accumulated failures, never as a side effect of a
@@ -308,10 +516,10 @@ class JobManager:
                 # start(), but this is cheap defense-in-depth against a
                 # 0-or-negative value ever aborting a fully-successful batch).
                 if consecutive > 0 and consecutive >= max_fail:
-                    self._update(aborted=True)
+                    self._update(job, aborted=True)
                     break
 
-    def _run_embed_batched(self, idx, ids, cfg):
+    def _run_embed_batched(self, job, idx, ids, cfg):
         """
         Embed jobs: one /v1/embeddings request per EMBED_BATCH captions instead
         of per image. Face detection (when enabled) and ChromaDB writes remain
@@ -338,8 +546,8 @@ class JobManager:
         consecutive = 0
         i, n = 0, len(ids)
         while i < n:
-            if self._stop.is_set():
-                self._update(stopped=True)
+            if job.stop.is_set():
+                self._update(job, stopped=True)
                 break
             chunk = ids[i:i + EMBED_BATCH]
             i += len(chunk)
@@ -353,7 +561,7 @@ class JobManager:
             texts, members = [], []   # members: (img_id, img_data, caption_json)
             stopped_mid_chunk = False
             for iid in chunk:
-                if self._stop.is_set():
+                if job.stop.is_set():
                     stopped_mid_chunk = True
                     break
                 img_data = idx.image_catalog["images"].get(iid)
@@ -366,14 +574,14 @@ class JobManager:
                     members.append((iid, img_data, cj))
                 except Exception as e:
                     consecutive += 1
-                    self._update(fail=1, done=1, failed_id=iid,
+                    self._update(job, fail=1, done=1, failed_id=iid,
                                  log=("fail", iid, str(e), fname))
             if stopped_mid_chunk:
-                self._update(stopped=True)
+                self._update(job, stopped=True)
                 break
             if not members:
                 if consecutive >= max_fail:
-                    self._update(aborted=True)
+                    self._update(job, aborted=True)
                     break
                 continue
 
@@ -384,7 +592,7 @@ class JobManager:
             except ratelimit.Cancelled:
                 # Stop pressed during a rate-limit wait — the chunk never
                 # reached the provider; its items stay pending, not failed.
-                self._update(stopped=True)
+                self._update(job, stopped=True)
                 break
             if vectors is None:
                 # Surface the real provider error in the job log — "9Router
@@ -399,18 +607,18 @@ class JobManager:
                     # actually serves and re-run. "suggested" is the full
                     # selectable id (served names come back prefix-stripped).
                     with self._lock:
-                        self._state["substitution"] = {
+                        job.state["substitution"] = {
                             **sub,
                             "suggested": resolve_9router_embed_id(
                                 sub["served"], sub["requested"]),
                         }
                 for iid, img_data, _ in members:
                     consecutive += 1
-                    self._update(fail=1, done=1, failed_id=iid,
+                    self._update(job, fail=1, done=1, failed_id=iid,
                                  log=("fail", iid, f"embedding failed — {reason}",
                                       img_data.get("filename", "")))
                 if consecutive >= max_fail:
-                    self._update(aborted=True)
+                    self._update(job, aborted=True)
                     break
                 continue
 
@@ -422,7 +630,7 @@ class JobManager:
                 for (iid, img_data, cj), vec in zip(members, vectors):
                     if vec is None:
                         consecutive += 1
-                        self._update(fail=1, done=1, failed_id=iid,
+                        self._update(job, fail=1, done=1, failed_id=iid,
                                      log=("fail", iid, "embedding failed for this item",
                                           img_data.get("filename", "")))
                     else:
@@ -431,7 +639,7 @@ class JobManager:
                 members, vectors = good_members, good_vectors
                 if not members:
                     if consecutive >= max_fail:
-                        self._update(aborted=True)
+                        self._update(job, aborted=True)
                         break
                     continue
 
@@ -459,28 +667,29 @@ class JobManager:
             except Exception as e:
                 for iid, img_data, _ in members:
                     consecutive += 1
-                    self._update(fail=1, done=1, failed_id=iid,
+                    self._update(job, fail=1, done=1, failed_id=iid,
                                  log=("fail", iid, f"store failed: {e}",
                                       img_data.get("filename", "")))
                 if consecutive >= max_fail:
-                    self._update(aborted=True)
+                    self._update(job, aborted=True)
                     break
                 continue
 
             consecutive = 0
             icon = "cloud" if "gemini" in source.lower() else "ok"
             for iid, img_data, _ in members:
-                self._update(ok=1, done=1,
+                self._update(job, ok=1, done=1,
                              log=(icon, iid, f"embed:{source}",
                                   img_data.get("filename", "")))
 
-    def _run_sequential(self, idx, jtype, ids, cfg):
+    def _run_sequential(self, job, idx, jtype, ids, cfg):
         """Embed / full / reanalyze: run one at a time (ChromaDB writes), but
         batch the images.json saves so full/reanalyze aren't O(n^2)."""
         max_fail = cfg["max_fail"]
         vp, vm = cfg["vision_provider"], cfg["vision_model"]
         ep, em = cfg["embed_provider"], cfg["embed_model"]
         csm = cfg.get("caption_source_model")
+        video_frames = cfg.get("video_frames", 4)
         try:
             faces_during_embed = bool(settings_mod.load().get("faces_during_embed", True))
         except Exception:
@@ -492,13 +701,15 @@ class JobManager:
         if jtype == "ingest":
             from ingest import IngestSession
             ingest_session = IngestSession(
-                cfg["source_path"], idx.image_catalog["images"])
+                cfg["source_path"], idx.image_catalog["images"],
+                video_dest=cfg.get("ingest_video_dest"),
+                media=cfg.get("ingest_media", "both"))
 
         consecutive = 0
         dirty = False
         for k, img_id in enumerate(ids):
-            if self._stop.is_set():
-                self._update(stopped=True)
+            if job.stop.is_set():
+                self._update(job, stopped=True)
                 break
             if jtype in ("scan", "backup"):
                 fname = img_id                      # a folder path
@@ -514,6 +725,8 @@ class JobManager:
                                          caption_source_model=csm, detect_faces=faces_during_embed)
                 elif jtype == "faces":
                     note = idx.detect_faces_one(img_id)
+                elif jtype == "video_faces":
+                    note = idx.video_faces_one(img_id, frames=video_frames)
                 elif jtype == "thumbs":
                     note = idx.thumb_one(img_id)
                 elif jtype == "dhash":
@@ -548,21 +761,21 @@ class JobManager:
                     # trip consecutive-failure abort) nor a silent permanent
                     # success (must stay distinguishable + retryable) — track
                     # it in its own bucket and leave `consecutive` untouched.
-                    self._update(skipped=1, done=1, log=("skip", img_id, note, fname))
+                    self._update(job, skipped=1, done=1, log=("skip", img_id, note, fname))
                 else:
                     consecutive = 0
                     icon = "cloud" if "gemini" in note.lower() else "ok"
-                    self._update(ok=1, done=1, log=(icon, img_id, note, fname))
+                    self._update(job, ok=1, done=1, log=(icon, img_id, note, fname))
             except ratelimit.Cancelled:
                 # Stop during a rate-limit wait: the item stays pending.
-                self._update(stopped=True)
+                self._update(job, stopped=True)
                 break
             except Exception as e:
                 consecutive += 1
-                self._update(fail=1, done=1, failed_id=img_id,
+                self._update(job, fail=1, done=1, failed_id=img_id,
                              log=("fail", img_id, str(e), fname))
                 if consecutive >= max_fail:
-                    self._update(aborted=True)
+                    self._update(job, aborted=True)
                     break
             if dirty and (k + 1) % SAVE_EVERY == 0:
                 idx._save_catalog()
@@ -572,31 +785,39 @@ class JobManager:
         if ingest_session is not None:
             ingest_session.close()
 
-    def _update(self, ok=0, fail=0, skipped=0, done=0, failed_id=None, log=None,
+    def _update(self, job, ok=0, fail=0, skipped=0, done=0, failed_id=None, log=None,
                 stopped=False, aborted=False, model_used=None):
         with self._lock:
-            self._state["ok"] += ok
-            self._state["fail"] += fail
-            self._state["skipped"] += skipped
-            self._state["done"] += done
+            st = job.state
+            st["ok"] += ok
+            st["fail"] += fail
+            st["skipped"] += skipped
+            st["done"] += done
             if model_used:
                 # Per-model tally for the run summary — with 9Router the
                 # gateway can substitute serving models mid-run, so one run
                 # can legitimately produce captions from several models.
-                mc = self._state["model_counts"]
+                mc = st["model_counts"]
                 mc[model_used] = mc.get(model_used, 0) + 1
             if failed_id is not None:
-                self._state["failed_ids"].append(failed_id)
+                st["failed_ids"].append(failed_id)
             if log is not None:
                 kind, img_id, note = log[:3]
                 fname = log[3] if len(log) > 3 else ""
-                self._state["log"].append(
+                st["log"].append(
                     {"kind": kind, "id": img_id, "note": note, "file": fname}
                 )
             if stopped:
-                self._state["stopped"] = True
+                st["stopped"] = True
             if aborted:
-                self._state["aborted"] = True
+                st["aborted"] = True
+
+
+def resources_for(jtype: str) -> set:
+    """Public helper: the resources a job type would hold right now (factoring
+    the current faces-during-embed setting). Lets the API/UI reason about
+    conflicts without a JobManager instance."""
+    return JobManager._resources_for(jtype, {})
 
 
 # module-level singleton shared by the API

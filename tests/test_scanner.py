@@ -195,3 +195,45 @@ def test_duplicate_copies_recorded_in_dup_paths(tmp_path):
     scan_directory(str(root), out)
     entry = next(iter(catalog_db.load_all(out)["images"].values()))
     assert sorted(entry["dup_paths"]) == [str(b), str(c)]
+
+
+# ── media typing (photos vs videos) ───────────────────────────────────────────
+
+def test_is_video_path_and_media_extensions():
+    from pathlib import Path
+    import scanner
+    assert scanner.is_video_path("a.MP4") and scanner.is_video_path(Path("b.mkv"))
+    assert not scanner.is_video_path("c.jpg")
+    assert ".mp4" in scanner.MEDIA_EXTENSIONS and ".jpg" in scanner.MEDIA_EXTENSIONS
+    assert ".mp3" not in scanner.MEDIA_EXTENSIONS   # audio not media (for now)
+
+
+def test_media_fields_tags_video_with_probe(monkeypatch):
+    from pathlib import Path
+    import scanner, video
+    monkeypatch.setattr(video, "probe", lambda p: {
+        "duration_s": 12.5, "width": 1920, "height": 1080,
+        "codec": "h264", "capture_time": "2023-06-01T10:00:00Z"})
+    f = scanner._media_fields(Path("clip.mp4"))
+    assert f["media_type"] == "video"
+    assert f["duration_s"] == 12.5 and f["width"] == 1920 and f["codec"] == "h264"
+    assert f["metadata"]["date"] == "2023-06-01T10:00:00Z"
+
+
+def test_media_fields_tags_image(monkeypatch):
+    from pathlib import Path
+    import scanner
+    monkeypatch.setattr(scanner, "get_metadata", lambda p: {"camera_make": "X"})
+    f = scanner._media_fields(Path("photo.jpg"))
+    assert f["media_type"] == "image"
+    assert f["metadata"] == {"camera_make": "X"}
+    assert "duration_s" not in f
+
+
+def test_media_fields_video_probe_failure_still_catalogs(monkeypatch):
+    from pathlib import Path
+    import scanner, video
+    monkeypatch.setattr(video, "probe", lambda p: None)  # corrupt/undecodable
+    f = scanner._media_fields(Path("broken.mov"))
+    assert f["media_type"] == "video"
+    assert f["duration_s"] is None and f["metadata"] == {}
