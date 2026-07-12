@@ -41,7 +41,29 @@
   });
 
   async function refresh() {
-    try { persons = (await api.people()).people; } catch (e) { err = e.message; }
+    try {
+      const r = await api.people();
+      // Prefer the detailed list (name + relation + is_family); fall back to
+      // bare names for older servers.
+      persons = r.detailed
+        || (r.people || []).map((n) => ({ name: n, relation: "", is_family: false }));
+    } catch (e) { err = e.message; }
+  }
+
+  const RELATION_OPTIONS = ["", "self", "spouse", "partner", "mother", "father",
+    "son", "daughter", "brother", "sister", "grandmother", "grandfather",
+    "aunt", "uncle", "cousin", "niece", "nephew", "friend", "colleague", "other"];
+  let relationBusy = {};
+  let familyOnly = false;
+  $: shownPersons = familyOnly ? persons.filter((p) => p.is_family) : persons;
+
+  async function setRelation(name, relation) {
+    relationBusy = { ...relationBusy, [name]: true };
+    try {
+      await api.setPersonRelation(name, relation, null);
+      await refresh();
+    } catch (e) { err = e.message; }
+    relationBusy = { ...relationBusy, [name]: false };
   }
   async function loadFaceStatus() {
     try { fstatus = await api.facesStatus(); } catch {}
@@ -197,7 +219,14 @@
 
 <div class="layout">
   <section class="card col" style="flex:1; min-width:0">
-    <div class="section-label">Registered People</div>
+    <div class="row" style="justify-content:space-between; align-items:center">
+      <div class="section-label" style="margin:0">Registered People</div>
+      {#if persons.some((p) => p.is_family)}
+        <label class="row" style="gap:6px; font-size:12px; color:var(--muted)">
+          <input type="checkbox" bind:checked={familyOnly} style="width:auto" /> Family only
+        </label>
+      {/if}
+    </div>
     {#if err}<p style="color:var(--danger)">{err}</p>{/if}
     {#if loading}
       <p class="muted">Loading…</p>
@@ -207,18 +236,31 @@
       {#if indexedCount === 0}
         <p class="pill" style="color:var(--warn)">Index photos first to search by person.</p>
       {/if}
-      {#each persons as name}
-        <div class="row" style="justify-content:space-between">
-          <span>👤 <b>{name}</b></span>
-          <span class="row" style="gap:6px">
-            <button class="sm ghost" on:click={() => renamePersonUi(name)} title="Rename">✎</button>
-            <button class="sm ghost" on:click={() => deletePersonUi(name)} title="Remove person">✕</button>
-            <button on:click={() => find(name)} disabled={indexedCount === 0}>Find</button>
+      {#if familyOnly && shownPersons.length === 0}
+        <p class="muted">No one tagged as family yet — set a relation below.</p>
+      {/if}
+      {#each shownPersons as person (person.name)}
+        <div class="row" style="justify-content:space-between; align-items:center">
+          <span>👤 <b>{person.name}</b>
+            {#if person.is_family}<span class="fam-badge" title="Family member">family</span>{/if}
+          </span>
+          <span class="row" style="gap:6px; flex-wrap:wrap; align-items:center">
+            <select class="relation-select" value={person.relation}
+                    on:change={(e) => setRelation(person.name, e.target.value)}
+                    disabled={relationBusy[person.name]} title="Relationship (kept separate from the name)">
+              <option value="">— relation —</option>
+              {#each RELATION_OPTIONS.filter((r) => r) as rel}
+                <option value={rel}>{rel}</option>
+              {/each}
+            </select>
+            <button class="sm ghost" on:click={() => renamePersonUi(person.name)} title="Rename">✎</button>
+            <button class="sm ghost" on:click={() => deletePersonUi(person.name)} title="Remove person">✕</button>
+            <button on:click={() => find(person.name)} disabled={indexedCount === 0}>Find</button>
           </span>
         </div>
-        {#if active === name}
+        {#if active === person.name}
           {#if loadingFind}
-            <p class="muted">Finding photos of {name}…</p>
+            <p class="muted">Finding photos of {person.name}…</p>
           {:else}
             <PhotoGrid photos={results} cols={5}
                        on:select={(e) => dispatch("select", e.detail)} />
@@ -257,4 +299,9 @@
   .face { width: 52px; height: 52px; object-fit: cover; border-radius: 6px; border: 1px solid var(--border); display: block; }
   .meta { font-size: 12px; color: var(--muted); margin-top: 6px; }
   .cluster input { flex: 1; min-width: 0; }
+  .fam-badge { font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    color: var(--accent); border-radius: 4px; padding: 1px 6px; margin-left: 6px;
+    vertical-align: middle; }
+  .relation-select { font-size: 12px; padding: 3px 6px; max-width: 140px; }
 </style>

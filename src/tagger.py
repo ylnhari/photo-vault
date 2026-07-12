@@ -3,7 +3,7 @@ import json
 import threading
 import numpy as np
 from faces import detect_and_embed_faces
-from constants import PERSON_MAP_PATH
+from constants import PERSON_MAP_PATH, PERSON_RELATIONS_PATH
 
 # Guards every person_map.json read-modify-write cycle below. Without it,
 # two concurrent edits (e.g. register + rename in quick succession) can race:
@@ -68,7 +68,8 @@ def add_person_embedding(person_name, embedding):
 
 
 def rename_person(old_name, new_name):
-    """Rename a registered person. Raises KeyError/ValueError on bad input."""
+    """Rename a registered person. Raises KeyError/ValueError on bad input.
+    Carries the person's relation/family metadata across to the new name."""
     new_name = (new_name or "").strip()
     with _map_lock:
         person_map = _load_map()
@@ -80,6 +81,10 @@ def rename_person(old_name, new_name):
             raise ValueError(f"'{new_name}' already exists")
         person_map[new_name] = person_map.pop(old_name)
         _save_map(person_map)
+        relations = _load_relations()
+        if old_name in relations:
+            relations[new_name] = relations.pop(old_name)
+            _save_relations(relations)
 
 
 def delete_person(person_name) -> bool:
@@ -90,7 +95,86 @@ def delete_person(person_name) -> bool:
         person_map.pop(person_name, None)
         if existed:
             _save_map(person_map)
+        relations = _load_relations()
+        if person_name in relations:
+            relations.pop(person_name, None)
+            _save_relations(relations)
     return existed
+
+
+# ── Relation / family metadata (sidecar, keyed by person name) ────────────────
+
+_ALLOWED_RELATIONS = {
+    "self", "spouse", "partner", "mother", "father", "parent", "son", "daughter",
+    "child", "brother", "sister", "sibling", "grandmother", "grandfather",
+    "grandparent", "grandchild", "aunt", "uncle", "cousin", "niece", "nephew",
+    "in-law", "friend", "colleague", "other", "",
+}
+
+
+def set_relation(person_name, relation=None, is_family=None) -> bool:
+    """Attach relationship metadata to an existing person. `relation` is a free
+    label (validated against a known set, empty clears it); `is_family` is an
+    explicit flag — when None it defaults from whether the relation is a family
+    tie. Identity (the name) is never changed here. Returns True if the person
+    exists."""
+    person_name = (person_name or "").strip()
+    relation = (relation or "").strip().lower()
+    if relation and relation not in _ALLOWED_RELATIONS:
+        raise ValueError(f"unknown relation '{relation}'")
+    with _map_lock:
+        if person_name not in _load_map():
+            return False
+        relations = _load_relations()
+        fam = is_family
+        if fam is None:
+            non_family = {"friend", "colleague", "other", ""}
+            fam = bool(relation) and relation not in non_family
+        if not relation and is_family is None:
+            relations.pop(person_name, None)  # cleared
+        else:
+            relations[person_name] = {"relation": relation, "is_family": bool(fam)}
+        _save_relations(relations)
+    return True
+
+
+def get_relations() -> dict:
+    """{name: {"relation": str, "is_family": bool}} for people that have any."""
+    return _load_relations()
+
+
+def get_people_detailed() -> list:
+    """Every registered person with their relation metadata merged in, so the
+    People UI can show/filter identity + relationship together."""
+    relations = _load_relations()
+    out = []
+    for name in _load_map().keys():
+        meta = relations.get(name, {})
+        out.append({
+            "name": name,
+            "relation": meta.get("relation", ""),
+            "is_family": bool(meta.get("is_family", False)),
+        })
+    out.sort(key=lambda p: p["name"].lower())
+    return out
+
+
+def _load_relations():
+    if os.path.exists(PERSON_RELATIONS_PATH):
+        try:
+            with open(PERSON_RELATIONS_PATH, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_relations(relations):
+    os.makedirs(os.path.dirname(PERSON_RELATIONS_PATH), exist_ok=True)
+    tmp = PERSON_RELATIONS_PATH + ".tmp"
+    with open(tmp, 'w') as f:
+        json.dump(relations, f, indent=4)
+    os.replace(tmp, PERSON_RELATIONS_PATH)
 
 
 def get_person_embedding(person_name):

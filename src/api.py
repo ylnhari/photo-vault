@@ -69,6 +69,8 @@ from tagger import (
     get_all_persons,
     rename_person,
     delete_person,
+    set_relation,
+    get_people_detailed,
 )
 import dupes as dupes_mod
 import trash as trash_mod
@@ -1206,7 +1208,9 @@ def timeline(year: str | None = None, offset: int = 0, limit: int = 60):
 # ── people ────────────────────────────────────────────────────────────────────
 @app.get("/api/people")
 def people():
-    return {"people": get_all_persons()}
+    # `people` stays a flat name list (search's person filter + older callers);
+    # `detailed` adds each person's relation/family metadata for the People UI.
+    return {"people": get_all_persons(), "detailed": get_people_detailed()}
 
 
 @app.post("/api/people")
@@ -1251,6 +1255,25 @@ def person_delete(name: str):
     if not delete_person(name):
         raise HTTPException(404, "person not found")
     return {"ok": True}
+
+
+class RelationReq(BaseModel):
+    relation: str | None = None      # e.g. "daughter"; "" clears it
+    is_family: bool | None = None    # explicit override; None → derive from relation
+
+
+@app.put("/api/people/{name}/relation")
+def person_set_relation(name: str, req: RelationReq):
+    """Set a person's relationship/family metadata — identity (name) is
+    unchanged. Relation is a separate, structured field so 'name' stays the
+    unique identifier while 'daughter'/'spouse'/… describes the relationship."""
+    try:
+        ok = set_relation(name, relation=req.relation, is_family=req.is_family)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not ok:
+        raise HTTPException(404, "person not found")
+    return {"ok": True, "name": name, "relation": (req.relation or "").strip().lower()}
 
 
 # ── face clustering / tagging ─────────────────────────────────────────────────

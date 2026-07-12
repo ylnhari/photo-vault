@@ -9,6 +9,10 @@ CHROMA_DB_PATH = os.path.join(DATA_DIR, "chroma_db")
 FACE_DIR = os.path.join(DATA_DIR, "faces")
 THUMB_DIR = os.path.join(DATA_DIR, "thumbs")
 PERSON_MAP_PATH = os.path.join(DATA_DIR, "person_map.json")
+# Sidecar for per-person relation/family metadata, keyed by the same name as
+# person_map. Kept separate so the {name: embedding} map stays a clean vector
+# store — identity (name) is distinct from relationship (relation/family).
+PERSON_RELATIONS_PATH = os.path.join(DATA_DIR, "person_relations.json")
 
 
 def _load_port(default: int = 8768) -> int:

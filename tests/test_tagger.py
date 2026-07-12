@@ -232,3 +232,50 @@ def test_rename_person_stripped_duplicate_is_rejected(tmp_path):
     with patch("tagger.PERSON_MAP_PATH", str(person_map_path)):
         with pytest.raises(ValueError):
             rename_person("Alice", "  Bob  ")
+
+
+# ── relation / family metadata ────────────────────────────────────────────────
+
+def _relation_env(tmp_path):
+    return (patch("tagger.PERSON_MAP_PATH", str(tmp_path / "person_map.json")),
+            patch("tagger.PERSON_RELATIONS_PATH", str(tmp_path / "person_relations.json")))
+
+
+def test_set_relation_and_detailed(tmp_path):
+    import tagger
+    (tagger.PERSON_MAP_PATH, tagger.PERSON_RELATIONS_PATH)  # touch names
+    mp, rp = _relation_env(tmp_path)
+    with mp, rp:
+        # unknown person → cannot set
+        assert tagger.set_relation("Ghost", "daughter") is False
+        tagger._save_map({"Hasi": [0.1, 0.2], "Ravi": [0.3, 0.4]})
+        assert tagger.set_relation("Hasi", "daughter") is True   # family derived
+        assert tagger.set_relation("Ravi", "friend") is True     # not family
+        detailed = {p["name"]: p for p in tagger.get_people_detailed()}
+        assert detailed["Hasi"]["relation"] == "daughter" and detailed["Hasi"]["is_family"] is True
+        assert detailed["Ravi"]["relation"] == "friend" and detailed["Ravi"]["is_family"] is False
+
+
+def test_set_relation_rejects_unknown_and_clears(tmp_path):
+    import tagger
+    mp, rp = _relation_env(tmp_path)
+    with mp, rp:
+        tagger._save_map({"Hasi": [0.1]})
+        with pytest.raises(ValueError):
+            tagger.set_relation("Hasi", "bestie")   # not in allowed set
+        tagger.set_relation("Hasi", "daughter")
+        tagger.set_relation("Hasi", "")              # clear
+        assert tagger.get_relations() == {}
+
+
+def test_relation_follows_rename_and_delete(tmp_path):
+    import tagger
+    mp, rp = _relation_env(tmp_path)
+    with mp, rp:
+        tagger._save_map({"Hasi": [0.1]})
+        tagger.set_relation("Hasi", "daughter")
+        tagger.rename_person("Hasi", "Hasini")
+        assert tagger.get_relations()["Hasini"]["relation"] == "daughter"
+        assert "Hasi" not in tagger.get_relations()
+        tagger.delete_person("Hasini")
+        assert tagger.get_relations() == {}

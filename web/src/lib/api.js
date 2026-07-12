@@ -105,6 +105,8 @@ export const api = {
   renamePerson: (name, new_name) =>
     j("PUT", `/api/people/${encodeURIComponent(name)}`, { new_name }),
   deletePerson: (name) => j("DELETE", `/api/people/${encodeURIComponent(name)}`),
+  setPersonRelation: (name, relation, is_family) =>
+    j("PUT", `/api/people/${encodeURIComponent(name)}/relation`, { relation, is_family }),
 
   // Duplicates + trash
   duplicates: (threshold = 6, limit = 100) =>
