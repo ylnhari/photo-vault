@@ -99,6 +99,7 @@
   // ── orphaned ──────────────────────────────────────────────────────────────────
   let orphaned = { orphaned: [], total: 0 };
   let showOrphaned = false;
+  let showModels = false;  // "Captions by model" breakdown collapsed by default
   let orphanedBusy = false;
 
   // ── ingest / dedupe / backup ─────────────────────────────────────────────────
@@ -716,11 +717,30 @@
       {/if}
     </button>
   </div>
-  {#if mVision.model_summary && Object.keys(mVision.model_summary).length > 1}
-    <div class="model-summary">
-      {#each Object.entries(mVision.model_summary) as [label, count]}
-        <span class="badge">{label}: {count}</span>
-      {/each}
+  {#if $status.loaded && mVision.model_summary && Object.keys(mVision.model_summary).length > 0}
+    <div class="model-used">
+      <button class="model-used-head" on:click={() => (showModels = !showModels)}
+              aria-expanded={showModels}>
+        <span class="model-used-title">Captions by model
+          <span class="hint">· {Object.keys(mVision.model_summary).length} model{Object.keys(mVision.model_summary).length === 1 ? "" : "s"}</span>
+        </span>
+        <span class="chev">{showModels ? "▲" : "▼"}</span>
+      </button>
+      {#if showModels}
+        <p class="hint model-used-desc">
+          How many items each vision model has captioned. When a run falls back or 9Router
+          substitutes the serving model, the caption is credited to the model that actually
+          produced it. <code>skipped</code> entries couldn't be read.
+        </p>
+        <div class="model-used-list">
+          {#each Object.entries(mVision.model_summary).sort((a, b) => b[1] - a[1]) as [label, count]}
+            <div class="model-used-row">
+              <span class="model-used-name" title={label}>{label}</span>
+              <span class="model-used-count">{count.toLocaleString()}</span>
+            </div>
+          {/each}
+        </div>
+      {/if}
     </div>
   {/if}
 </div>
@@ -1621,6 +1641,22 @@
   .model-summary { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
   .badge { font-size: 11px; background: var(--surface2); border-radius: 4px;
     padding: 2px 7px; color: var(--muted); }
+  /* "Captions by model" collapsible breakdown (was a bare wall of badges). */
+  .model-used { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+  .model-used-head { width: 100%; display: flex; align-items: center; justify-content: space-between;
+    background: none; border: none; padding: 4px 0; cursor: pointer; color: var(--text); }
+  .model-used-title { font-size: 13px; font-weight: 600; }
+  .model-used .chev { color: var(--muted); font-size: 11px; }
+  .model-used-desc { margin: 4px 0 8px; }
+  /* Cap the height so a large model list scrolls instead of filling the page. */
+  .model-used-list { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column;
+    gap: 2px; border: 1px solid var(--border); border-radius: 8px; padding: 6px; }
+  .model-used-row { display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 3px 6px; border-radius: 6px; font-size: 12px; }
+  .model-used-row:nth-child(odd) { background: var(--bg); }
+  .model-used-name { color: var(--muted); font-family: ui-monospace, monospace; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .model-used-count { font-weight: 700; font-variant-numeric: tabular-nums; }
 
   /* folder management */
   .folder-list { margin: 8px 0 4px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }

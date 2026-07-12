@@ -398,7 +398,7 @@ def status():
         "thumbs_pending": idx.count_thumbs_missing(),
         "dhash_pending": sum(
             1 for d in idx.image_catalog.get("images", {}).values()
-            if not d.get("dhash")
+            if not d.get("dhash") and d.get("media_type") != "video"
         ),
         "trash_count": len(trash_mod.list_items()),
         "settings": s,
