@@ -2,7 +2,7 @@
   import { api } from "./api.js";
   import PhotoGrid from "./PhotoGrid.svelte";
   import { createEventDispatcher, onMount } from "svelte";
-  import { lastDeleted } from "./stores.js";
+  import { lastDeleted, status } from "./stores.js";
   export let indexedCount = 0;
   const dispatch = createEventDispatcher();
 
@@ -141,7 +141,14 @@
   }
 </script>
 
-{#if indexedCount === 0}
+{#if !$status.loaded}
+  <!-- Status hasn't loaded yet: show a loader, NOT the onboarding. indexedCount
+       is 0 on first paint before /api/status resolves, which used to flash the
+       "Set up your library" screen at users who already have a full library. -->
+  <div class="card onboard">
+    <p class="muted" style="text-align:center; margin:0">Loading your library…</p>
+  </div>
+{:else if indexedCount === 0}
   <div class="card onboard">
     <h2>Set up your library</h2>
     <ol>
