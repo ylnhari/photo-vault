@@ -63,6 +63,11 @@ def has_caption(img_data: dict) -> bool:
     cj = img_data.get("caption_json")
     if not cj:
         return bool(img_data.get("caption"))
+    if isinstance(cj, str) and '"caption": ""' not in cj and '"caption":""' not in cj:
+        # Fast path: the blank-caption pattern isn't present, so the caption is
+        # non-empty (or there's no caption field — unchanged behaviour). Avoids
+        # a json.loads on every one of 26k rows in the hot status/pending paths.
+        return True
     try:
         j = json.loads(cj) if isinstance(cj, str) else cj
     except (ValueError, TypeError):
@@ -186,6 +191,11 @@ _catalog_cache: dict = {"key": None, "data": None}
 
 # Short-TTL cache for the orphaned-file scan (see get_missing_files).
 _missing_files_cache: dict = {"key": None, "at": 0.0, "data": []}
+
+# Short-TTL cache for the all-attributes-unknown scan (see get_missing_attributes).
+# It pulls every row's metadata out of ChromaDB (~14s for 26k), which the hot
+# status poll can't afford to redo on every call.
+_missing_attrs_cache: dict = {"key": None, "at": 0.0, "data": []}
 
 
 def load_catalog_cached() -> dict:
@@ -390,14 +400,31 @@ class Indexer:
         which captions+embeds each item with the still-image pipeline). Videos
         are excluded — they have their own keyframe caption job (video_vision)
         and would otherwise be fed a video file where an image is expected."""
-        existing_ids = set(self._collection().get()["ids"])
+        # include=[] returns ids only; the default .get() also pulls every
+        # document + metadata for all 26k rows (~5s wasted) that we never use.
+        existing_ids = set(self._collection().get(include=[])["ids"])
         return [
             (img_id, img_data)
             for img_id, img_data in self.image_catalog["images"].items()
             if img_id not in existing_ids and not is_video(img_data)
         ]
 
-    def get_missing_attributes(self) -> list[tuple]:
+    def get_missing_attributes(self, use_cache: bool = False) -> list[tuple]:
+        """Items whose stored attributes are all 'unknown' (candidates for the
+        Re-analyze action). Pulling every metadata row from ChromaDB is ~14s at
+        26k rows, so the read-only status poll passes use_cache=True for a
+        short-TTL snapshot; the reanalyze job keeps the exact live check."""
+        global _missing_attrs_cache
+        key = _catalog_cache["key"]
+        # TTL-primary (not version-keyed): during an active job the catalog
+        # changes every item, which would bump the version and defeat a
+        # version-keyed cache — recomputing this ~8s scan on every status poll
+        # and making the whole dashboard read 0 while a job runs. A short TTL
+        # keeps the poll fast during jobs; the count just lags a few seconds.
+        if use_cache and _missing_attrs_cache["at"] > 0 and (
+            time.time() - _missing_attrs_cache["at"] < 20
+        ):
+            return _missing_attrs_cache["data"]
         result = self._collection().get(include=["metadatas"])
         catalog = self.image_catalog.get("images", {})
         stale = []
@@ -408,6 +435,7 @@ class Indexer:
             )
             if all_unknown and img_id in catalog:
                 stale.append((img_id, catalog[img_id]))
+        _missing_attrs_cache = {"key": key, "at": time.time(), "data": stale}
         return stale
 
     def get_missing_files(self, use_cache: bool = False) -> list[tuple]:
@@ -589,7 +617,7 @@ class Indexer:
         """Images with a non-empty caption but not yet in the active embedding
         collection. Blank-caption records are skipped — there's nothing
         meaningful to embed until vision fills them in (see has_caption)."""
-        existing_ids = set(self._collection().get()["ids"])
+        existing_ids = set(self._collection().get(include=[])["ids"])
         return [
             (img_id, img_data)
             for img_id, img_data in self.image_catalog["images"].items()
@@ -986,10 +1014,16 @@ class Indexer:
     # ── Perceptual hash (duplicates) ─────────────────────────────────────────
 
     def get_dhash_pending(self) -> list[tuple]:
+        # Videos are excluded: dhash is a perceptual hash of a still image (for
+        # near-duplicate photo detection). A video container can't be opened as
+        # an image, so dhash_one would fail on every one of them — and videos
+        # already dedupe by content-hash (media_hashes.json), not dhash. Without
+        # this exclusion the dhash job fails on all videos and the dashboard
+        # never clears "fingerprint pending".
         return [
             (img_id, data)
             for img_id, data in self.image_catalog.get("images", {}).items()
-            if not data.get("dhash")
+            if not data.get("dhash") and not is_video(data)
         ]
 
     def dhash_one(self, img_id: str) -> str:

@@ -363,7 +363,7 @@ def status():
         "stage": stage,
         "vision_pending": vision_pending,
         "embed_pending": embed_pending if csm or em else legacy_embed_pending,
-        "missing_attrs": len(idx.get_missing_attributes()),
+        "missing_attrs": len(idx.get_missing_attributes(use_cache=True)),
         "missing_full": len(idx.get_missing()),
         "missing_files": len(idx.get_missing_files(use_cache=True)),
         # New model-aware fields
