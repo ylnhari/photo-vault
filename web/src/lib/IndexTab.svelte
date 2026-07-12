@@ -692,13 +692,13 @@
     {/if}
   </div>
   <div class="pipeline" class:is-loading={!$status.loaded}>
-    <button class="stage" title="Go to Folder Management (A)" on:click={() => gotoSection("sec-scan")}>
+    <button class="stage" title="Go to Folder Management" on:click={() => gotoSection("sec-scan")}>
       <div class="num">{#if $status.loaded}{totalScanned}{:else}<span class="skeleton">—</span>{/if}</div>
       <div class="lbl">Scanned</div>
     </button>
     <div class="arrow">→</div>
     <button class="stage" class:pending={visionPending > 0}
-            title="Go to Vision analysis (B)" on:click={() => gotoSection("sec-vision")}>
+            title="Go to Photo captioning" on:click={() => gotoSection("sec-vision")}>
       <div class="num">{#if $status.loaded}{mVision.done ?? st.stage?.vision_done ?? 0}{:else}<span class="skeleton">—</span>{/if}</div>
       <div class="lbl">Captioned</div>
       {#if $status.loaded && visionPending > 0}<div class="pend">{visionPending} pending</div>{/if}
@@ -708,7 +708,7 @@
     </button>
     <div class="arrow">→</div>
     <button class="stage" class:pending={embedPending > 0}
-            title="Go to Embed (C)" on:click={() => gotoSection("sec-embed")}>
+            title="Go to Embed" on:click={() => gotoSection("sec-embed")}>
       <div class="num">{#if $status.loaded}{mEmbed.done ?? st.stage?.active_model_embedded ?? 0}{:else}<span class="skeleton">—</span>{/if}</div>
       <div class="lbl">Embedded</div>
       {#if $status.loaded && embedPending > 0}<div class="pend">{embedPending} pending</div>{/if}
@@ -993,7 +993,7 @@
 
 <!-- A: Folder Management -->
 <div class="card">
-  <SectionHead icon="📂" color="#3b82f6" title="A · Folder Management" id="sec-scan" />
+  <SectionHead icon="📂" color="#3b82f6" title="Folder Management" id="sec-scan" />
   <p class="hint">Manages which directories are scanned. Photos are tracked by content — moves and renames within scanned folders are detected automatically.</p>
 
   <div class="subsection-label">Included folders</div>
@@ -1148,9 +1148,9 @@
   <ErrLine {err} at={errAt} scope="import" onclear={clearErr} />
 </div>
 
-<!-- B: Vision analysis -->
+<!-- Photo captioning -->
 <div class="card">
-  <SectionHead icon="👁" color="#6366f1" title="B · Vision analysis" id="sec-vision">
+  <SectionHead icon="👁" color="#6366f1" title="Photo captioning" id="sec-vision">
     <span class="hint" style="font-weight:400">(image → caption + 12 attributes)</span>
   </SectionHead>
   {#if selectedVisionLabel}
@@ -1181,10 +1181,81 @@
   <ErrLine {err} at={errAt} scope="vision" onclear={clearErr} />
 </div>
 
-<!-- C: Embed -->
+<!-- Pipeline order: caption → faces → embed, with parallel photo/video tiles. -->
+
+<!-- Photo face detection -->
 <div class="card">
-  <SectionHead icon="🧬" color="#8b5cf6" title="C · Embed" id="sec-embed">
-    <span class="hint" style="font-weight:400">(caption → searchable vector)</span>
+  <SectionHead icon="🙂" color="#ec4899" title="Photo face detection" id="sec-faces">
+    <span class="hint" style="font-weight:400">(detect + embed faces for person search)</span>
+  </SectionHead>
+  <p class="hint">{facesDone} done · {facesPending} pending.
+    {settings.faces_during_embed ? "Also runs automatically during embedding." : "Runs only when you start it here."}</p>
+  {#if jobOf("faces")}
+    <JobPanel job={jobOf("faces")} on:stop={() => stopJob("faces")} on:retry={() => retry("faces")} on:clear={() => clearJob("faces")} />
+  {:else if facesPending === 0}
+    {#if totalScanned > 0}
+      <p class="ok-text">✓ All photos have been scanned for faces.</p>
+    {:else}
+      <p class="hint">No photos scanned yet — start with Folder Management above.</p>
+    {/if}
+  {:else if conflictFor("faces")}
+    <div class="blocked-row">⏸ Blocked — <b>{conflictFor("faces")}</b> is running, stop it first</div>
+  {:else}
+    <button class="primary" on:click={() => start("faces")}>
+      ▶ Detect faces in {facesPending} photo{facesPending === 1 ? "" : "s"}
+    </button>
+  {/if}
+  <ErrLine {err} at={errAt} scope="faces" onclear={clearErr} />
+</div>
+
+{#if videoTotal > 0}
+<!-- Video captioning (parallel to photo captioning) -->
+<div class="card">
+  <SectionHead icon="🎬" color="#6366f1" title="Video captioning" id="sec-video-vision">
+    <span class="hint" style="font-weight:400">(caption videos from sampled keyframes)</span>
+  </SectionHead>
+  <p class="hint">{videoTotal.toLocaleString()} video{videoTotal === 1 ? "" : "s"} in the library ·
+    {videoVisionPending.toLocaleString()} to caption.
+    Captioned from a few sampled frames using your Vision model, then searchable like photos.</p>
+  {#if jobOf("video_vision")}
+    <JobPanel job={jobOf("video_vision")} on:stop={() => stopJob("video_vision")} on:retry={() => retry("video_vision")} on:clear={() => clearJob("video_vision")} />
+  {:else if videoVisionPending === 0}
+    <p class="ok-text">✓ All videos captioned.</p>
+  {:else if conflictFor("video_vision")}
+    <div class="blocked-row">⏸ Blocked — <b>{conflictFor("video_vision")}</b> is running, stop it first</div>
+  {:else}
+    <button class="primary" on:click={() => start("video_vision")}>
+      ▶ Caption {videoVisionPending.toLocaleString()} video{videoVisionPending === 1 ? "" : "s"}
+    </button>
+  {/if}
+  <ErrLine {err} at={errAt} scope="video" onclear={clearErr} />
+</div>
+
+<!-- Video face detection (parallel to photo face detection) -->
+<div class="card">
+  <SectionHead icon="🙂" color="#ec4899" title="Video face detection" id="sec-video-faces">
+    <span class="hint" style="font-weight:400">(find faces in videos, from sampled keyframes)</span>
+  </SectionHead>
+  <p class="hint">{videoFacesPending.toLocaleString()} of {videoTotal.toLocaleString()} video{videoTotal === 1 ? "" : "s"} still to scan for faces.</p>
+  {#if jobOf("video_faces")}
+    <JobPanel job={jobOf("video_faces")} on:stop={() => stopJob("video_faces")} on:retry={() => retry("video_faces")} on:clear={() => clearJob("video_faces")} />
+  {:else if videoFacesPending === 0}
+    <p class="ok-text">✓ All videos scanned for faces.</p>
+  {:else if conflictFor("video_faces")}
+    <div class="blocked-row">⏸ Blocked — <b>{conflictFor("video_faces")}</b> is running, stop it first</div>
+  {:else}
+    <button class="primary" on:click={() => start("video_faces")}>
+      🙂 Find faces in {videoFacesPending.toLocaleString()} video{videoFacesPending === 1 ? "" : "s"}
+    </button>
+  {/if}
+  <ErrLine {err} at={errAt} scope="video" onclear={clearErr} />
+</div>
+{/if}
+
+<!-- Embed — after captions + faces for BOTH photos and videos -->
+<div class="card">
+  <SectionHead icon="🧬" color="#8b5cf6" title="Embed" id="sec-embed">
+    <span class="hint" style="font-weight:400">(caption → searchable vector · runs last)</span>
   </SectionHead>
   {#if settings.caption_source_model}
     <p class="hint">Source: captions from <code>{settings.caption_source_model}</code>
@@ -1212,13 +1283,13 @@
   {:else if embedPending === 0 && mEmbed.eligible > 0}
     <p class="ok-text">✓ All eligible captions are embedded.</p>
   {:else if embedPending === 0}
-    <p class="hint">Run vision analysis first (B).</p>
+    <p class="hint">Caption photos and videos first (above).</p>
   {:else if conflictFor("embed")}
     <div class="blocked-row">⏸ Blocked — <b>{conflictFor("embed")}</b> is running, stop it first</div>
   {:else}
     <button class="primary" on:click={() => start("embed")} disabled={noServices || embedCfgIncomplete}
             title={embedCfgIncomplete ? "Pick a 9Router embedding model in Run configuration first" : ""}>
-      ▶ Embed {embedPending} photo{embedPending === 1 ? "" : "s"}
+      ▶ Embed {embedPending} item{embedPending === 1 ? "" : "s"}
     </button>
     {#if embedCfgIncomplete}
       <p class="warn-text hint">Blocked: 9Router is selected for embedding but no model is chosen.</p>
@@ -1226,67 +1297,6 @@
   {/if}
   <ErrLine {err} at={errAt} scope="embed" onclear={clearErr} />
 </div>
-
-<!-- C2: Face detection (separate, user-controlled stage) -->
-<div class="card">
-  <SectionHead icon="🙂" color="#ec4899" title="Face detection">
-    <span class="hint" style="font-weight:400">(detect + embed faces for person search)</span>
-  </SectionHead>
-  <p class="hint">{facesDone} done · {facesPending} pending.
-    {settings.faces_during_embed ? "Also runs automatically during embedding." : "Runs only when you start it here."}</p>
-  {#if jobOf("faces")}
-    <JobPanel job={jobOf("faces")} on:stop={() => stopJob("faces")} on:retry={() => retry("faces")} on:clear={() => clearJob("faces")} />
-  {:else if facesPending === 0}
-    {#if totalScanned > 0}
-      <p class="ok-text">✓ All photos have been scanned for faces.</p>
-    {:else}
-      <p class="hint">No photos scanned yet — start with section A.</p>
-    {/if}
-  {:else if conflictFor("faces")}
-    <div class="blocked-row">⏸ Blocked — <b>{conflictFor("faces")}</b> is running, stop it first</div>
-  {:else}
-    <button class="primary" on:click={() => start("faces")}>
-      ▶ Detect faces in {facesPending} photo{facesPending === 1 ? "" : "s"}
-    </button>
-  {/if}
-  <ErrLine {err} at={errAt} scope="faces" onclear={clearErr} />
-</div>
-
-<!-- C3: Video analysis (keyframe captioning + faces) -->
-{#if videoTotal > 0}
-<div class="card">
-  <SectionHead icon="🎬" color="#6366f1" title="Video analysis">
-    <span class="hint" style="font-weight:400">(caption + find faces in videos, from sampled keyframes)</span>
-  </SectionHead>
-  <p class="hint">{videoTotal.toLocaleString()} video{videoTotal === 1 ? "" : "s"} in the library ·
-    {videoVisionPending.toLocaleString()} to caption · {videoFacesPending.toLocaleString()} to scan for faces.
-    Videos are captioned from a few sampled frames using your Vision model above, then searchable like photos.</p>
-  {#if jobOf("video_vision")}
-    <JobPanel job={jobOf("video_vision")} on:stop={() => stopJob("video_vision")} on:retry={() => retry("video_vision")} on:clear={() => clearJob("video_vision")} />
-  {/if}
-  {#if jobOf("video_faces")}
-    <JobPanel job={jobOf("video_faces")} on:stop={() => stopJob("video_faces")} on:retry={() => retry("video_faces")} on:clear={() => clearJob("video_faces")} />
-  {/if}
-  {#if !jobOf("video_vision") && !jobOf("video_faces")}
-    <div class="row" style="gap:8px; flex-wrap:wrap">
-      <button class="primary" disabled={videoVisionPending === 0 || !!conflictFor("video_vision")}
-              on:click={() => start("video_vision")}
-              title={conflictFor("video_vision") ? `${conflictFor("video_vision")} is running` : ""}>
-        ▶ Caption {videoVisionPending.toLocaleString()} video{videoVisionPending === 1 ? "" : "s"}
-      </button>
-      <button disabled={videoFacesPending === 0 || !!conflictFor("video_faces")}
-              on:click={() => start("video_faces")}
-              title={conflictFor("video_faces") ? `${conflictFor("video_faces")} is running` : ""}>
-        🙂 Find faces in {videoFacesPending.toLocaleString()} video{videoFacesPending === 1 ? "" : "s"}
-      </button>
-    </div>
-    {#if videoVisionPending === 0 && videoFacesPending === 0}
-      <p class="ok-text" style="margin-top:8px">✓ All videos captioned and scanned for faces.</p>
-    {/if}
-  {/if}
-  <ErrLine {err} at={errAt} scope="video" onclear={clearErr} />
-</div>
-{/if}
 
 <!-- Thumbnails: pregenerate grid previews -->
 <div class="card">
@@ -1437,7 +1447,7 @@
 
 <!-- D: Full index -->
 <div class="card">
-  <SectionHead icon="⚡" color="#22c55e" title="D · Full index">
+  <SectionHead icon="⚡" color="#22c55e" title="Full index">
     <span class="hint" style="font-weight:400">(caption + embed in one pass)</span>
   </SectionHead>
   {#if jobOf("full")}
@@ -1465,7 +1475,7 @@
 
 <!-- E: Re-analyze -->
 <div class="card">
-  <SectionHead icon="🔄" color="#fb923c" title="E · Re-analyze">
+  <SectionHead icon="🔄" color="#fb923c" title="Re-analyze">
     <span class="hint" style="font-weight:400">(refresh captions + re-embed)</span>
   </SectionHead>
   {#if jobOf("reanalyze")}
@@ -1489,7 +1499,7 @@
 
 <!-- F: Active search model -->
 <div class="card">
-  <div class="section-label">F · Active search model <span class="hint">(index used by Search + Timeline)</span></div>
+  <div class="section-label">Active search model <span class="hint">(index used by Search + Timeline)</span></div>
   {#if !$models.loaded}
     <p class="hint">Loading…</p>
   {:else if Object.keys($models.models).length === 0}
