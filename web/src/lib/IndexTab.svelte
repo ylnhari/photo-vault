@@ -908,14 +908,10 @@
     {/if}
   </div>
 
-  <!-- Max failures + face toggle -->
-  <div style="margin-top:12px; display:flex; flex-direction:column; gap:10px">
-    <label class="row" style="gap:8px; font-size:13px">
-      Abort job after
-      <input type="number" bind:value={settings.max_fail} min="1" max="50"
-             on:change={markDirty} style="width:60px" />
-      consecutive failures
-    </label>
+  <!-- Stage-specific settings, grouped by the stage they affect (captioning,
+       video, faces) instead of one undifferentiated list. -->
+  <div class="settings-group">
+    <div class="settings-group-label">👁 Photo &amp; video captioning</div>
     <label class="row" style="gap:8px; font-size:13px; flex-wrap:wrap">
       Max caption tokens
       <input type="number" bind:value={settings.vision_max_tokens} min="256" max="16384" step="256"
@@ -925,6 +921,16 @@
         spend hidden reasoning tokens against this budget. Truncated captions also grow the
         budget automatically, so this is rarely needed.</span>
     </label>
+    <label class="row" style="gap:8px; font-size:13px">
+      Abort job after
+      <input type="number" bind:value={settings.max_fail} min="1" max="50"
+             on:change={markDirty} style="width:60px" />
+      consecutive failures
+    </label>
+  </div>
+
+  <div class="settings-group">
+    <div class="settings-group-label">🎬 Video</div>
     <label class="row" style="gap:8px; font-size:13px; flex-wrap:wrap">
       Keyframes per video
       <input type="number" bind:value={settings.video_frames} min="1" max="12" step="1"
@@ -934,11 +940,15 @@
         Higher = richer coverage of long clips but more calls/quota; lower = faster &amp;
         cheaper. Default 4.</span>
     </label>
+  </div>
+
+  <div class="settings-group">
+    <div class="settings-group-label">🙂 Face detection</div>
     <label class="row" style="gap:8px; font-size:13px">
       <input type="checkbox" bind:checked={settings.faces_during_embed}
              on:change={markDirty} style="width:auto" />
       Detect faces during embedding
-      <span class="hint">(off → run face detection separately below)</span>
+      <span class="hint">(off → run face detection separately in its own section)</span>
     </label>
     <label class="row" style="gap:8px; font-size:13px; flex-wrap:wrap">
       Face detection runs on
@@ -1667,6 +1677,11 @@
   .model-used-name { color: var(--muted); font-family: ui-monospace, monospace; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
   .model-used-count { font-weight: 700; font-variant-numeric: tabular-nums; }
+  /* Stage-grouped settings (captioning / video / faces) inside Model Config. */
+  .settings-group { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px;
+    display: flex; flex-direction: column; gap: 10px; }
+  .settings-group-label { font-size: 12px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .05em; }
 
   /* folder management */
   .folder-list { margin: 8px 0 4px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
