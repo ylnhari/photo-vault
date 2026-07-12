@@ -383,6 +383,38 @@ def test_get_stage_stats_counts_captioned(tmp_path):
     assert stats["active_model_embedded"] == 1
 
 
+def test_blank_caption_is_not_counted_as_captioned(tmp_path):
+    """Regression: a vision model that returns an explicit empty caption
+    ('caption': '') while filling other attributes must NOT be treated as
+    captioned — otherwise the record is marked done and get_vision_pending
+    never re-queues it. A caption_json without a caption field at all keeps its
+    old 'captioned' meaning."""
+    from indexer import Indexer, has_caption
+    blank = {"path": "/blank.jpg", "filename": "blank.jpg", "metadata": {},
+             "caption_json": '{"caption": "", "scene": "indoor"}'}
+    real = {"path": "/real.jpg", "filename": "real.jpg", "metadata": {},
+            "caption_json": '{"caption": "a dog on grass"}'}
+    nofield = {"path": "/nf.jpg", "filename": "nf.jpg", "metadata": {},
+               "caption_json": '{"c": "x"}'}
+    assert not has_caption(blank)
+    assert has_caption(real)
+    assert has_caption(nofield)  # no caption field → unchanged (captioned)
+
+    catalog = {"images": {"blank": blank, "real": real}}
+    catalog_path = _seed_catalog_db(tmp_path, catalog)
+    mock_client, col = _mock_chromadb(existing_ids=[])
+    reg = {"active_model": "m", "models": {"m": {"source": "lm_studio", "dimension": 3}}}
+    with patch("indexer.IMAGE_CATALOG_PATH", str(catalog_path)), \
+         patch("indexer.db.client", return_value=mock_client), \
+         patch("indexer.get_registry", return_value=reg), \
+         patch("indexer.get_active_model", return_value="m"):
+        idx = Indexer()
+        pending_ids = {i for i, _ in idx.get_vision_pending()}
+        stats = idx.get_stage_stats()
+    assert "blank" in pending_ids and "real" not in pending_ids
+    assert stats["vision_done"] == 1 and stats["vision_pending"] == 1
+
+
 def test_get_stage_stats_embed_pending_never_negative(tmp_path):
     """Regression: if the active collection has MORE embedded ids than the
     catalog has captions for (e.g. stale entries after a failed/partial Chroma

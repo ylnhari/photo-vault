@@ -35,6 +35,44 @@ def _caption_has_error(text: str) -> bool:
         return False
 
 
+def caption_text(img_data: dict) -> str:
+    """The human caption currently stored for an item, or '' if none. The full
+    attribute JSON lives in caption_json; the caption is its 'caption' field.
+    Falls back to a flat 'caption' field for older records."""
+    cj = img_data.get("caption_json")
+    if cj:
+        try:
+            j = json.loads(cj) if isinstance(cj, str) else cj
+            if isinstance(j, dict):
+                cap = j.get("caption")
+                if isinstance(cap, str) and cap.strip():
+                    return cap.strip()
+        except (ValueError, TypeError):
+            pass
+    cap = img_data.get("caption")
+    return cap.strip() if isinstance(cap, str) and cap.strip() else ""
+
+
+def has_caption(img_data: dict) -> bool:
+    """True when the item has a usable caption. Guards the bug where some vision
+    models return an explicit blank caption ('caption': '') while still filling
+    the other attributes: a present-but-blank caption_json used to count as
+    'captioned', so the item was marked done and never re-queued. Only an
+    explicit empty 'caption' field counts as not-captioned — a caption_json with
+    no caption field at all is left as captioned (unchanged behaviour)."""
+    cj = img_data.get("caption_json")
+    if not cj:
+        return bool(img_data.get("caption"))
+    try:
+        j = json.loads(cj) if isinstance(cj, str) else cj
+    except (ValueError, TypeError):
+        return True  # present but unparseable — had content; leave as captioned
+    if isinstance(j, dict) and "caption" in j:
+        cap = j.get("caption")
+        return bool(isinstance(cap, str) and cap.strip())
+    return True  # caption_json present without a caption field — unchanged
+
+
 def _record_caption_history(img_data: dict, model: str, text: str):
     """Keep one caption per vision model. Re-running with the same model replaces it;
     a different model is appended. caption_json/caption_model always hold the latest."""
@@ -500,7 +538,7 @@ class Indexer:
         return [
             (img_id, img_data)
             for img_id, img_data in self.image_catalog["images"].items()
-            if not img_data.get("caption_json") and not is_video(img_data)
+            if not has_caption(img_data) and not is_video(img_data)
         ]
 
     def get_vision_pending_for_model(self, model_label: str) -> list[tuple]:
@@ -521,7 +559,7 @@ class Indexer:
         return [
             (img_id, img_data)
             for img_id, img_data in self.image_catalog["images"].items()
-            if is_video(img_data) and not img_data.get("caption_json")
+            if is_video(img_data) and not has_caption(img_data)
         ]
 
     def get_video_faces_pending(self) -> list[tuple]:
@@ -548,12 +586,14 @@ class Indexer:
         }
 
     def get_embed_pending(self) -> list[tuple]:
-        """Images with caption_json but not yet in the active embedding collection."""
+        """Images with a non-empty caption but not yet in the active embedding
+        collection. Blank-caption records are skipped — there's nothing
+        meaningful to embed until vision fills them in (see has_caption)."""
         existing_ids = set(self._collection().get()["ids"])
         return [
             (img_id, img_data)
             for img_id, img_data in self.image_catalog["images"].items()
-            if img_data.get("caption_json") and img_id not in existing_ids
+            if has_caption(img_data) and img_id not in existing_ids
         ]
 
     def get_embed_pending_for_model(self, embed_model_name: str,
@@ -597,9 +637,9 @@ class Indexer:
         photos = [d for d in catalog.values() if not is_video(d)]
         videos = [d for d in catalog.values() if is_video(d)]
         photo_total = len(photos)
-        captioned = sum(1 for d in photos if d.get("caption_json"))
+        captioned = sum(1 for d in photos if has_caption(d))
         video_total = len(videos)
-        video_captioned = sum(1 for d in videos if d.get("caption_json"))
+        video_captioned = sum(1 for d in videos if has_caption(d))
 
         reg = get_registry()
         active_model = reg.get("active_model")
