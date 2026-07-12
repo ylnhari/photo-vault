@@ -13,7 +13,9 @@ export const health = writable({
 // Shared shape so a failed refreshStatus() can reset to a clear "unknown"
 // state instead of leaving stale numbers in place (see refreshStatus below).
 const STATUS_DEFAULT = {
-  loaded: false,
+  loaded: false,   // false until the FIRST successful load — UI shows a skeleton
+  loading: false,  // a refresh is in flight
+  error: false,    // the last refresh failed — UI keeps last-good numbers + a hint
   stage: { total_scanned: 0, vision_done: 0, vision_pending: 0,
            active_model: null, active_model_embedded: 0, embed_pending: 0, models: {} },
   vision_pending: 0, embed_pending: 0, missing_attrs: 0, missing_full: 0, missing_files: 0,
@@ -62,13 +64,17 @@ export async function refreshHealth() {
 }
 
 export async function refreshStatus() {
+  status.update((s) => ({ ...s, loading: true }));
   try {
     const s = await api.status();
-    status.set({ loaded: true, ...s });
+    status.set({ ...STATUS_DEFAULT, ...s, loaded: true, loading: false, error: false });
   } catch {
-    // Reset to the default/unknown shape (like refreshHealth/refreshModels)
-    // instead of silently keeping stale counts presented as current.
-    status.set({ ...STATUS_DEFAULT, loaded: true });
+    // Do NOT zero the numbers on a failed/slow poll — that made a mere timeout
+    // look like the whole library had been wiped (0 scanned/captioned/embedded).
+    // Keep the last-good values and flag the refresh as errored so the UI can
+    // show a subtle "couldn't refresh" hint instead of a scary 0. `loaded`
+    // stays whatever it was: false (still skeleton) if we never succeeded once.
+    status.update((s) => ({ ...s, loading: false, error: true }));
   }
 }
 

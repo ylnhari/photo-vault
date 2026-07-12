@@ -679,19 +679,28 @@
 <div class="card">
   <div class="row" style="justify-content:space-between">
     <div class="section-label">Pipeline</div>
-    <button class="ghost sm" on:click={refreshStatus}>Refresh</button>
+    {#if $status.loading && !$status.loaded}
+      <span class="hint" style="font-size:12px">Loading…</span>
+    {:else if $status.error}
+      <button class="ghost sm" on:click={refreshStatus}
+              title="Last refresh didn't complete — showing last-known numbers">⚠ Retry</button>
+    {:else if $status.loading}
+      <span class="hint" style="font-size:12px">Refreshing…</span>
+    {:else}
+      <button class="ghost sm" on:click={refreshStatus}>Refresh</button>
+    {/if}
   </div>
-  <div class="pipeline">
+  <div class="pipeline" class:is-loading={!$status.loaded}>
     <button class="stage" title="Go to Folder Management (A)" on:click={() => gotoSection("sec-scan")}>
-      <div class="num">{totalScanned}</div>
+      <div class="num">{#if $status.loaded}{totalScanned}{:else}<span class="skeleton">—</span>{/if}</div>
       <div class="lbl">Scanned</div>
     </button>
     <div class="arrow">→</div>
     <button class="stage" class:pending={visionPending > 0}
             title="Go to Vision analysis (B)" on:click={() => gotoSection("sec-vision")}>
-      <div class="num">{mVision.done ?? st.stage?.vision_done ?? 0}</div>
+      <div class="num">{#if $status.loaded}{mVision.done ?? st.stage?.vision_done ?? 0}{:else}<span class="skeleton">—</span>{/if}</div>
       <div class="lbl">Captioned</div>
-      {#if visionPending > 0}<div class="pend">{visionPending} pending</div>{/if}
+      {#if $status.loaded && visionPending > 0}<div class="pend">{visionPending} pending</div>{/if}
       {#if mVision.selected_label}
         <div class="model-badge">{mVision.selected_label}</div>
       {/if}
@@ -699,9 +708,9 @@
     <div class="arrow">→</div>
     <button class="stage" class:pending={embedPending > 0}
             title="Go to Embed (C)" on:click={() => gotoSection("sec-embed")}>
-      <div class="num">{mEmbed.done ?? st.stage?.active_model_embedded ?? 0}</div>
+      <div class="num">{#if $status.loaded}{mEmbed.done ?? st.stage?.active_model_embedded ?? 0}{:else}<span class="skeleton">—</span>{/if}</div>
       <div class="lbl">Embedded</div>
-      {#if embedPending > 0}<div class="pend">{embedPending} pending</div>{/if}
+      {#if $status.loaded && embedPending > 0}<div class="pend">{embedPending} pending</div>{/if}
       {#if mEmbed.selected_model}
         <div class="model-badge">{mEmbed.selected_model}</div>
       {/if}
@@ -1599,6 +1608,11 @@
     background: var(--bg); border: 1px solid var(--border); }
   .stage.pending { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
   .stage .num { font-size: 26px; font-weight: 700; }
+  /* First-load skeleton: pulse a placeholder instead of a misleading "0" until
+     the first successful status fetch arrives. */
+  .pipeline.is-loading .num .skeleton { color: var(--muted); opacity: .5;
+    animation: pv-pulse 1.1s ease-in-out infinite; }
+  @keyframes pv-pulse { 0%,100% { opacity: .25; } 50% { opacity: .6; } }
   .stage .lbl { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing:.06em; }
   .stage .pend { font-size: 11px; color: var(--warn); margin-top: 4px; }
   .stage .model-badge { font-size: 10px; color: var(--muted); margin-top: 4px;

@@ -555,13 +555,49 @@ def validate_vision_output(text: str) -> dict:
     return {"valid": True, "warning": None}
 
 
-def _call_lm_studio(base64_image: str, model: str = "vision-model") -> str:
+class LMStudioNoVisionModel(RuntimeError):
+    """LM Studio is reachable but has no VLM loaded to caption with."""
+
+
+def _lm_vision_model_name() -> str | None:
+    """Bare id of the currently loaded LM Studio vision (vlm) model, or None if
+    none can be resolved. Used to send a REAL model id to the OpenAI-compat
+    endpoint instead of the placeholder 'vision-model', which LM Studio 400s on.
+    Prefers the v0 API's real 'loaded' vlm; when v0 is unavailable (old LM
+    Studio), falls back to the first /v1/models id — still a real id, unlike the
+    placeholder — mirroring _lm_model_id()."""
+    v0 = list_lm_studio_models_v0()
+    for m in v0:
+        if m.get("state") == "loaded" and m.get("type") == "vlm":
+            return m.get("id")
+    if not v0:  # v0 unavailable — best-effort first /v1/models id
+        try:
+            models = _get_lm_client().models.list()
+            if models.data:
+                return models.data[0].id
+        except Exception:
+            pass
+    return None
+
+
+def _call_lm_studio(base64_image: str, model: str = None) -> str:
     client = _get_lm_client()
+    # Resolve a real loaded VLM when the caller didn't pin one. The old default
+    # ("vision-model") is not a real model id, so LM Studio returned HTTP 400 —
+    # which is exactly what made "Re-analyze" fail silently with lm_studio +
+    # no explicit model. If nothing suitable is loaded, raise a clear error the
+    # UI can surface (and that lets "auto" fall back to Gemini).
+    resolved = model or _lm_vision_model_name()
+    if not resolved:
+        raise LMStudioNoVisionModel(
+            "LM Studio has no vision model loaded — load a VLM in LM Studio, "
+            "or pick a different provider/model."
+        )
 
     def _one(max_tok):
         ratelimit.acquire("lm_studio")
         response = client.chat.completions.create(
-            model=model or "vision-model",
+            model=resolved,
             messages=[
                 {
                     "role": "user",
@@ -756,8 +792,8 @@ def get_image_caption(
     except ratelimit.Cancelled:
         raise
     except Exception as e:
-        if _is_connection_error(e):
-            print(f"[vision] LM Studio offline, falling back to Gemini")
+        if _is_connection_error(e) or isinstance(e, LMStudioNoVisionModel):
+            print(f"[vision] LM Studio unavailable ({e}), falling back to Gemini")
             try:
                 text, used_model = _call_gemini(base64_image)
                 return _ret(text, f"gemini:{used_model}")
@@ -783,11 +819,17 @@ def _oai_video_content(prompt: str, frames_b64: list[str]) -> list[dict]:
 
 def _call_lm_studio_video(frames_b64: list[str], prompt: str, model: str = None) -> str:
     client = _get_lm_client()
+    resolved = model or _lm_vision_model_name()
+    if not resolved:
+        raise LMStudioNoVisionModel(
+            "LM Studio has no vision model loaded — load a VLM in LM Studio, "
+            "or pick a different provider/model."
+        )
 
     def _one(max_tok):
         ratelimit.acquire("lm_studio")
         response = client.chat.completions.create(
-            model=model or "vision-model",
+            model=resolved,
             messages=[{"role": "user", "content": _oai_video_content(prompt, frames_b64)}],
             max_tokens=max_tok,
         )
