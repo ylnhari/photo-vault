@@ -4,6 +4,18 @@ import urllib.error
 from unittest.mock import patch, MagicMock
 
 
+@pytest.fixture(autouse=True)
+def _reset_service_status_memo():
+    """service_status() memoizes its probe result for a few seconds (so the
+    dashboard's on-load fetch is instant). That module-level cache would leak a
+    prior test's mocked service state into the next call, so clear it around
+    every test — each test drives its own mocked probes and expects them read."""
+    import validator
+    validator._status_cache = {"at": 0.0, "data": None}
+    yield
+    validator._status_cache = {"at": 0.0, "data": None}
+
+
 def _http_ok():
     class _Resp:
         def read(self): return b"{}"

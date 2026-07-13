@@ -4,6 +4,7 @@ PersistentClient(path=...), which reopens the on-disk store each time. This
 module hands back one process-wide client and a collection helper.
 """
 import threading
+import time
 
 import chromadb
 
@@ -12,6 +13,18 @@ from embeddings import collection_name_for, get_active_model
 
 _client = None
 _client_lock = threading.Lock()
+
+# Shared short-TTL snapshot of a collection's full metadata set. Pulling every
+# row's metadata (`collection.get(include=["metadatas"])`) is a ~3–4s scan at
+# ~26k rows, and TWO hot read paths need it on the initial dashboard load — the
+# Search filter-values scan and the status "all-attributes-unknown" scan — so
+# without sharing they each pay it (and contend on the GIL). Cache one snapshot,
+# keyed on (collection name, row count), behind a lock so a burst of concurrent
+# callers triggers a single fetch. TTL is short so re-captioned/edited metadata
+# surfaces in the UI within a few seconds.
+_ALL_META_TTL = 5.0
+_all_meta_cache: dict = {"key": None, "at": 0.0, "data": None}
+_all_meta_lock = threading.Lock()
 
 
 def client():
@@ -47,6 +60,30 @@ def collection(model_name: str | None = None, *, allow_default: bool = False):
             )
     name = collection_name_for(model_name)
     return client().get_or_create_collection(name=name)
+
+
+def all_metadatas(col=None, ttl: float = _ALL_META_TTL) -> dict:
+    """Cached full-collection metadata pull, shared across the read paths that
+    each need every row's metadata on the same dashboard load (see the cache
+    note above). Returns the raw ChromaDB shape {"ids": [...], "metadatas": [...]}.
+    Falls back to the active collection when `col` is None."""
+    c = col if col is not None else collection(allow_default=True)
+    key = (c.name, c.count())
+    now = time.time()
+    cached = _all_meta_cache
+    if cached["key"] == key and cached["data"] is not None and now - cached["at"] < ttl:
+        return cached["data"]
+    with _all_meta_lock:
+        # Re-check under the lock so concurrent first-callers pull only once.
+        if (
+            _all_meta_cache["key"] == key
+            and _all_meta_cache["data"] is not None
+            and time.time() - _all_meta_cache["at"] < ttl
+        ):
+            return _all_meta_cache["data"]
+        data = c.get(include=["metadatas"])
+        _all_meta_cache.update({"key": key, "at": time.time(), "data": data})
+        return data
 
 
 FACES_COLLECTION = "faces"

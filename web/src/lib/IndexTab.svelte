@@ -478,7 +478,7 @@
     // previously only fetched on mount, so a model unloaded in LM Studio
     // kept showing "● loaded" here forever.
     await Promise.all([
-      refreshHealth(),
+      refreshHealth(true),  // force a live probe — bypass the health memo
       api.providerModels().then(r => { pmodels = r; }).catch(() => {}),
     ]);
     rechecking = false;

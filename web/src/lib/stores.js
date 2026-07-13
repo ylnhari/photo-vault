@@ -53,9 +53,9 @@ export async function refreshJob() {
   }
 }
 
-export async function refreshHealth() {
+export async function refreshHealth(fresh = false) {
   try {
-    const h = await api.health();
+    const h = await api.health(fresh);
     health.set({ loaded: true, ...h });
   } catch {
     health.set({ loaded: true, lm_studio: false, gemini: false, gemini_key_set: false,

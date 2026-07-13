@@ -3,6 +3,35 @@ import os
 import pytest
 from unittest.mock import patch, MagicMock, call
 import catalog_db
+from indexer import resolve_photo_date
+
+
+# ── date resolution (Timeline + Search Year share this) ───────────────────────
+
+def test_resolve_photo_date_prefers_exif():
+    d = {"metadata": {"date": "2015:06:20 10:00:00"}, "filename": "IMG_20170208.jpg", "created_at": 1721000000}
+    assert resolve_photo_date(d).startswith("2015:06:20")
+
+
+def test_resolve_photo_date_recovers_from_filename_whatsapp():
+    d = {"metadata": {}, "filename": "IMG-20170511-WA0039.jpg", "created_at": 1721000000}
+    assert resolve_photo_date(d).startswith("2017:05:11")
+
+
+def test_resolve_photo_date_recovers_epoch_ms_filename():
+    d = {"metadata": {}, "filename": "1559543971742.jpg", "created_at": 1721000000}
+    assert resolve_photo_date(d).startswith("2019:")
+
+
+def test_resolve_photo_date_falls_back_to_created_at():
+    d = {"metadata": {}, "filename": "bdce31e66814addacf.jpg", "created_at": 1721000000}
+    assert resolve_photo_date(d).startswith("2024:")
+
+
+def test_resolve_photo_date_rejects_implausible_filename_digits():
+    # a plain product-code style number must NOT be misread as a date
+    d = {"metadata": {}, "filename": "m_8.jpg", "created_at": 1721000000}
+    assert resolve_photo_date(d).startswith("2024:")  # -> created_at, not a bogus date
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────

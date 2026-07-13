@@ -39,7 +39,12 @@ from constants import (
 )
 import db
 import security
-from indexer import Indexer, catalog_path_for, load_catalog_cached
+from indexer import (
+    Indexer,
+    catalog_path_for,
+    load_catalog_cached,
+    resolve_photo_date as indexer_resolve_photo_date,
+)
 
 # id is a content hash, so a given id's bytes never change → cache forever.
 _IMMUTABLE_CACHE = {"Cache-Control": "private, max-age=31536000, immutable"}
@@ -313,8 +318,10 @@ def _chroma_meta(img_id: str) -> dict:
 
 # ── status / health ───────────────────────────────────────────────────────────
 @app.get("/api/health")
-def health():
-    return service_status()
+def health(fresh: bool = False):
+    # fresh=1 bypasses the short-TTL memo — used by the Services "Recheck" button
+    # so a just-started model shows up immediately instead of within the TTL.
+    return service_status(force=fresh)
 
 
 @app.get("/api/status")
@@ -891,7 +898,8 @@ _MAX_RESULT_LIMIT = 500
 def _search_response(res: dict | None) -> dict:
     metas = res.get("metadatas", [[]])[0] if res else []
     ids = res.get("ids", [[]])[0] if res else []
-    out = {"results": [_card(i, m) for i, m in zip(ids, metas)]}
+    missing = _missing_ids_cached()
+    out = {"results": [_card(i, m, missing) for i, m in zip(ids, metas)]}
     if res:
         if res.get("person_not_found"):
             out["person_not_found"] = True
@@ -948,14 +956,31 @@ def search_post(body: SearchReq):
     return _search_response(res)
 
 
-def _card(img_id: str, meta: dict) -> dict:
+def _missing_ids_cached() -> set | None:
+    """Set of catalog ids whose file is gone, from the indexer's 30s-cached
+    missing-files scan. A broad filter-browse can return thousands of cards, and
+    doing os.path.exists() per card meant thousands of filesystem stats per
+    request (and disk contention under concurrent load). One shared cached set +
+    a membership test replaces that. Returns None if the scan fails, so callers
+    fall back to a live per-file stat rather than mislabel everything present."""
+    try:
+        return {img_id for img_id, _ in Indexer(use_cache=True).get_missing_files(use_cache=True)}
+    except Exception:
+        return None
+
+
+def _exists(path: str, img_id: str, missing: set | None) -> bool:
+    return (img_id not in missing) if missing is not None else os.path.exists(path)
+
+
+def _card(img_id: str, meta: dict, missing: set | None = None) -> dict:
     return {
         "id": img_id,
         "filename": os.path.basename(meta.get("path", img_id)),
         "caption": meta.get("caption", ""),
         "year": meta.get("year", ""),
         "occasion": meta.get("occasion", ""),
-        "exists": os.path.exists(meta.get("path", "")),
+        "exists": _exists(meta.get("path", ""), img_id, missing),
         "media_type": meta.get("media_type", "image"),
         "duration_s": meta.get("duration_s", 0),
     }
@@ -975,6 +1000,7 @@ def _cards_for_ids(ids: list[str]) -> list[dict]:
     except Exception:
         pass
     catalog = load_catalog_cached().get("images", {})
+    missing = _missing_ids_cached()
     cards = []
     for iid in ids:
         m = meta_by_id.get(iid, {})
@@ -989,7 +1015,7 @@ def _cards_for_ids(ids: list[str]) -> list[dict]:
                 "caption": m.get("caption", ""),
                 "year": m.get("year", ""),
                 "occasion": m.get("occasion", ""),
-                "exists": os.path.exists(path),
+                "exists": _exists(path, iid, missing),
                 "media_type": m.get("media_type") or c.get("media_type", "image"),
                 "duration_s": m.get("duration_s") or c.get("duration_s", 0),
             }
@@ -1113,18 +1139,10 @@ def map_photos():
 
 
 def _resolve_photo_date(data: dict) -> str:
-    """EXIF date if present, else the file timestamp (WhatsApp strips EXIF,
-    screenshots never had it) — most of the library lands in a real
-    year/month instead of one giant "Unknown" bucket."""
-    date = data.get("metadata", {}).get("date", "")
-    if not date or len(date) < 4:
-        ts = data.get("created_at")
-        if ts:
-            try:
-                date = _dt.fromtimestamp(ts).strftime("%Y:%m:%d %H:%M:%S")
-            except (OSError, OverflowError, ValueError):
-                date = ""
-    return date
+    """EXIF date -> a date parsed from the filename -> file/import timestamp.
+    Single source of truth shared with the embed payload (indexer), so the
+    Timeline and the Search 'Year' filter place a photo under the same year."""
+    return indexer_resolve_photo_date(data)
 
 
 @app.get("/api/timeline/summary")

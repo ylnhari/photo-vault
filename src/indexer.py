@@ -1,7 +1,9 @@
 import os
+import re
 import json
 import hashlib
 import time
+from datetime import datetime
 from pathlib import Path
 import db
 import geocode
@@ -425,7 +427,7 @@ class Indexer:
             time.time() - _missing_attrs_cache["at"] < 20
         ):
             return _missing_attrs_cache["data"]
-        result = self._collection().get(include=["metadatas"])
+        result = db.all_metadatas(self._collection())
         catalog = self.image_catalog.get("images", {})
         stale = []
         for img_id, meta in zip(result["ids"], result["metadatas"]):
@@ -1066,12 +1068,61 @@ def resolve_caption_json(img_data: dict, caption_source_model: str = None) -> st
     return caption_json
 
 
+# A real date embedded in a phone filename: WhatsApp "IMG-20170511-WA0039",
+# camera "IMG_20170208_093403", "2018-03-14-...", "Screenshot_20200101", etc.
+# Bounded to plausible years so a random digit run isn't misread as a date.
+_FN_DATE_RE = re.compile(r"(20[0-2]\d)[-_]?(0[1-9]|1[0-2])[-_]?(0[1-9]|[12]\d|3[01])")
+# 13-digit epoch-millisecond names (WhatsApp/FB "1559543971742.jpg", "FB_IMG_155…").
+_FN_EPOCH_RE = re.compile(r"(?<!\d)(1[0-9]{12})(?!\d)")
+
+
+def _date_from_filename(name: str) -> str:
+    """Recover an EXIF-style 'YYYY:MM:DD HH:MM:SS' date encoded in a filename,
+    or '' if none. ~65% of a typical phone library (WhatsApp/screenshots) has no
+    EXIF but carries the real date right in the name."""
+    if not name:
+        return ""
+    m = _FN_DATE_RE.search(name)
+    if m:
+        return f"{m.group(1)}:{m.group(2)}:{m.group(3)} 00:00:00"
+    m = _FN_EPOCH_RE.search(name)
+    if m:
+        try:
+            dt = datetime.fromtimestamp(int(m.group(1)) / 1000)
+            if 2005 <= dt.year <= datetime.now().year:
+                return dt.strftime("%Y:%m:%d %H:%M:%S")
+        except (OSError, OverflowError, ValueError):
+            pass
+    return ""
+
+
+def resolve_photo_date(img_data: dict) -> str:
+    """Best-known capture date, in EXIF 'YYYY:MM:DD HH:MM:SS' form. Priority:
+    real EXIF date -> a date parsed from the filename -> the file/import
+    timestamp as a last resort. Single source of truth so the Timeline and the
+    Search 'Year' filter place a photo under the SAME year (they used to
+    disagree: Timeline fell back to import time, Search stored 'unknown')."""
+    date = (img_data.get("metadata", {}) or {}).get("date", "") or ""
+    if date and len(date) >= 4:
+        return date
+    fn = _date_from_filename(img_data.get("filename", "") or "")
+    if fn:
+        return fn
+    ts = img_data.get("created_at")
+    if ts:
+        try:
+            return datetime.fromtimestamp(ts).strftime("%Y:%m:%d %H:%M:%S")
+        except (OSError, OverflowError, ValueError):
+            pass
+    return ""
+
+
 def build_embed_payload(img_data: dict, caption_json: str,
                         embed_source: str, model_name: str) -> dict:
     """ChromaDB metadata payload for one embedded image."""
     attrs = parse_vision_attributes(caption_json)
     meta = img_data.get("metadata", {})
-    date = meta.get("date", "")
+    date = resolve_photo_date(img_data)
     year = date[:4] if date and len(date) >= 4 else "unknown"
     month = date[5:7] if len(date) >= 7 else "unknown"
     lat, lon = meta.get("gps_lat"), meta.get("gps_lon")

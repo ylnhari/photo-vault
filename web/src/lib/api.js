@@ -45,7 +45,7 @@ async function j(method, url, body) {
 }
 
 export const api = {
-  health: () => j("GET", "/api/health"),
+  health: (fresh = false) => j("GET", `/api/health${fresh ? "?fresh=1" : ""}`),
   status: () => j("GET", "/api/status"),
 
   // Scanning — dirs optional; empty array → uses folder registry

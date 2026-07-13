@@ -1,3 +1,5 @@
+import concurrent.futures
+import time
 import urllib.request
 import urllib.error
 from constants import GEMINI_API_KEY, GEMINI_BASE, LM_STUDIO_URL, NINEROUTER_URL
@@ -56,14 +58,42 @@ def check_9router() -> bool:
         return False
 
 
-def service_status() -> dict:
+# The three service probes are independent network round-trips, each blocking on
+# its own connection timeout (LM Studio 3s + Gemini 5s + 9Router 3s). Run serially
+# that is up to ~11s (measured ~6.4s) on every /api/health — which the SPA calls on
+# load, gating the first render. Run them concurrently instead (wall time = the
+# slowest probe) and memoize the result briefly so repeat calls are instant. TTL is
+# short: bringing a service online should reflect in the UI within a few seconds.
+_STATUS_TTL = 8.0
+_status_cache: dict = {"at": 0.0, "data": None}
+
+
+def service_status(force: bool = False) -> dict:
     """Service health for the Services panel: LM Studio (server + what's
-    actually loaded), Gemini fallback, and the 9Router gateway."""
-    lm_up = check_lm_studio()
-    return {
+    actually loaded), Gemini fallback, and the 9Router gateway.
+
+    Pass force=True to bypass the short-TTL memo — the "Recheck" button needs a
+    live probe (the user just started/stopped a model and wants the truth now),
+    whereas the automatic on-load fetch is happy with a few-seconds-old snapshot."""
+    now = time.time()
+    if not force and _status_cache["data"] is not None and now - _status_cache["at"] < _STATUS_TTL:
+        return _status_cache["data"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        f_lm = ex.submit(check_lm_studio)
+        f_gemini = ex.submit(check_gemini)
+        f_9router = ex.submit(check_9router)
+        lm_up = f_lm.result()
+        gemini_up = f_gemini.result()
+        ninerouter_up = f_9router.result()
+    # Only probe LM Studio's loaded-model state when the server answered — that
+    # call is a second round-trip and is pointless (and slow) when it's offline.
+    lm_state = lm_studio_loaded_state() if lm_up else {"known": False, "vision_loaded": None, "embed_loaded": None}
+    data = {
         "lm_studio": lm_up,
-        "lm_studio_state": lm_studio_loaded_state() if lm_up else {"known": False, "vision_loaded": None, "embed_loaded": None},
-        "gemini": check_gemini(),
+        "lm_studio_state": lm_state,
+        "gemini": gemini_up,
         "gemini_key_set": bool(GEMINI_API_KEY),
-        "ninerouter": check_9router(),
+        "ninerouter": ninerouter_up,
     }
+    _status_cache.update({"at": time.time(), "data": data})
+    return data

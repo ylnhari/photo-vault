@@ -206,7 +206,7 @@ def get_available_filter_values() -> dict:
             and time.time() - _filter_values_cache["at"] < _FILTER_VALUES_CACHE_TTL
         ):
             return _filter_values_cache["data"]
-        result = collection.get(include=["metadatas"])
+        result = db.all_metadatas(collection)
         attrs = ["weather", "occasion", "festival_name", "scene", "group_size", "person_count",
                  "clothing_style", "mood", "location_type", "season", "time_of_day",
                  "photo_type", "year", "month", "place"]
