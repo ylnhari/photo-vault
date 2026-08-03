@@ -7,18 +7,18 @@ browse by timeline and people. UI is a Svelte SPA talking to a FastAPI backend o
 ## Context
 All local, no cloud, no paid APIs. Primary: LM Studio (vision + embeddings) + InsightFace (faces).
 Fallback: Gemini free tier for both vision and embeddings when LM Studio is offline.
-Opt-in third provider: **9Router** (local OpenAI-compatible gateway, `constants.NINEROUTER_URL`
-from `../ports.json → registry.9router.port`) — pools multiple Gemini CLI accounts/API keys and
-rotates them on 429 internally. Never part of the "auto" chain; always needs an explicit model id
-(no LM-Studio-style auto-detect). The gateway may substitute the serving model: vision keeps the
-caption but labels it with the model that ACTUALLY produced it (so 9Router vision runs target
-any-caption-missing photos, and the job panel tallies "Models used"); embeddings REJECT
-substitution (one vector space per collection). See `FEATURE-REQUEST-9router-integration.md` +
-`../9ROUTER.md`.
+Optional local integration: an OpenAI-compatible gateway can be configured through the host's
+local settings and an explicit model ID. It is never part of the automatic provider chain and is
+not required for a clone to run. If a gateway substitutes a vision model, retain the actual model
+label with the caption; reject embedding substitution because each vector space needs its own
+collection. Keep gateway endpoints, accounts, keys, and sibling-machine documentation out of this
+repository.
 GEMINI_API_KEY loaded from `.env` via `constants._load_env()` — never hardcoded.
 Multi-model embeddings: each embedding model gets its own ChromaDB collection; active model
 selected by user in UI; registry stored in `data/embedding_registry.json`.
-Port read from `../ports.json` (photo-vault → 8768) via `constants.SERVER_PORT`; never hardcode.
+When a local `ports.json` registry is present, resolve this app's port through it via
+`constants.SERVER_PORT`; a clone may configure an explicit local port or use the documented
+fallback. Never silently hunt for a free port or hardcode a user-specific port in documentation.
 
 ## Architecture
 Backend (Python, UI-agnostic) + frontend (Svelte SPA). The backend modules are the durable core;
@@ -84,7 +84,7 @@ background job — never blocks a request. Job types include video_vision + vide
 ## Deps (with-deps project)
 ```bash
 make install      # uv sync --extra dev  +  cd web && npm install
-make run          # build SPA + serve → http://127.0.0.1:8768
+make run          # build SPA + serve → http://127.0.0.1:<resolved-port>
 make serve        # backend only (no rebuild)
 make web          # Vite dev server with hot reload (proxies /api → 8768)
 make test         # uv run python -m pytest tests/ -q
