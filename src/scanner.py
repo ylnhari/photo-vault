@@ -265,10 +265,9 @@ def save_data(images, folders, output_file):
     currently in `images`/`folders`; scan checkpoints are infrequent (every
     `checkpoint_interval` files) so dirty-tracking isn't worth the complexity
     here, unlike the per-batch saves in the job loop (indexer.py)."""
-    try:
-        catalog_db.save_all(output_file, images, folders)
-    except Exception as e:
-        print(f"Error saving catalog: {e}")
+    # A successful-looking scan with a failed final save leaves the catalog
+    # stale on disk. Let the caller surface persistence failures as job errors.
+    catalog_db.save_all(output_file, images, folders)
 
 
 def scan_directory(

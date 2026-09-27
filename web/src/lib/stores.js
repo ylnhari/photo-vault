@@ -40,16 +40,16 @@ export const lastDeleted = writable([]);
 // Lightweight background-job status for the global header pill, so a running
 // index job is visible from every tab (the detailed panel lives in
 // Index & Manage). Polled slowly; IndexTab keeps its own faster poll.
-export const jobStatus = writable({ active: false, type: null, done: 0, total: 0 });
+export const jobStatus = writable({ active: false, preparing: false, type: null, done: 0, total: 0 });
 
 export async function refreshJob() {
   try {
     const j = await api.indexProgress();
-    jobStatus.set({ active: !!j.active, type: j.type, done: j.done, total: j.total });
+    jobStatus.set({ active: !!j.active, preparing: !!j.preparing, type: j.type, done: j.done, total: j.total });
   } catch {
     // Reset to a clear "unknown" shape rather than leaving stale progress
     // numbers on screen when the server can't be reached.
-    jobStatus.set({ active: false, type: null, done: 0, total: 0 });
+    jobStatus.set({ active: false, preparing: false, type: null, done: 0, total: 0 });
   }
 }
 

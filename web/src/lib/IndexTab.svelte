@@ -196,6 +196,7 @@
     video_faces: "Video face detection" };
 
   onMount(async () => {
+    document.addEventListener("visibilitychange", onJobVisibilityChange);
     if (!$health.loaded) refreshHealth();
     if (!$status.loaded) refreshStatus();
     if (!$models.loaded) refreshModels();
@@ -340,11 +341,30 @@
     };
   }
 
-  onDestroy(() => clearInterval(poll));
+  onDestroy(() => {
+    clearInterval(poll);
+    document.removeEventListener("visibilitychange", onJobVisibilityChange);
+  });
+
+  function onJobVisibilityChange() {
+    if (document.hidden) {
+      clearInterval(poll);
+      poll = null;
+    } else if (job?.any_active) {
+      startPolling();
+    }
+  }
 
   function startPolling() {
     clearInterval(poll);
+    poll = null;
+    if (document.hidden) return;
     poll = setInterval(async () => {
+      if (document.hidden) {
+        clearInterval(poll);
+        poll = null;
+        return;
+      }
       job = await api.indexProgress();
       // Jobs can run concurrently now — keep polling until EVERY job is idle.
       if (!(job.any_active)) {

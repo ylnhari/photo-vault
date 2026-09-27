@@ -1,19 +1,25 @@
 <script>
   import { api, fmtDuration } from "./api.js";
   import { createEventDispatcher, onMount, onDestroy } from "svelte";
-  import { onActivateKey } from "./keyboard.js";
+  import { createRequestGate } from "./requestGate.js";
 
   // Either a single id, or an ordered list + starting index for navigation.
   export let id = null;
   export let ids = null;       // array of photo ids in the current grid
+  export let cards = [];
   export let index = 0;        // starting position within ids
 
   const dispatch = createEventDispatcher();
+  const metaGate = createRequestGate();
+  const detailGate = createRequestGate();
+  const similarGate = createRequestGate();
 
   // Normalize to a list we can navigate.
   let list = ids && ids.length ? ids : (id != null ? [id] : []);
   let pos = ids && ids.length ? Math.max(0, Math.min(index, ids.length - 1)) : 0;
   $: currentId = list[pos];
+  $: currentCard = cards.find((card) => card.id === currentId) || {};
+  $: imageAlt = meta?.caption || currentCard.caption || meta?.filename || currentCard.filename || "Photo";
 
   let meta = null;
   let detail = null;
@@ -34,14 +40,19 @@
   let simBusy = false;
   async function loadSimilar() {
     if (similar) { similar = null; return; }  // toggle off
+    const targetId = currentId;
+    const request = similarGate.begin();
     simBusy = true; err = "";
-    try { similar = (await api.similar(currentId)).results; }
-    catch (e) { err = e.message; }
-    simBusy = false;
+    try {
+      const response = await api.similar(targetId, 12, { signal: request.signal });
+      if (request.isCurrent() && currentId === targetId) similar = response.results;
+    } catch (e) { if (request.isCurrent() && currentId === targetId) err = e.message; }
+    finally { if (request.isCurrent()) simBusy = false; }
   }
   function openSimilar(s) {
     // Navigate the lightbox through the similar set.
     list = similar.map((x) => x.id);
+    cards = similar;
     pos = list.indexOf(s.id);
   }
 
@@ -51,16 +62,27 @@
     lastLoaded = currentId;
     meta = null; detail = null; showDetail = false; confirmDelete = false; err = "";
     similar = null;
+    detailGate.cancel();
+    similarGate.cancel();
     load(currentId);
     preloadNeighbors();
   }
 
   async function load(targetId) {
-    try { meta = await api.meta(targetId); } catch (e) { err = e.message; }
+    const request = metaGate.begin();
+    try {
+      const response = await api.meta(targetId, { signal: request.signal });
+      if (request.isCurrent() && currentId === targetId) meta = response;
+    } catch (e) { if (request.isCurrent() && currentId === targetId) err = e.message; }
   }
   async function loadDetail() {
     if (detail) { showDetail = true; return; }
-    try { detail = await api.explore(currentId); showDetail = true; } catch (e) { err = e.message; }
+    const targetId = currentId;
+    const request = detailGate.begin();
+    try {
+      const response = await api.explore(targetId, { signal: request.signal });
+      if (request.isCurrent() && currentId === targetId) { detail = response; showDetail = true; }
+    } catch (e) { if (request.isCurrent() && currentId === targetId) err = e.message; }
   }
 
   // Preload the medium derivative of the adjacent photos for instant prev/next.
@@ -74,8 +96,8 @@
     }
   }
 
-  function next() { if (pos < list.length - 1) pos += 1; }
-  function prev() { if (pos > 0) pos -= 1; }
+  function next() { if (!busy && pos < list.length - 1) pos += 1; }
+  function prev() { if (!busy && pos > 0) pos -= 1; }
   function close() { dispatch("close"); }
 
   // ── focus trap ──────────────────────────────────────────────────────────
@@ -90,9 +112,11 @@
   }
 
   function onKey(e) {
+    const target = e.target;
+    const editing = target?.matches?.("input, textarea, select, [contenteditable='true']") || target?.isContentEditable;
     if (e.key === "Escape") { close(); }
-    else if (e.key === "ArrowRight") { next(); }
-    else if (e.key === "ArrowLeft") { prev(); }
+    else if (!editing && e.key === "ArrowRight") { next(); }
+    else if (!editing && e.key === "ArrowLeft") { prev(); }
     else if (e.key === "Tab") {
       const els = focusableEls();
       if (!els.length) return;
@@ -104,21 +128,29 @@
       }
     }
   }
+  let returnFocusTarget;
   onMount(() => {
+    returnFocusTarget = document.activeElement;
     window.addEventListener("keydown", onKey);
     // Move focus into the dialog so it doesn't stay on whatever triggered it
     // (a grid cell behind the overlay).
     focusableEls()[0]?.focus();
   });
-  onDestroy(() => window.removeEventListener("keydown", onKey));
+  onDestroy(() => {
+    window.removeEventListener("keydown", onKey);
+    metaGate.cancel(); detailGate.cancel(); similarGate.cancel();
+    returnFocusTarget?.focus?.();
+  });
 
   async function remove(deleteFile) {
+    if (busy || !currentId) return;
+    const targetId = currentId;
     busy = true;
     try {
-      await api.deleteImage(currentId, deleteFile);
+      await api.deleteImage(targetId, deleteFile);
       // Drop from the local list and advance, or close if it was the last one.
-      list = list.filter((x) => x !== currentId);
-      dispatch("deleted", currentId);
+      list = list.filter((x) => x !== targetId);
+      dispatch("deleted", targetId);
       if (list.length === 0) { close(); return; }
       if (pos >= list.length) pos = list.length - 1;
       lastLoaded = null;  // force reload of the now-current photo
@@ -139,27 +171,28 @@
     <button class="nav next" on:click|stopPropagation={next} aria-label="Next">›</button>
   {/if}
 
-  <div class="box" bind:this={boxEl} role="dialog" aria-modal="true" tabindex="-1">
+  <div class="box" bind:this={boxEl} role="dialog" aria-modal="true" aria-labelledby="lightbox-title" tabindex="-1">
     <button class="ghost close" on:click={close} aria-label="Close">✕</button>
     {#if list.length > 1}
       <div class="counter">{pos + 1} / {list.length}</div>
     {/if}
     <div class="content">
       <div class="imgwrap">
+        <h2 id="lightbox-title" class="sr-only">{imageAlt}</h2>
         {#key currentId}
           {#if isVideo}
             <!-- Streamed via /api/video (HTTP range → seekable). Poster is the
                  same frame the grid shows so it doesn't flash black before play. -->
-            <video src={api.videoUrl(currentId)} poster={api.thumbUrl(currentId)}
+            <video src={api.videoUrl(currentId)} poster={api.thumbUrl(currentId)} aria-label={imageAlt}
                    controls autoplay playsinline preload="metadata">
               <track kind="captions" />
             </video>
           {:else}
-            <img src={api.mediumUrl(currentId)} alt="" decoding="async" />
+            <img src={api.mediumUrl(currentId)} alt={imageAlt} decoding="async" />
           {/if}
         {/key}
       </div>
-      <div class="side col">
+      <section class="side col" aria-label="Photo details and actions">
         {#if err}<p style="color:var(--danger)">{err}</p>{/if}
         {#if meta}
           {#if isVideo}
@@ -200,13 +233,13 @@
           {:else}
             <div class="simgrid">
               {#each similar as s (s.id)}
-                <span class="simthumb-wrap" role="button" tabindex="0"
+                  <button class="simthumb-wrap"
                      title={s.caption || s.filename}
                      on:click={() => openSimilar(s)}
-                     on:keydown={(e) => onActivateKey(e, () => openSimilar(s))}>
+                     aria-label={`Open similar photo: ${s.caption || s.filename || "memory"}`}>
                   <img class="simthumb" src={api.thumbUrl(s.id)} alt={s.filename}
                        decoding="async" />
-                </span>
+                  </button>
               {/each}
             </div>
           {/if}
@@ -256,37 +289,47 @@
         <button class="danger" on:click={() => remove(true)} disabled={!confirmDelete || busy}>
           Delete file from disk
         </button>
-      </div>
+      </section>
     </div>
   </div>
 </div>
 
 <style>
   .overlay {
-    position: fixed; inset: 0; background: rgba(0,0,0,.85);
+    position: fixed; inset: 0; background: rgba(25,35,31,.76); backdrop-filter: blur(5px);
     display: flex; align-items: center; justify-content: center; z-index: 100; padding: 24px;
   }
-  .box { position: relative; background: var(--surface); border: 1px solid var(--border);
-    border-radius: 14px; max-width: 1100px; width: 100%; max-height: 90vh; overflow: hidden; }
-  .close { position: absolute; top: 10px; right: 10px; z-index: 2; }
+  .box { position: relative; background: var(--surface); border: 1px solid rgba(255,255,255,.36);
+    border-radius: 15px; max-width: 1420px; width: 100%; max-height: 92vh; overflow: hidden; box-shadow: 0 26px 90px rgba(0,0,0,.32); }
+  .close { position: absolute; top: 10px; right: 10px; z-index: 2; width: 35px; height: 35px; padding: 0;
+    color: #31403a; background: rgba(255,255,255,.91); border: 0; border-radius: 50%; }
   .counter { position: absolute; top: 14px; left: 16px; z-index: 2; font-size: 12px;
-    color: var(--muted); background: var(--surface2); padding: 2px 8px; border-radius: 10px; }
-  .content { display: grid; grid-template-columns: 1.6fr 1fr; gap: 0; max-height: 90vh; }
-  .imgwrap { background: #000; display: flex; align-items: center; justify-content: center; }
-  .imgwrap img, .imgwrap video { max-width: 100%; max-height: 90vh; object-fit: contain; }
-  /* Extra top padding keeps the first metadata line clear of the ✕ button.
-     max-height must be set here (not just inherited from .content/.box) —
-     otherwise the grid row stretches to the panel's full content height and
-     .box's overflow:hidden clips the bottom instead of this scrolling. */
-  .side { padding: 44px 24px 24px; overflow-y: auto; max-height: 90vh; }
-  @media (max-width: 700px) { .content { grid-template-columns: 1fr; } }
+    color: #eaf1ed; background: rgba(29,43,37,.7); padding: 4px 9px; border-radius: 12px; }
+  .content { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(290px, .78fr); max-height: 92vh; }
+  .imgwrap { position: relative; min-width: 0; min-height: 280px; background: #18221e; display: flex; align-items: center; justify-content: center; }
+  .imgwrap img, .imgwrap video { display: block; max-width: 100%; max-height: 92vh; object-fit: contain; }
+  .side { padding: 54px 24px 24px; overflow-y: auto; max-height: 92vh; background: #fff; color: #39463f; }
+  .side .muted { color: var(--muted); }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+  @media (max-width: 760px) {
+    .overlay { align-items: flex-end; padding: 0; }
+    .box { width: 100%; max-height: 100dvh; border-radius: 15px 15px 0 0; border-bottom: 0; }
+    .content { display: flex; flex-direction: column; max-height: 100dvh; }
+    .imgwrap { min-height: 0; height: min(53dvh, 530px); flex: 0 0 auto; }
+    .imgwrap img, .imgwrap video { max-width: 100%; max-height: 53dvh; }
+    .side { max-height: min(43dvh, 390px); padding: 20px 18px calc(22px + env(safe-area-inset-bottom)); }
+    .close { top: 10px; right: 10px; }
+    .counter { top: 17px; left: 14px; }
+    .nav { position: absolute; top: 27dvh; width: 38px; height: 48px; }
+    .nav.prev { left: 8px; } .nav.next { right: 8px; }
+  }
   .sm { padding: 5px 10px; font-size: 13px; }
   .muted { color: var(--muted); }
   .ok-text { color: var(--success); }
   .warn-text { color: var(--warn); }
   .simgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 10px; }
-  .simthumb-wrap { display: block; aspect-ratio: 1; border-radius: 6px; overflow: hidden;
-    cursor: pointer; border: 1px solid var(--border); }
+  .simthumb-wrap { display: block; width: 100%; aspect-ratio: 1; padding: 0; border-radius: 6px; overflow: hidden;
+    cursor: pointer; background: var(--surface2); border: 1px solid var(--border); }
   .simthumb-wrap:hover, .simthumb-wrap:focus-visible { outline: 2px solid var(--accent); }
   .simthumb { width: 100%; height: 100%; object-fit: cover; display: block; }
   .history-entry { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; }
@@ -297,7 +340,7 @@
   .nav {
     position: fixed; top: 50%; transform: translateY(-50%); z-index: 101;
     width: 48px; height: 64px; font-size: 34px; line-height: 1;
-    background: rgba(0,0,0,.4); color: #fff; border: none; cursor: pointer; border-radius: 8px;
+    background: rgba(23,35,29,.82); color: #fff; border: none; cursor: pointer; border-radius: 8px;
   }
   .nav:hover { background: rgba(0,0,0,.7); }
   .nav.prev { left: 16px; }

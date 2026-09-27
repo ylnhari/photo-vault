@@ -1,8 +1,229 @@
 import time
+import os
+import subprocess
+import sys
+import threading
+from pathlib import Path
 import pytest
 from unittest.mock import patch, MagicMock
 
 from jobs import JobManager
+
+
+def test_importing_jobs_does_not_load_inference_stack(tmp_path):
+    env = os.environ.copy()
+    env["PHOTO_VAULT_ENV_FILE"] = "-"
+    env["PHOTO_VAULT_DATA_DIR"] = str(tmp_path / "isolated-data")
+    src_dir = str(Path(__file__).parent.parent / "src")
+    env["PYTHONPATH"] = src_dir
+    code = (
+        "import sys, jobs; "
+        "assert 'indexer' not in sys.modules; "
+        "assert 'vision' not in sys.modules; "
+        "assert 'faces' not in sys.modules"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], cwd=src_dir, env=env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_worker_indexer_construction_failure_finishes_job():
+    mgr = JobManager()
+    pending_indexer = _fake_indexer(["a"], lambda *a, **k: "ok")
+    with patch("jobs.Indexer", side_effect=[pending_indexer,
+                                             RuntimeError("worker catalog load failed")]):
+        mgr.start("vision")
+        status = _wait_idle(mgr)
+
+    assert status["active"] is False
+    assert status["finished"] is True
+    assert status["aborted"] is True
+    assert status["error"] == "worker catalog load failed"
+
+
+def test_background_prepare_keeps_status_stop_and_conflict_responsive(monkeypatch):
+    import pytest
+    mgr = JobManager()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_discovery(jtype, cfg):
+        entered.set()
+        release.wait(timeout=3)
+        return ["a"]
+
+    monkeypatch.setattr(mgr, "_pending_ids", blocked_discovery)
+    with patch("jobs.Indexer") as indexer:
+        started = mgr.start("vision", background_prepare=True)
+        assert started["active"] and started["preparing"]
+        assert entered.wait(timeout=2)
+        assert mgr.status(started["id"])["preparing"] is True
+        mgr.stop(started["id"])
+        with pytest.raises(RuntimeError, match="already running"):
+            mgr.start("vision", background_prepare=True)
+        release.set()
+        status = _wait_idle(mgr)
+
+    assert status["stopped"] is True
+    assert status["done"] == 0
+    indexer.assert_not_called()
+
+
+def test_background_prepare_error_finishes_and_releases_resources(monkeypatch):
+    mgr = JobManager()
+    monkeypatch.setattr(
+        mgr, "_pending_ids",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("catalog discovery failed")),
+    )
+    started = mgr.start("scan", background_prepare=True)
+    status = _wait_idle(mgr)
+    assert status["id"] == started["id"]
+    assert status["preparing"] is False
+    assert status["aborted"] is True
+    assert status["error"] == "catalog discovery failed"
+
+    monkeypatch.setattr(mgr, "_pending_ids", lambda *args: [])
+    next_job = mgr.start("scan", background_prepare=True)
+    assert next_job["active"] is True
+    assert _wait_idle(mgr)["active"] is False
+
+
+def _embed_job_stopped_during_optional_faces(monkeypatch, stop_in_face):
+    mgr = JobManager()
+    monkeypatch.setattr(
+        "jobs.settings_mod.load",
+        lambda: {"vision_concurrency": 1, "faces_during_embed": True},
+    )
+    imgs = {
+        name: {"path": f"{name}.jpg", "filename": f"{name}.jpg",
+               "caption_json": '{"caption":"synthetic"}', "metadata": {}}
+        for name in ("a", "b")
+    }
+    fake = _fake_indexer(list(imgs), lambda *a, **k: "ok")
+    fake.get_embed_pending.return_value = list(imgs.items())
+    fake.image_catalog = {"images": imgs}
+    col = MagicMock()
+
+    def embed_batch(*args, **kwargs):
+        if not stop_in_face:
+            mgr.stop()
+        return ([[0.1], [0.2]], "synthetic-model", "lm_studio")
+
+    def detect_face(path):
+        if stop_in_face:
+            mgr.stop()
+        return []
+
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("embeddings.get_embeddings_batch", side_effect=embed_batch), \
+         patch("jobs.resolve_caption_json", return_value='{"caption":"synthetic"}'), \
+         patch("jobs.parse_vision_attributes", return_value={"caption": "synthetic"}), \
+         patch("jobs.build_embedding_text", return_value="synthetic"), \
+         patch("jobs.build_embed_payload", return_value={}), \
+         patch("db.collection", return_value=col), \
+         patch("faces.detect_and_embed_faces", side_effect=detect_face) as detect, \
+         patch("faces.save_face_data"), patch("faces.index_faces"):
+        mgr.start("embed")
+        status = _wait_idle(mgr)
+
+    return status, detect, col
+
+
+def test_stop_after_embedding_skips_faces_but_persists_vectors(monkeypatch):
+    status, detect, col = _embed_job_stopped_during_optional_faces(monkeypatch, False)
+    detect.assert_not_called()
+    assert col.upsert.call_args.kwargs["ids"] == ["a", "b"]
+    assert status["stopped"] is True
+    assert status["ok"] == 2 and status["done"] == 2
+
+
+def test_stop_between_face_items_keeps_completed_embedding_batch(monkeypatch):
+    status, detect, col = _embed_job_stopped_during_optional_faces(monkeypatch, True)
+    assert detect.call_count == 1
+    assert col.upsert.call_args.kwargs["ids"] == ["a", "b"]
+    assert status["stopped"] is True
+    assert status["ok"] == 2 and status["done"] == 2
+
+
+def test_backup_holds_all_mutable_resources():
+    import jobs
+    resources = jobs.resources_for("backup")
+    assert {
+        jobs.RES_CATALOG, jobs.RES_INFERENCE, jobs.RES_EMBED_COL,
+        jobs.RES_FACES, jobs.RES_THUMBS, jobs.RES_BACKUP,
+    } <= resources
+
+
+def test_backup_records_success_only_after_every_root_completes():
+    import backup
+    mgr = JobManager()
+    fake = _fake_indexer([], lambda *a, **k: "ok")
+    roots = [("root-a", "dest-a"), ("root-b", "dest-b")]
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("backup.backup_roots", return_value=roots), \
+         patch("backup.backup_one", side_effect=["copied a", "copied b"]), \
+         patch("backup.record_success") as record:
+        mgr.start("backup")
+        status = _wait_idle(mgr)
+    assert status["ok"] == 2 and status["fail"] == 0
+    record.assert_called_once_with(roots)
+
+
+def test_partial_backup_does_not_record_success():
+    import backup
+    mgr = JobManager()
+    fake = _fake_indexer([], lambda *a, **k: "ok")
+    roots = [("root-a", "dest-a"), ("root-b", "dest-b")]
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("backup.backup_roots", return_value=roots), \
+         patch("backup.backup_one", side_effect=["copied a", OSError("synthetic copy failure")]), \
+         patch("backup.record_success") as record:
+        mgr.start("backup")
+        status = _wait_idle(mgr)
+    assert status["fail"] == 1
+    record.assert_not_called()
+
+
+def test_backup_job_pins_targets_and_does_not_freshen_changed_destination(tmp_path,
+                                                                         monkeypatch):
+    import backup
+    import folders
+    import settings
+
+    source = tmp_path / "Pictures"
+    source.mkdir()
+    old_dest = str(tmp_path / "backup-old")
+    new_dest = str(tmp_path / "backup-new")
+    current = {"dest": old_dest}
+    monkeypatch.setattr(settings, "load", lambda: {"backup_dest": current["dest"]})
+    monkeypatch.setattr(folders, "get_effective_scan_dirs", lambda: [str(source)])
+    monkeypatch.setattr(backup, "STATE_PATH", str(tmp_path / "backup-state.json"))
+
+    mgr = JobManager()
+    fake = _fake_indexer([], lambda *a, **k: "ok")
+    seen = []
+
+    def fake_copy(src, dest=None):
+        seen.append((src, dest))
+        if len(seen) == 1:
+            current["dest"] = new_dest
+        return "copied"
+
+    with patch("jobs.Indexer", return_value=fake), \
+         patch("backup.backup_one", side_effect=fake_copy):
+        mgr.start("backup")
+        status = _wait_idle(mgr)
+
+    expected = dict([
+        (str(source), os.path.join(old_dest, source.name)),
+        (backup.DATA_DIR, os.path.join(old_dest, "photo-vault-data")),
+    ])
+    assert {src: dest for src, dest in seen} == expected
+    assert status["ok"] == 2 and status["fail"] == 0
+    assert status["backup_destination_changed"] is True
+    assert backup.status()["last_backup_at"] is None
 
 
 @pytest.fixture(autouse=True)
@@ -162,12 +383,37 @@ def test_faces_conflicts_when_faces_during_embed_on():
         time.sleep(0.05)
         return "ok"
     fake = _fake_indexer(["a", "b", "c"], slow)
+    fake.image_catalog = {"images": {
+        "a": {"path": "synthetic.jpg", "filename": "synthetic.jpg",
+              "caption_json": '{"caption":"synthetic"}', "metadata": {}}
+    }}
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_embeddings(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=2)
+        return ([[0.1]], "synthetic-model", "lm_studio")
+
     with patch("jobs.Indexer", return_value=fake), \
          patch("jobs.settings_mod.load",
-               lambda: {"vision_concurrency": 1, "faces_during_embed": True}):
-        mgr.start("embed")
-        with pytest.raises(RuntimeError, match="already running"):
-            mgr.start("faces")
+               lambda: {"vision_concurrency": 1, "faces_during_embed": True}), \
+         patch("embeddings.get_embeddings_batch", side_effect=blocked_embeddings), \
+         patch("jobs.resolve_caption_json", return_value='{"caption":"synthetic"}'), \
+         patch("jobs.parse_vision_attributes", return_value={"caption": "synthetic"}), \
+         patch("jobs.build_embedding_text", return_value="synthetic"), \
+         patch("jobs.build_embed_payload", return_value={}), \
+         patch("db.collection") as collection, \
+         patch("faces.detect_and_embed_faces", return_value=[]), \
+         patch("faces.save_face_data"), patch("faces.index_faces"):
+        collection.return_value.upsert = MagicMock()
+        try:
+            mgr.start("embed")
+            assert entered.wait(timeout=2)
+            with pytest.raises(RuntimeError, match="already running"):
+                mgr.start("faces")
+        finally:
+            release.set()
         _wait_all_idle(mgr)
 
 

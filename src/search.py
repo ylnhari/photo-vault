@@ -1,4 +1,6 @@
 import time
+import threading
+from collections import OrderedDict
 
 import chromadb.errors
 
@@ -20,6 +22,10 @@ _MALFORMED_FILTER_ERRORS = (ValueError, chromadb.errors.InvalidArgumentError)
 # query is — this is just a sane ceiling for a personal-library-scale
 # collection so one enormous filter match can't blow up memory/response size.
 FILTER_BROWSE_LIMIT = 10000
+SEMANTIC_RESULT_LIMIT = 250
+_QUERY_CACHE_LIMIT = 128
+_query_vector_cache: OrderedDict = OrderedDict()
+_query_vector_lock = threading.Lock()
 
 
 class SearchUnavailableError(Exception):
@@ -33,21 +39,41 @@ class SearchUnavailableError(Exception):
     misleading empty result set."""
 
 
-def _embed_query(text: str):
+def _embed_query(text: str, model_name: str | None = None,
+                 model_info: dict | None = None):
     """Embed a search query IN THE ACTIVE MODEL'S vector space. Letting the
     auto provider chain pick (whatever LM Studio has loaded, or Gemini) can
     produce a vector from a different model than the collection being queried —
     wrong dimension or meaningless distances."""
     try:
-        reg = get_registry()
-        active = reg.get("active_model")
-        info = reg.get("models", {}).get(active)
-        if active and info:
-            vec, _, _ = get_embedding(
-                text, force_provider=info.get("source", "auto"), model=active
+        if model_name and model_info:
+            profile_key = model_info.get("profile_id") or (
+                f"legacy:{model_info.get('source')}:{model_name}:"
+                f"{model_info.get('dimension')}"
             )
+            normalized = " ".join((text or "").split())
+            cache_key = (profile_key, normalized)
+            with _query_vector_lock:
+                cached = _query_vector_cache.get(cache_key)
+                if cached is not None:
+                    _query_vector_cache.move_to_end(cache_key)
+                    return list(cached)
+            vec, returned_model, returned_source = get_embedding(
+                text, force_provider=model_info.get("source", "auto"),
+                model=model_name, purpose="query",
+            )
+            if vec is not None and (returned_model != model_name or
+                                    returned_source != model_info.get("source")):
+                raise RuntimeError("query embedding provider/model differs from active collection")
         else:
             vec, _, _ = get_embedding(text)
+            cache_key = None
+        if vec is not None and cache_key is not None:
+            with _query_vector_lock:
+                _query_vector_cache[cache_key] = tuple(vec)
+                _query_vector_cache.move_to_end(cache_key)
+                while len(_query_vector_cache) > _QUERY_CACHE_LIMIT:
+                    _query_vector_cache.popitem(last=False)
     except Exception as e:
         raise SearchUnavailableError(
             f"Could not embed search query {text!r}: {e}"
@@ -73,11 +99,13 @@ def build_where_clause(filters: dict) -> dict | None:
         return clauses[0]
     return {"$and": clauses}
 
-def _active_collection(client=None):
+def _active_collection(client=None, model_name=None, model_info=None):
     # allow_default: search must degrade to "no results yet" for a fresh
     # install with no model selected, not raise — db.collection() otherwise
     # raises ValueError here specifically to stop embedding/indexing code
     # from silently writing into an ungoverned fallback collection.
+    if model_name and model_info:
+        return db.collection(model_name, model_info=model_info)
     return db.collection(allow_default=True)
 
 
@@ -97,7 +125,19 @@ def _intersect_with_person(result: dict, person_ids: set) -> dict:
 
 
 def search_images(query: str, top_k: int = 50, filters: dict = None, person: str = None):
-    collection = _active_collection()
+    # Snapshot registry and collection together once. The active selection may
+    # change while an API request is running; this search must use one profile.
+    try:
+        registry = get_registry()
+    except Exception as e:
+        raise SearchUnavailableError(f"Could not read embedding registry: {e}") from e
+    active_model = registry.get("active_model")
+    model_info = registry.get("models", {}).get(active_model)
+    if active_model and not model_info:
+        raise SearchUnavailableError(
+            f"Active embedding model {active_model!r} is missing from the registry"
+        )
+    collection = _active_collection(model_name=active_model, model_info=model_info)
     if collection.count() == 0:
         return _empty_result()
 
@@ -124,6 +164,9 @@ def search_images(query: str, top_k: int = 50, filters: dict = None, person: str
             result["person_not_found"] = True
         return result
 
+    if person is not None and not person_ids:
+        return _finish(_empty_result())
+
     # Person-only browse (no text query, no attribute filters): return ALL of the
     # person's photos straight from the face index — not capped to a semantic top_k.
     if person is not None and not q and not where_clause:
@@ -140,17 +183,23 @@ def search_images(query: str, top_k: int = 50, filters: dict = None, person: str
     # any real match that didn't happen to rank in the top_k nearest to that
     # arbitrary literal-word vector — this is the most important fix here.
     if not q and where_clause:
-        got = collection.get(
-            where=where_clause, include=["metadatas"], limit=FILTER_BROWSE_LIMIT
-        )
-        result = {"ids": [got["ids"]], "metadatas": [got["metadatas"]]}
+        get_args = {"where": where_clause, "include": ["metadatas"],
+                    "limit": FILTER_BROWSE_LIMIT}
         if person_ids is not None:
-            result = _intersect_with_person(result, person_ids)
+            get_args["ids"] = sorted(person_ids)
+        got = collection.get(**get_args)
+        result = {"ids": [got["ids"]], "metadatas": [got["metadatas"]]}
         return _finish(result)
 
     if not q:
-        q = "photo"  # default for pure-browse (no query, no filters, no person)
-    query_embedding = _embed_query(q)
+        # Browsing the library is a catalog operation; never trigger provider
+        # inference for a synthetic word such as "photo".
+        got = collection.get(include=["metadatas"], limit=min(FILTER_BROWSE_LIMIT, max(0, top_k)))
+        result = {"ids": [got["ids"]], "metadatas": [got["metadatas"]]}
+        return _finish(result)
+    if not active_model or not model_info:
+        raise SearchUnavailableError("No active embedding profile is available for semantic search")
+    query_embedding = _embed_query(q, active_model, model_info)
     if query_embedding is None:
         return None
 
@@ -158,8 +207,9 @@ def search_images(query: str, top_k: int = 50, filters: dict = None, person: str
     try:
         results = collection.query(
             query_embeddings=[query_embedding],
-            n_results=min(top_k, collection.count()),
+            n_results=min(max(1, top_k), SEMANTIC_RESULT_LIMIT, collection.count()),
             where=where_clause,
+            ids=sorted(person_ids) if person_ids is not None else None,
         )
     except _MALFORMED_FILTER_ERRORS as e:
         if where_clause is None:
@@ -175,11 +225,10 @@ def search_images(query: str, top_k: int = 50, filters: dict = None, person: str
         filter_error = True
         results = collection.query(
             query_embeddings=[query_embedding],
-            n_results=min(top_k, collection.count()),
+            n_results=min(max(1, top_k), SEMANTIC_RESULT_LIMIT, collection.count()),
+            ids=sorted(person_ids) if person_ids is not None else None,
         )
 
-    if person_ids is not None:
-        results = _intersect_with_person(results, person_ids)
     if filter_error:
         results["filter_error"] = True
     return _finish(results)

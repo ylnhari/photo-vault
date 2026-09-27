@@ -6,31 +6,39 @@
 let _token = (typeof window !== "undefined" && window.__PV_TOKEN__) || null;
 let _tokenTried = false;
 let _lastTryTime = 0;
+let _tokenPromise = null;
 const TOKEN_RETRY_MIN_INTERVAL_MS = 2000;
 
 async function ensureToken() {
   if (_token || _tokenTried) return;
+  if (_tokenPromise) return _tokenPromise;
   const now = Date.now();
   if (now - _lastTryTime < TOKEN_RETRY_MIN_INTERVAL_MS) return;
   _lastTryTime = now;
-  try {
-    const r = await fetch("/api/token");
-    if (r.ok) {
-      const token = (await r.json()).token || null;
-      if (token) {
-        _token = token;
-        _tokenTried = true;  // only latch "done" once we actually have a token
+  _tokenPromise = (async () => {
+    try {
+      const r = await fetch("/api/token");
+      if (r.ok) {
+        const token = (await r.json()).token || null;
+        if (token) {
+          _token = token;
+          _tokenTried = true;
+        }
       }
+    } catch {
+      // Retry on a later call, subject to the minimum retry interval.
+    } finally {
+      _tokenPromise = null;
     }
-  } catch {}
-  // On failure, _tokenTried stays false so the next call retries (subject to
-  // the min-interval guard above) instead of permanently 401ing every request.
+  })();
+  return _tokenPromise;
 }
 
-async function j(method, url, body) {
+async function j(method, url, body, { signal } = {}) {
   await ensureToken();
   const opts = { method, headers: {} };
   if (_token) opts.headers["Authorization"] = `Bearer ${_token}`;
+  if (signal) opts.signal = signal;
   if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
@@ -89,9 +97,20 @@ export const api = {
   backupValidate: (dest) => j("GET", `/api/backup/validate?dest=${encodeURIComponent(dest)}`),
 
   // Search
-  filters: () => j("GET", "/api/filters"),
-  search: (q, filters, person, top_k = 200) =>
-    j("POST", "/api/search", { q, filters, person, top_k }),
+  filters: (options) => j("GET", "/api/filters", undefined, options),
+  search: (q, filters, person, top_k = 200, options) =>
+    j("POST", "/api/search", { q, filters, person, top_k }, options),
+  library: (params = {}, options) => {
+    const query = new URLSearchParams();
+    for (const key of ["offset", "limit", "q", "media_type", "year", "text_scope", "date_from", "date_to", "month", "day", "photo_type", "scene", "weather", "occasion", "time_of_day", "camera", "has_text", "has_location", "has_caption", "sort"]) {
+      const value = params[key];
+      if (value !== undefined && value !== null && value !== "") query.set(key, String(value));
+    }
+    const queryString = query.toString();
+    return j("GET", `/api/library${queryString ? `?${queryString}` : ""}`, undefined, options);
+  },
+  librarySummary: (options) => j("GET", "/api/library/summary", undefined, options),
+  libraryFacets: (options) => j("GET", "/api/library/facets", undefined, options),
   recent: (limit = 60) => j("GET", `/api/recent?limit=${limit}`),
   timeline: () => j("GET", "/api/timeline"),
   timelineYear: (year, offset = 0, limit = 120) =>
@@ -139,10 +158,10 @@ export const api = {
   setActiveModel: (model) => j("POST", "/api/models/active", { model }),
 
   // Images
-  similar: (id, top_k = 12) =>
-    j("GET", `/api/similar?id=${encodeURIComponent(id)}&top_k=${top_k}`),
-  meta: (id) => j("GET", `/api/meta?id=${encodeURIComponent(id)}`),
-  explore: (id) => j("GET", `/api/explore?id=${encodeURIComponent(id)}`),
+  similar: (id, top_k = 12, options) =>
+    j("GET", `/api/similar?id=${encodeURIComponent(id)}&top_k=${top_k}`, undefined, options),
+  meta: (id, options) => j("GET", `/api/meta?id=${encodeURIComponent(id)}`, undefined, options),
+  explore: (id, options) => j("GET", `/api/explore?id=${encodeURIComponent(id)}`, undefined, options),
   deleteImage: (id, deleteFile) =>
     j("DELETE", `/api/image?id=${encodeURIComponent(id)}&delete_file=${deleteFile}`),
   batchDelete: (ids, deleteFile = false) =>

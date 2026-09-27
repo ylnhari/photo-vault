@@ -1,0 +1,50 @@
+# Interface audit and implementation: photo-first usability
+
+Read-only source audit of `web/src/**` and the existing production bundle. No app was started, no personal catalog was read, and no indexing or provider calls were made. This is a source-level baseline; it does not measure browser timings or rendered behavior.
+
+## Highest-impact findings
+
+1. **The initial catalog view is gated by two serial loads and navigation repeats work.** `App.svelte:23-25` starts health, status, and job requests; `SearchTab.svelte:107-116` waits until status provides a positive embedded count, then fetches filters and 60 recent items before showing the grid. The shell shows a loader while status is unknown (`SearchTab.svelte:144-150`). Each tab is conditionally mounted in `App.svelte:80-91`, so switching away destroys its local state and switching back reruns tab `onMount` fetches (Timeline: `TimelineTab.svelte:97`; Map, Albums, People and Index have similar mount loads). Persist tab data and view state in shared stores; make a recent-photo snapshot available immediately, then refresh counts/filters in the background. Keep the initial view independent of provider health.
+
+2. **All views and Map dependencies ship in the startup bundle.** `App.svelte` statically imports each tab, while `MapTab.svelte:4-8` statically imports Leaflet, marker clustering, and their styles. The checked-in built assets are one JS file, **431,759 bytes**, and one CSS file, **48,530 bytes** (480,289 bytes total, about 469 KiB uncompressed); `web/dist/index.html` includes both directly. Split Map and management views into on-demand chunks, and load map styles/library only when Map opens. Keep the first Search view and its core grid in the initial chunk.
+
+3. **Gallery rendering is only partially bounded.** `PhotoGrid.svelte:23-25` filters and maps every supplied photo; `:158-172` creates a DOM cell and eager image request for each visible photo. The comment at `:166-170` deliberately disables native lazy loading because of a prior tab-switch issue. CSS `content-visibility:auto` (`:215-216`) skips some offscreen layout work but does not remove nodes or prevent thumbnail requests. Recent search is capped at 60 and semantic search defaults to 200 (`SearchTab.svelte:114`, `api.js` search default), but album/timeline/people result sizes are not bounded by the component. Add server-backed pagination or incremental loading, intersection-observer thumbnail loading with a placeholder, and windowed rendering for long lists. Avoid requesting all full-size images at once.
+
+4. **Overlapping requests can paint stale results.** `SearchTab.svelte:119-129` allows Enter to call `doSearch()` while a request is running; the button alone is disabled. There is no request id or cancellation, so an older response can replace a newer search. In `Lightbox.svelte:50-64`, metadata, analysis, and similar-photo responses write into shared component state without confirming that the selected id is still the request target; rapid next/previous navigation can show details from the prior image. Add `AbortController` support to the API wrapper and per-view request generations, and ignore responses after tab teardown or target changes.
+
+5. **Search takes too much space and makes its main action easy to miss.** The search field, person field, and up to 14 filter selects are stacked in a fixed 240px sidebar (`SearchTab.svelte:85-91,166-185,251-253`). On mobile the whole sidebar becomes a full-width column above results (`:253`), pushing photos below the fold. The text fields have placeholders but no associated labels (`:168-170`), and pressing Enter is wired only on the query field. Use a prominent global search bar, a compact filter-chip row with an expandable filter sheet, explicit labels, and visible active-filter chips with one-click removal. Preserve the query and scroll position across destinations.
+
+6. **The lightbox is not fully safe for keyboard and small-screen use.** It adds a global arrow-key listener (`Lightbox.svelte:92-108`) without ignoring keystrokes from focused controls; it moves focus into the dialog but does not restore focus to the opening tile. The dialog has `role="dialog"` and `aria-modal` but no accessible name (`:142`), and the displayed image has empty alt text (`:158`). At widths under 700px the desktop two-column content simply becomes one column (`:274-282`); the side panel remains an equally important scroll region beside a large viewer. Ignore navigation keys from editable controls, name the dialog, restore focus, and use an image-first mobile viewer with metadata/actions in a labeled sheet.
+
+7. **Navigation and selection cues need semantic states.** The six navigation buttons only receive a CSS `active` class (`App.svelte:57-62`); they expose no tab/current-page state. Gallery cells are custom buttons (`PhotoGrid.svelte:158-162`) without `aria-pressed`, and caption overlays only reveal on hover/focus (`:225-234`). Use semantic navigation with `aria-current`, real buttons or grid semantics, announce selection state, and ensure captions/actions are discoverable on touch and assistive technology. The header flex-wraps six tabs rather than adapting navigation to a compact mobile pattern (`App.svelte:94-100`).
+
+## Proposed interface direction
+
+Make the initial Library/Search surface a photo wall: a compact persistent header, a clear search field, a thin filter-chip row, then a dense justified gallery with consistent thumbnail ratios and unobtrusive date grouping. Use light ivory surfaces with charcoal text and a restrained blue/teal accent; keep chrome quiet so photos dominate, and reserve bright warning colors for real status. Replace emoji branding and scattered inline styles with shared type, spacing, surface, focus, and state tokens.
+
+Use a persistent desktop sidebar for Library, Timeline, Map, Albums, People, and Manage; use compact mobile navigation on phones. Keep the currently selected destination mounted or move its query, filters, scroll, and selection into shared state so switching views does not discard work. Fetch the first 60 catalog rows and a cheap count summary from a fast library read path; do not wait for AI health or detailed indexing status before showing browseable photos. Load provider health and detailed status when Manage opens. Keep browsing state bounded and retain it across tab switches.
+
+Search should support a single labeled query field, Enter and an explicit action, a filter drawer that reports active filters, and a useful empty state that suggests dates/people/places only when available. Keep the current onboarding actions, but separate catalog availability from AI availability so a local catalog can still be browsed when providers are offline. Result count, sorting, and clear-all should sit immediately above the gallery.
+
+On desktop, use a wide lightbox with the photo as the dominant pane and a compact, scrollable metadata panel. On mobile, prioritize the image and put metadata and management actions in a labeled bottom sheet. Keep previous/next, close, and destructive actions reachable, with confirmation and focus behavior that works by keyboard.
+
+## Verification and limits
+
+- Baseline asset sizes came from the existing files under `web/dist/assets`; assets were not rebuilt.
+- No tests, build, browser session, network request, or runtime benchmark was run under this read-only audit scope.
+- Findings describe source behavior. Request latency, mobile rendering, and actual bundle composition need a later synthetic-fixture browser pass.
+
+## Implemented in the interface pass
+
+- Replaced the tab header with a persistent desktop sidebar and compact six-destination mobile navigation. Library is the landing surface; secondary views and the Lightbox load only when first opened, and visited views stay mounted to preserve their state.
+- Library fetches `/api/library/summary` and the first 60 `/api/library` cards in parallel. Browse supports debounced text, all/photos/videos, year selection, and Load more. Smart search remains an explicit mode with the existing people and attribute filters. Neither landing nor catalog browsing calls AI health or detailed status.
+- Added request cancellation/latest-result guards, shared `/api/token` bootstrap, retained-result loading states, album/batch actions, and photo/video preview fallbacks. Gallery rows are windowed to the viewport plus overscan, cards use lazy thumbnail loading, and the Lightbox requests metadata/analysis with per-photo guards and restores keyboard focus.
+- Reworked shared colors and spacing for ivory surfaces, charcoal text, and a restrained teal accent. The Search and Lightbox controls include labels, active navigation semantics, selection announcements, modal naming, focus handling, and responsive image-first mobile layout.
+- Map is available from catalog metadata without an embedding count. Indexing progress pauses its poll while the browser page is hidden; a zero-item preparation stage is labeled “Preparing items…” instead of 0%.
+
+## Current verification
+
+- `cd web && npm test`: **3 passed** (API token single-flight/query/signal behavior and request-gate stale/cancel behavior).
+- `cd web && npm run build`: **succeeded**. Vite still reports unused CSS selectors in the pre-existing `IndexTab.svelte`; no warning points to the new Library, shell, gallery, or Lightbox code.
+- Baseline entry assets were **431,759 bytes JS + 48,530 bytes CSS**. Latest production build's first-view path is the shell JS (30,350 bytes), Library JS (30,400), PhotoGrid JS (11,290), request gate (220), and their CSS (7,670 + 11,510 + 2,800 bytes): about **72.3 KB JS and 22.0 KB CSS uncompressed**, before the Lightbox or secondary views are visited. Map (186,440 bytes JS) and Manage (146,260 bytes JS) are separate on-demand chunks.
+- The size comparison uses built asset output only. No warm/cold timing was claimed, and no browser session or actual catalog was opened. The primary agent will perform the rendered review against the synthetic fixture.

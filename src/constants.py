@@ -3,7 +3,11 @@ import json
 
 # Base paths
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+# Process-level override keeps previews, tests, and portable installs isolated
+# from the personal library. This is resolved before loading any .env file.
+DATA_DIR = os.path.abspath(os.path.expanduser(
+    os.environ.get("PHOTO_VAULT_DATA_DIR") or os.path.join(PROJECT_ROOT, "data")
+))
 IMAGE_CATALOG_PATH = os.path.join(DATA_DIR, "catalog.db")
 CHROMA_DB_PATH = os.path.join(DATA_DIR, "chroma_db")
 FACE_DIR = os.path.join(DATA_DIR, "faces")
@@ -66,7 +70,9 @@ NINEROUTER_URL = _load_9router_url()
 
 # Gemini fallback — loaded from .env in project root
 def _load_env():
-    env_path = os.path.join(PROJECT_ROOT, ".env")
+    env_path = os.environ.get("PHOTO_VAULT_ENV_FILE", os.path.join(PROJECT_ROOT, ".env"))
+    if not env_path or env_path == "-":
+        return
     if os.path.exists(env_path):
         with open(env_path) as f:
             for line in f:
@@ -96,10 +102,8 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 # and change over time (https://ai.google.dev/gemini-api/docs/rate-limits), so
 # this is an ordering heuristic, not a guarantee for any specific account.
 GEMINI_VISION_MODELS = [
+    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
-    "gemini-2.5-flash-lite",
-    "gemini-3-flash",
-    "gemini-2.5-flash",
     "gemini-3.5-flash",
 ]
 

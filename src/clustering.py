@@ -7,11 +7,8 @@ cluster is a person added to person_map.json.
 import hashlib
 import os
 import json
-import numpy as np
-from sklearn.cluster import DBSCAN
-
 from constants import FACE_DIR, DATA_DIR
-from faces import load_face_data
+from runtime_import import import_module
 
 CLUSTERS_FILE = os.path.join(DATA_DIR, "face_clusters.json")
 
@@ -94,6 +91,7 @@ def _member_key(member: dict):
 
 
 def _cosine_distance(a, b) -> float:
+    np = import_module("numpy")
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     na = np.linalg.norm(a)
@@ -181,6 +179,8 @@ def cluster_faces(eps: float = 0.5, min_samples: int = 3) -> dict:
     all review progress (named/ignored) back to "new", which defeats the
     point of persisting review state at all.
     """
+    np = import_module("numpy")
+    DBSCAN = import_module("sklearn.cluster").DBSCAN
     previous_clusters = load_clusters().get("clusters", [])
 
     items = _load_all_faces()
@@ -256,6 +256,7 @@ def cluster_mean_embedding(cluster_id: int) -> list | None:
     every one of them is now stale — a different situation the caller should
     surface differently (re-cluster needed) than a plain "nothing here".
     """
+    np = import_module("numpy")
     cluster = get_cluster(cluster_id)
     if not cluster:
         return None
@@ -264,7 +265,7 @@ def cluster_mean_embedding(cluster_id: int) -> list | None:
 
     embs = []
     for m in cluster["members"]:
-        faces = load_face_data(m["image_id"])
+        faces = import_module("faces").load_face_data(m["image_id"])
         idx = m["face_index"]
         if not (0 <= idx < len(faces)):
             continue

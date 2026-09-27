@@ -102,7 +102,7 @@
 {:else if err}
   <p style="color:var(--danger)">{err}</p>
 {:else if years.length === 0}
-  <p class="muted">No photos yet. Scan a folder in Index &amp; Manage.</p>
+  <p class="muted">No photos yet. Scan a folder in Manage.</p>
 {:else}
   <div class="jumpbar">
     <span class="jumplabel">Jump to</span>

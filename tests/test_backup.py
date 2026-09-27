@@ -65,6 +65,35 @@ def test_status_available_and_staleness(env):
     assert backup.status()["days_since"] == 0.0
 
 
+def test_status_hides_backup_after_source_roots_change(env, monkeypatch):
+    tmp_path, pics = env
+    backup.record_success()
+    import folders
+    other = tmp_path / "OtherPictures"
+    other.mkdir()
+    monkeypatch.setattr(folders, "get_effective_scan_dirs", lambda: [str(pics), str(other)])
+    assert backup.status()["last_backup_at"] is None
+
+
+def test_record_success_persists_frozen_roots_when_settings_change_during_write(env, monkeypatch):
+    tmp_path, _ = env
+    roots = backup.backup_roots()
+    old_dest = tmp_path / "sd" / "PhotoVaultBackup"
+    new_dest = tmp_path / "new-sd" / "PhotoVaultBackup"
+    import settings
+
+    def mutate_then_match(_snapshot):
+        monkeypatch.setattr(settings, "load", lambda: {"backup_dest": str(new_dest)})
+        return True
+
+    monkeypatch.setattr(backup, "targets_match_current", mutate_then_match)
+    assert backup.record_success(roots) is True
+    saved = json.loads((tmp_path / "backup_state.json").read_text())
+    assert saved["backup_dest"] == backup._path_key(str(old_dest))
+    assert saved["roots_fingerprint"] == backup._roots_fingerprint(roots)
+    assert backup.status()["last_backup_at"] is None
+
+
 _SUMMARY = """
 ------------------------------------------------------------------------------
                Total    Copied   Skipped  Mismatch    FAILED    Extras
@@ -88,7 +117,9 @@ def test_backup_one_scan_root_copies_without_purge_and_includes_videos(env, monk
     assert "5 copied" in note and "115 unchanged" in note
     # additive mode does NOT delete extras — report them as kept, not removed
     assert "2 extra kept at dest" in note and "removed" not in note
-    assert backup.status()["last_backup_at"] is not None
+    # A root copy is only partial progress; the job manager records success
+    # after every configured root completes.
+    assert backup.status()["last_backup_at"] is None
 
 
 def test_backup_one_data_root_uses_strict_mirror(env, monkeypatch):
@@ -101,6 +132,7 @@ def test_backup_one_data_root_uses_strict_mirror(env, monkeypatch):
     assert "/MIR" in cmd and "/XF" not in cmd
     # strict mirror DOES delete extras — report the removal
     assert "2 removed at dest" in note
+    assert backup.status()["last_backup_at"] is None
 
 
 def test_backup_one_failure_raises(env, monkeypatch):
@@ -116,6 +148,12 @@ def test_backup_one_failure_raises(env, monkeypatch):
 def test_backup_one_unmapped_source_raises(env):
     with pytest.raises(RuntimeError, match="no backup destination"):
         backup.backup_one(r"C:\not\a\root")
+
+
+def test_backup_one_missing_source_raises_instead_of_counting_skip(env, tmp_path):
+    missing = str(tmp_path / "missing")
+    with pytest.raises(FileNotFoundError, match="source folder is missing"):
+        backup.backup_one(missing, str(tmp_path / "backup"))
 
 
 # ── cross-platform python mirror engine ──────────────────────────────────────
@@ -187,7 +225,7 @@ def test_backup_one_uses_python_engine_off_windows(env, monkeypatch):
         note = backup.backup_one(str(pics))
     run.assert_not_called()
     assert "1 copied" in note
-    assert backup.status()["last_backup_at"] is not None
+    assert backup.status()["last_backup_at"] is None
 
 
 def test_validate_dest_rejects_library_overlap(tmp_path, monkeypatch):

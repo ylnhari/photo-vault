@@ -41,6 +41,7 @@
   function requestStop() { stopRequested = true; dispatch("stop"); }
 
   $: running = job.active;
+  $: preparing = running && !!job.preparing && !job.total;
   $: pct = job.total ? Math.round((job.done / job.total) * 100) : (running ? 0 : 100);
 
   // ETA comes from the backend (cumulative average rate, includes time spent
@@ -90,8 +91,12 @@
   </div>
 
   <div class="stats">
-    <span class="pct">{pct}%</span>
-    <span class="muted">{job.done}/{job.total}</span>
+    {#if preparing}
+      <span class="preparing-label">Preparing items…</span>
+    {:else}
+      <span class="pct">{pct}%</span>
+      <span class="muted">{job.done}/{job.total}</span>
+    {/if}
     <span class="chip ok">✅ {job.ok}</span>
     {#if job.fail}<span class="chip fail">❌ {job.fail}</span>{/if}
     {#if running && job.eta_seconds != null}
@@ -174,6 +179,7 @@
   .stats { display: flex; gap: 10px; align-items: baseline; font-size: 13px; flex-wrap: wrap; }
   .models { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; margin-top: 8px; }
   .pct { font-size: 22px; font-weight: 700; color: var(--tile); }
+  .preparing-label { font-size: 14px; font-weight: 650; color: var(--ink); }
   .chip { padding: 2px 9px; border-radius: 99px; background: var(--surface2); font-size: 12px; }
   .chip.ok { color: var(--success); }
   .chip.fail { color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, var(--surface2)); }

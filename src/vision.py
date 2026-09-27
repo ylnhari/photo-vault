@@ -532,6 +532,18 @@ def _call_9router(base64_image: str, model: str) -> tuple[str, str]:
 
 
 _REQUIRED_VISION_KEYS = ("caption", "scene", "occasion", "weather", "group_size")
+_VISION_ENUMS = {
+    "scene": {"indoor", "outdoor", "unknown"},
+    "location_type": {"home", "beach", "restaurant", "park", "office", "travel", "street", "gym", "school", "unknown"},
+    "weather": {"sunny", "cloudy", "rainy", "snowy", "indoor", "unknown"},
+    "season": {"spring", "summer", "autumn", "winter", "unknown"},
+    "time_of_day": {"morning", "afternoon", "evening", "night", "unknown"},
+    "occasion": {"birthday", "wedding", "vacation", "everyday", "sports", "festival", "graduation", "family", "unknown"},
+    "group_size": {"solo", "couple", "small_group", "large_group", "no_people", "unknown"},
+    "clothing_style": {"formal", "casual", "sports", "traditional", "swimwear", "unknown"},
+    "mood": {"happy", "celebration", "relaxed", "adventurous", "serious", "romantic", "unknown"},
+    "photo_type": {"photo", "screenshot", "document", "meme", "selfie", "artwork", "unknown"},
+}
 
 
 def validate_vision_output(text: str) -> dict:
@@ -544,6 +556,8 @@ def validate_vision_output(text: str) -> dict:
             "valid": False,
             "warning": "Output is not valid JSON — model may not support image input",
         }
+    if not isinstance(data, dict):
+        return {"valid": False, "warning": "Output must be a JSON object"}
     if "error" in data:
         return {"valid": False, "warning": f"Model returned error: {data['error']}"}
     missing = [k for k in _REQUIRED_VISION_KEYS if k not in data]
@@ -552,6 +566,26 @@ def validate_vision_output(text: str) -> dict:
             "valid": False,
             "warning": f"Missing expected keys: {missing} — model may be text-only",
         }
+    if not isinstance(data.get("caption"), str) or not data["caption"].strip():
+        return {"valid": False, "warning": "Caption must be a non-empty string"}
+    for key in ("scene", "occasion", "weather", "group_size"):
+        if not isinstance(data.get(key), str) or not data[key].strip():
+            return {"valid": False, "warning": f"{key} must be a non-empty string"}
+    for key, allowed in _VISION_ENUMS.items():
+        if key in data and (not isinstance(data[key], str) or data[key] not in allowed):
+            return {"valid": False, "warning": f"{key} must be one of the supported values"}
+    if "person_count" in data and (
+        isinstance(data["person_count"], bool)
+        or not isinstance(data["person_count"], int)
+        or data["person_count"] < 0
+    ):
+        return {"valid": False, "warning": "person_count must be a non-negative integer"}
+    for key in _LIST_KEYS:
+        if key in data and (
+            not isinstance(data[key], list)
+            or any(not isinstance(value, str) for value in data[key])
+        ):
+            return {"valid": False, "warning": f"{key} must be a list of strings"}
     return {"valid": True, "warning": None}
 
 

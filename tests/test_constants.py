@@ -12,7 +12,7 @@ def test_project_root_is_parent_of_src():
 
 def test_data_dir_under_project_root():
     import constants
-    assert constants.DATA_DIR == os.path.join(constants.PROJECT_ROOT, "data")
+    assert constants.DATA_DIR == os.path.abspath(os.environ["PHOTO_VAULT_DATA_DIR"])
 
 
 def test_all_data_paths_under_data_dir():
@@ -46,78 +46,94 @@ def test_gemini_models_non_empty():
     assert len(constants.GEMINI_VISION_MODELS) >= 3
 
 
-def test_load_env_sets_variable(tmp_path):
+def test_load_env_sets_variable(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text("TEST_VAR_XYZ=hello123\n")
 
-    # Temporarily patch PROJECT_ROOT so _load_env reads our tmp .env
+    # Temporarily patch PROJECT_ROOT so _load_env reads our tmp .env. The
+    # session-wide safety override stays disabled for this explicit unit test.
     import constants
     original = constants.PROJECT_ROOT
+    monkeypatch.delenv("PHOTO_VAULT_ENV_FILE", raising=False)
     constants.PROJECT_ROOT = str(tmp_path)
     os.environ.pop("TEST_VAR_XYZ", None)
-    constants._load_env()
-    constants.PROJECT_ROOT = original
+    try:
+        constants._load_env()
+    finally:
+        constants.PROJECT_ROOT = original
 
     assert os.environ.get("TEST_VAR_XYZ") == "hello123"
     del os.environ["TEST_VAR_XYZ"]
 
 
-def test_load_env_skips_comments(tmp_path):
+def test_load_env_skips_comments(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text("# this is a comment\nVALID_VAR=yes\n")
 
     import constants
     original = constants.PROJECT_ROOT
+    monkeypatch.delenv("PHOTO_VAULT_ENV_FILE", raising=False)
     constants.PROJECT_ROOT = str(tmp_path)
     os.environ.pop("VALID_VAR", None)
-    constants._load_env()
-    constants.PROJECT_ROOT = original
+    try:
+        constants._load_env()
+    finally:
+        constants.PROJECT_ROOT = original
 
     assert os.environ.get("VALID_VAR") == "yes"
     del os.environ["VALID_VAR"]
 
 
-def test_load_env_strips_matching_double_quotes(tmp_path):
+def test_load_env_strips_matching_double_quotes(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text('QUOTED_VAR="hello world"\n')
 
     import constants
     original = constants.PROJECT_ROOT
+    monkeypatch.delenv("PHOTO_VAULT_ENV_FILE", raising=False)
     constants.PROJECT_ROOT = str(tmp_path)
     os.environ.pop("QUOTED_VAR", None)
-    constants._load_env()
-    constants.PROJECT_ROOT = original
+    try:
+        constants._load_env()
+    finally:
+        constants.PROJECT_ROOT = original
 
     assert os.environ.get("QUOTED_VAR") == "hello world"
     del os.environ["QUOTED_VAR"]
 
 
-def test_load_env_strips_matching_single_quotes(tmp_path):
+def test_load_env_strips_matching_single_quotes(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text("SINGLE_QUOTED='hello'\n")
 
     import constants
     original = constants.PROJECT_ROOT
+    monkeypatch.delenv("PHOTO_VAULT_ENV_FILE", raising=False)
     constants.PROJECT_ROOT = str(tmp_path)
     os.environ.pop("SINGLE_QUOTED", None)
-    constants._load_env()
-    constants.PROJECT_ROOT = original
+    try:
+        constants._load_env()
+    finally:
+        constants.PROJECT_ROOT = original
 
     assert os.environ.get("SINGLE_QUOTED") == "hello"
     del os.environ["SINGLE_QUOTED"]
 
 
-def test_load_env_does_not_strip_mismatched_or_internal_quotes(tmp_path):
+def test_load_env_does_not_strip_mismatched_or_internal_quotes(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text('MISMATCHED="unterminated\nINTERNAL=has"quote"inside\n')
 
     import constants
     original = constants.PROJECT_ROOT
+    monkeypatch.delenv("PHOTO_VAULT_ENV_FILE", raising=False)
     constants.PROJECT_ROOT = str(tmp_path)
     os.environ.pop("MISMATCHED", None)
     os.environ.pop("INTERNAL", None)
-    constants._load_env()
-    constants.PROJECT_ROOT = original
+    try:
+        constants._load_env()
+    finally:
+        constants.PROJECT_ROOT = original
 
     # Mismatched leading/trailing quote is left as-is (not a matching pair).
     assert os.environ.get("MISMATCHED") == '"unterminated'

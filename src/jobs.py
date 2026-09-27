@@ -25,9 +25,26 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import ratelimit
+from runtime_import import import_module
 import settings as settings_mod
-from indexer import Indexer, resolve_caption_json, build_embed_payload
-from vision import parse_vision_attributes, build_embedding_text
+
+
+def _lazy_callable(module: str, name: str):
+    """Keep the job/status module cheap until a worker actually needs ML code."""
+    def call(*args, **kwargs):
+        return getattr(import_module(module), name)(*args, **kwargs)
+    call.__name__ = name
+    return call
+
+
+# Keep these module-level patch points for the existing worker tests while
+# avoiding eager imports of InsightFace, ChromaDB, and provider clients from
+# the API's lightweight progress/status path.
+Indexer = _lazy_callable("indexer", "Indexer")
+resolve_caption_json = _lazy_callable("indexer", "resolve_caption_json")
+build_embed_payload = _lazy_callable("indexer", "build_embed_payload")
+parse_vision_attributes = _lazy_callable("vision", "parse_vision_attributes")
+build_embedding_text = _lazy_callable("vision", "build_embedding_text")
 
 JOB_TYPES = ("vision", "embed", "full", "reanalyze", "faces", "thumbs",
              "dhash", "scan", "ingest", "dedupe", "backup",
@@ -72,7 +89,11 @@ JOB_RESOURCES = {
     "scan":         {RES_CATALOG},
     "ingest":       {RES_CATALOG},
     "dedupe":       {RES_CATALOG, RES_EMBED_COL, RES_FACES},
-    "backup":       {RES_BACKUP},
+    # The data mirror must represent one coherent point in time. Hold every
+    # mutable app resource for the whole backup so catalog, embeddings, face,
+    # and thumbnail writers cannot change files while they are copied.
+    "backup":       {RES_CATALOG, RES_INFERENCE, RES_EMBED_COL, RES_FACES,
+                     RES_THUMBS, RES_BACKUP},
 }
 
 # How many finished jobs to keep visible (for the UI's "Done"/retry panel)
@@ -120,7 +141,7 @@ class JobManager:
     def _idle_state() -> dict:
         return {
             "id": None, "resources": [],
-            "active": False, "type": None, "total": 0, "done": 0,
+            "active": False, "preparing": False, "type": None, "total": 0, "done": 0,
             "ok": 0, "fail": 0, "skipped": 0, "failed_ids": [], "log": [],
             "aborted": False, "stopped": False, "finished": False, "error": None,
             "started_at": None, "max_fail": 5, "model_counts": {},
@@ -128,6 +149,7 @@ class JobManager:
             "vision_provider": "auto", "vision_model": None,
             "embed_provider": "auto", "embed_model": None,
             "caption_source_model": None,
+            "backup_destination_changed": False,
         }
 
     # ── resource policy ───────────────────────────────────────────────────────
@@ -211,7 +233,11 @@ class JobManager:
         elif jtype == "backup":
             # One work item per mirror root (source paths).
             import backup as backup_mod
-            roots = [src for src, _ in backup_mod.backup_roots()]
+            pairs = backup_mod.backup_roots()
+            # Freeze destinations with the job so a settings edit cannot split
+            # roots across two backup drives midway through the run.
+            cfg["backup_roots"] = pairs
+            roots = [src for src, _ in pairs]
             if not roots:
                 raise ValueError("backup destination not configured")
             return roots
@@ -223,7 +249,8 @@ class JobManager:
               vision_model: str = None, embed_provider: str = "auto",
               embed_model: str = None, caption_source_model: str = None,
               vision_model_label: str = None, source_path: str = None,
-              ingest_media: str = "both", ingest_video_dest: str = None) -> dict:
+              ingest_media: str = "both", ingest_video_dest: str = None,
+              background_prepare: bool = False) -> dict:
         if jtype not in JOB_TYPES:
             raise ValueError(f"unknown job type: {jtype}")
         # max_fail <= 0 would abort the job after the very first batch
@@ -241,23 +268,23 @@ class JobManager:
         vision_model_label = settings_mod.vision_model_label(
             {"vision_provider": vision_provider, "vision_model": vision_model}
         )
+        cfg = {
+            "vision_provider": vision_provider, "vision_model": vision_model,
+            "embed_provider": embed_provider, "embed_model": embed_model,
+            "caption_source_model": caption_source_model,
+            "vision_model_label": vision_model_label,
+            "max_fail": max_fail,
+            "source_path": source_path,
+            "ingest_media": ingest_media if ingest_media in
+                            ("both", "photos", "videos") else "both",
+            "ingest_video_dest": ingest_video_dest,
+            # Keyframes sampled per video for video_vision/video_faces.
+            # Read once at job start (like vision_concurrency) so the job
+            # runs at a stable value even if Settings change mid-run.
+            "video_frames": _clamp_video_frames(
+                settings_mod.load().get("video_frames", 4)),
+        }
         with self._lock:
-            cfg = {
-                "vision_provider": vision_provider, "vision_model": vision_model,
-                "embed_provider": embed_provider, "embed_model": embed_model,
-                "caption_source_model": caption_source_model,
-                "vision_model_label": vision_model_label,
-                "max_fail": max_fail,
-                "source_path": source_path,
-                "ingest_media": ingest_media if ingest_media in
-                                ("both", "photos", "videos") else "both",
-                "ingest_video_dest": ingest_video_dest,
-                # Keyframes sampled per video for video_vision/video_faces.
-                # Read once at job start (like vision_concurrency) so the job
-                # runs at a stable value even if Settings change mid-run.
-                "video_frames": _clamp_video_frames(
-                    settings_mod.load().get("video_frames", 4)),
-            }
             # Concurrency gate: refuse only if this job's resources overlap a
             # RUNNING job's. Disjoint jobs (e.g. faces alongside embed) proceed.
             needed = self._resources_for(jtype, cfg)
@@ -277,10 +304,10 @@ class JobManager:
             self._counter += 1
             jid = f"{jtype}-{self._counter}"
             state = self._idle_state()
-            ids = self._pending_ids(jtype, cfg)
             state.update({
                 "id": jid, "resources": sorted(needed),
-                "active": True, "type": jtype, "total": len(ids),
+                "active": True, "preparing": True,
+                "type": jtype, "total": 0,
                 "started_at": time.time(),
                 "vision_provider": vision_provider, "vision_model": vision_model,
                 "embed_provider": embed_provider, "embed_model": embed_model,
@@ -289,13 +316,34 @@ class JobManager:
             })
             job = _Job(jid, jtype, needed, state)
             self._jobs[jid] = job
-            if not ids:
-                state.update({"active": False, "finished": True})
+            if background_prepare:
+                job.thread = threading.Thread(
+                    target=self._run,
+                    args=(job, jtype, None, cfg, True), daemon=True
+                )
+                job.thread.start()
                 return self._render(state)
-            job.thread = threading.Thread(
-                target=self._run, args=(job, jtype, ids, cfg), daemon=True
-            )
-            job.thread.start()
+
+        # Preserve the synchronous API's immediate item count, but release the
+        # manager lock while discovery reads the catalog or walks folders.
+        try:
+            ids = self._pending_ids(jtype, cfg)
+        except Exception:
+            with self._lock:
+                self._jobs.pop(job.id, None)
+            raise
+        with self._lock:
+            state["total"] = len(ids)
+            state["preparing"] = False
+            if job.stop.is_set():
+                state.update({"active": False, "finished": True, "stopped": True})
+            elif not ids:
+                state.update({"active": False, "finished": True})
+            else:
+                job.thread = threading.Thread(
+                    target=self._run, args=(job, jtype, ids, cfg), daemon=True
+                )
+                job.thread.start()
             return self._render(state)
 
     def stop(self, job_id: str = None):
@@ -382,14 +430,30 @@ class JobManager:
 
     # ── worker ────────────────────────────────────────────────────────────────
 
-    def _run(self, job, jtype, ids, cfg):
-        idx = Indexer()  # private mutable catalog copy for this job
+    def _run(self, job, jtype, ids, cfg, background_prepare=False):
         is_infer = RES_INFERENCE in job.resources
         if is_infer:
             # Only one inference job runs at a time, so it's safe for it to own
             # the module-level cancel event for its lifetime.
             ratelimit.set_cancel_event(job.stop)
         try:
+            if background_prepare:
+                if job.stop.is_set():
+                    self._update(job, stopped=True)
+                    return
+                ids = self._pending_ids(jtype, cfg)
+                with self._lock:
+                    job.state["total"] = len(ids)
+                    job.state["preparing"] = False
+                if job.stop.is_set():
+                    self._update(job, stopped=True)
+                    return
+                if not ids:
+                    return
+            # Construction loads the catalog and can fail. Keep it inside the
+            # worker lifecycle so failures are visible and resources are always
+            # released through the finally block below.
+            idx = Indexer()  # private mutable catalog copy for this job
             if jtype == "vision":
                 self._run_vision_parallel(job, idx, ids, cfg)
             elif jtype == "video_vision":
@@ -428,6 +492,7 @@ class JobManager:
             if is_infer:
                 ratelimit.set_cancel_event(threading.Event())  # neutral again
             with self._lock:
+                job.state["preparing"] = False
                 job.state["active"] = False
                 job.state["finished"] = True
 
@@ -526,14 +591,12 @@ class JobManager:
         per-batch on this thread. The dedicated 'embed' job path — 'full' and
         'reanalyze' still run item-by-item via _run_sequential.
         """
-        from embeddings import (
-            get_embeddings_batch,
-            collection_name_for,
-            last_embed_error,
-            last_substitution,
-            resolve_9router_embed_id,
-        )
-        import db
+        embeddings = import_module("embeddings")
+        get_embeddings_batch = embeddings.get_embeddings_batch
+        last_embed_error = embeddings.last_embed_error
+        last_substitution = embeddings.last_substitution
+        resolve_9router_embed_id = embeddings.resolve_9router_embed_id
+        db = import_module("db")
 
         ep, em = cfg["embed_provider"], cfg["embed_model"]
         csm = cfg.get("caption_source_model")
@@ -644,9 +707,14 @@ class JobManager:
                     continue
 
             # Faces (optional, per image) then one batched ChromaDB add.
-            if faces_during:
-                from faces import detect_and_embed_faces, save_face_data, index_faces
+            if faces_during and not job.stop.is_set():
+                faces = import_module("faces")
+                detect_and_embed_faces = faces.detect_and_embed_faces
+                save_face_data = faces.save_face_data
+                index_faces = faces.index_faces
                 for iid, img_data, _ in members:
+                    if job.stop.is_set():
+                        break
                     try:
                         fd = detect_and_embed_faces(img_data["path"])
                         save_face_data(iid, fd)
@@ -654,12 +722,14 @@ class JobManager:
                     except Exception as e:
                         print(f"[jobs] face detection failed for {iid}: {e}")
 
-            col = db.client().get_or_create_collection(
-                name=collection_name_for(model_name)
-            )
+            col = db.collection(model_name)
             b_ids = [iid for iid, _, _ in members]
             b_payloads = [
-                build_embed_payload(img_data, cj, source, model_name)
+                build_embed_payload(
+                    img_data, cj, source, model_name,
+                    caption_source_model=csm,
+                    embedding_text=build_embedding_text(parse_vision_attributes(cj)),
+                )
                 for _, img_data, cj in members
             ]
             try:
@@ -681,6 +751,11 @@ class JobManager:
                 self._update(job, ok=1, done=1,
                              log=(icon, iid, f"embed:{source}",
                                   img_data.get("filename", "")))
+            # Keep vectors already returned by the provider, but stop before
+            # starting another batch (or optional local face work).
+            if job.stop.is_set():
+                self._update(job, stopped=True)
+                break
 
     def _run_sequential(self, job, idx, jtype, ids, cfg):
         """Embed / full / reanalyze: run one at a time (ChromaDB writes), but
@@ -741,7 +816,8 @@ class JobManager:
                     dirty = True
                 elif jtype == "backup":
                     import backup as backup_mod
-                    note = backup_mod.backup_one(img_id)
+                    dest = dict(cfg.get("backup_roots", [])).get(img_id)
+                    note = backup_mod.backup_one(img_id, dest=dest)
                 elif jtype == "full":
                     note = idx.index_one_full(img_id, use_cached=True, upsert=False,
                                               vision_provider=vp, vision_model=vm,
@@ -784,6 +860,24 @@ class JobManager:
             idx._save_catalog()
         if ingest_session is not None:
             ingest_session.close()
+        if jtype == "backup":
+            # A successful root copy is only partial progress. Publish the
+            # last-success timestamp after every configured root completed.
+            with self._lock:
+                st = job.state
+                complete = (
+                    st["done"] == len(ids)
+                    and st["fail"] == 0
+                    and st["skipped"] == 0
+                    and not st["stopped"]
+                    and not st["aborted"]
+                )
+            if complete:
+                import backup as backup_mod
+                if backup_mod.record_success(cfg.get("backup_roots")):
+                    return
+                with self._lock:
+                    job.state["backup_destination_changed"] = True
 
     def _update(self, job, ok=0, fail=0, skipped=0, done=0, failed_id=None, log=None,
                 stopped=False, aborted=False, model_used=None):

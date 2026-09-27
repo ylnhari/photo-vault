@@ -215,7 +215,7 @@ def test_get_embedding_forced_gemini_skips_lm_studio():
 def test_get_embedding_forwards_model_to_lm_studio():
     from embeddings import get_embedding
     captured = {}
-    def fake_lm(t, model=None):
+    def fake_lm(t, model=None, purpose="document"):
         captured["model"] = model
         return ([0.1], model or "auto")
     with patch("embeddings._lm_studio_embed", side_effect=fake_lm), \
@@ -410,32 +410,51 @@ def test_batch_embed_empty_input():
     assert get_embeddings_batch([]) == ([], "", "")
 
 
-def test_batch_embed_gemini_partial_failure_keeps_successful_vectors():
-    """One bad text in a Gemini batch must not discard the whole chunk — the
-    failing slot comes back None, the rest keep their real vectors."""
+def test_gemini_batch_uses_batch_endpoint_and_retrieval_document_task_type():
+    from embeddings import _gemini_embed_batch
+    import embeddings
+    embeddings._gemini_embed_cooldown.clear()
+    calls = []
+    class Resp:
+        def read(self): return json.dumps({"embeddings": [
+            {"values": [0.1, 0.2]}, {"values": [0.3, 0.4]},
+        ]}).encode()
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    def fake(req, timeout=None):
+        calls.append((req.full_url, json.loads(req.data)))
+        return Resp()
+    with patch("urllib.request.urlopen", side_effect=fake), \
+         patch("embeddings.GEMINI_API_KEY", "fake-key"), \
+         patch("embeddings.EMBEDDING_REGISTRY_PATH", "missing-registry.json"):
+        vectors, model = _gemini_embed_batch(
+            ["caption one", "caption two"], model="gemini-embedding-001")
+    assert vectors == [[0.1, 0.2], [0.3, 0.4]]
+    assert model == "gemini-embedding-001"
+    assert ":batchEmbedContents?key=fake-key" in calls[0][0]
+    requests = calls[0][1]["requests"]
+    assert [r["embedContentConfig"]["taskType"] for r in requests] == [
+        "RETRIEVAL_DOCUMENT", "RETRIEVAL_DOCUMENT"]
+    assert requests[0]["content"]["parts"][0]["text"] == "caption one"
+
+
+def test_batch_embed_gemini_batch_failure_discards_chunk():
+    """A malformed/failed Gemini batch must not produce partial id alignment."""
     from embeddings import get_embeddings_batch
 
-    def fake_gemini_embed(text, model=None):
-        if text == "bad":
-            raise RuntimeError("content blocked")
-        return ([0.1] if text == "good1" else [0.2]), "text-embedding-004"
-
     with patch("embeddings._lm_studio_embed_batch", side_effect=ConnectionRefusedError("refused")), \
-         patch("embeddings._gemini_embed", side_effect=fake_gemini_embed), \
-         patch("embeddings.register_model"):
+         patch("embeddings._gemini_embed_batch", side_effect=RuntimeError("content blocked")):
         vectors, model, source = get_embeddings_batch(["good1", "bad", "good2"])
 
-    assert source == "gemini"
-    assert vectors[0] == [0.1]
-    assert vectors[1] is None
-    assert vectors[2] == [0.2]
+    assert source == "error"
+    assert vectors is None
 
 
 def test_batch_embed_gemini_all_fail_returns_none():
     from embeddings import get_embeddings_batch
 
     with patch("embeddings._lm_studio_embed_batch", side_effect=ConnectionRefusedError("refused")), \
-         patch("embeddings._gemini_embed", side_effect=RuntimeError("quota exceeded")):
+         patch("embeddings._gemini_embed_batch", side_effect=RuntimeError("quota exceeded")):
         vectors, model, source = get_embeddings_batch(["a", "b"], force_provider="gemini")
 
     assert vectors is None
@@ -444,15 +463,14 @@ def test_batch_embed_gemini_all_fail_returns_none():
 
 # ── registry persistence resilience (items 7, 8, 20) ────────────────────────
 
-def test_load_registry_recovers_from_corrupt_file(tmp_path):
-    """A truncated/corrupt registry file (e.g. from a crash mid-write) must
-    not crash every subsequent registry read — start fresh instead."""
+def test_load_registry_fails_closed_on_corrupt_file(tmp_path):
+    """A corrupt profile registry must not make old vectors appear unregistered."""
     from embeddings import _load_registry
     reg_path = tmp_path / "reg.json"
     reg_path.write_text("{not valid json")
     with patch("embeddings.EMBEDDING_REGISTRY_PATH", str(reg_path)):
-        reg = _load_registry()
-    assert reg == {"active_model": None, "models": {}}
+        with pytest.raises(RuntimeError, match="unreadable"):
+            _load_registry()
 
 
 def test_save_registry_is_atomic_no_leftover_tmp_file(tmp_path):
@@ -496,6 +514,83 @@ def test_register_model_same_dimension_repeated_call_does_not_raise(tmp_path):
     assert reg["models"]["model-a"]["dimension"] == 768
 
 
+def test_new_registry_entries_get_explicit_hashed_cosine_profile(tmp_path):
+    from embeddings import register_model, get_registry
+    reg_path = str(tmp_path / "reg.json")
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", reg_path):
+        register_model("lm_studio", "nomic-embed-text", 768)
+        info = get_registry()["models"]["nomic-embed-text"]
+    assert info["profile"]["metric"] == "cosine"
+    assert info["profile"]["task_strategy"] == "nomic-search-prefix-v1"
+    assert info["profile_id"] in info["collection"]
+    assert len(info["collection"]) <= 63
+
+
+def test_db_profile_collection_is_created_with_cosine_and_identity_metadata():
+    import db
+    profile = {"metric": "cosine", "provider": "gemini"}
+    info = {"collection": "img_gemini_abc", "profile": profile, "profile_id": "abc"}
+    mock_collection = MagicMock()
+    mock_collection.name = info["collection"]
+    mock_collection.metadata = {"hnsw:space": "cosine", "embedding_profile_id": "abc"}
+    client = MagicMock()
+    client.get_or_create_collection.return_value = mock_collection
+    with patch("db.client", return_value=client):
+        result = db.collection("gemini-embedding-001", model_info=info)
+    assert result is mock_collection
+    assert client.get_or_create_collection.call_args.kwargs["metadata"] == {
+        "hnsw:space": "cosine", "embedding_profile_id": "abc"
+    }
+
+
+def test_legacy_registry_profile_and_collection_are_preserved(tmp_path):
+    from embeddings import _profile_for_registered, collection_name_for
+    reg_path = tmp_path / "reg.json"
+    reg_path.write_text(json.dumps({"active_model": "old", "models": {
+        "old": {"source": "gemini", "dimension": 768, "collection": "img_original"}
+    }}))
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", str(reg_path)):
+        profile, legacy = _profile_for_registered("gemini", "old")
+        assert legacy is True
+        assert profile["task_strategy"] == "legacy-raw-v0"
+        assert collection_name_for("old") == "img_original"
+
+
+def test_gemini001_profile_uses_retrieval_task_types():
+    from embeddings import _profile_text
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", "missing-registry.json"):
+        assert _profile_text("sunny beach", "gemini", "gemini-embedding-001", "document") == (
+            "sunny beach", "RETRIEVAL_DOCUMENT")
+        assert _profile_text("beach vacation", "gemini", "gemini-embedding-001", "query") == (
+            "beach vacation", "RETRIEVAL_QUERY")
+
+
+def test_nomic_profile_uses_distinct_query_and_document_prefixes():
+    from embeddings import _profile_text
+    with patch("embeddings.EMBEDDING_REGISTRY_PATH", "missing-registry.json"):
+        assert _profile_text("A family at the beach", "lm_studio", "nomic-embed-text", "document")[0] == \
+            "search_document: A family at the beach"
+        assert _profile_text("family beach day", "lm_studio", "nomic-embed-text", "query")[0] == \
+            "search_query: family beach day"
+
+
+@pytest.mark.parametrize("vector", [[], [0, 0], [float("nan")], [float("inf")], ["x"]])
+def test_embedding_vectors_reject_invalid_values(vector):
+    from embeddings import _validate_vector
+    with pytest.raises(RuntimeError):
+        _validate_vector(vector, "test")
+
+
+def test_embedding_batch_rejects_missing_duplicate_indexes_and_dimension_mismatch():
+    from embeddings import _ordered_rows, _validate_vectors
+    with pytest.raises(RuntimeError, match="index"):
+        _ordered_rows([{"embedding": [1.0]}], 1, "test")
+    with pytest.raises(RuntimeError, match="duplicate"):
+        _ordered_rows([{"index": 0}, {"index": 0}], 2, "test")
+    with pytest.raises(RuntimeError, match="dimension"):
+        _validate_vectors([[1.0], [0.1, 0.2]], 2, "test")
+
+
 # ── Gemini embed rate-limit cooldown (item 9) ───────────────────────────────
 
 def test_gemini_embed_429_sets_cooldown_and_skips_retry():
@@ -513,7 +608,8 @@ def test_gemini_embed_429_sets_cooldown_and_skips_retry():
     assert cooldowns["text-embedding-004"] > 0
 
     # A second call while in cooldown must not hit the network at all.
-    with patch("urllib.request.urlopen") as mock_open:
+    with patch("urllib.request.urlopen") as mock_open, \
+         patch("embeddings.GEMINI_API_KEY", "fake-key"):
         with pytest.raises(RuntimeError, match="cooldown"):
             _gemini_embed("test", model="text-embedding-004")
         mock_open.assert_not_called()

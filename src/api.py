@@ -36,58 +36,93 @@ from constants import (
     THUMB_DIR,
     PROJECT_ROOT,
     SERVER_PORT,
+    IMAGE_CATALOG_PATH,
 )
-import db
+import catalog_db
+from photo_date import resolve_photo_date
+from runtime_import import import_module
 import security
-from indexer import (
-    Indexer,
-    catalog_path_for,
-    load_catalog_cached,
-    resolve_photo_date as indexer_resolve_photo_date,
-)
+
+
+class _LazyModule:
+    """Import optional backend packages only when an endpoint needs them."""
+    def __init__(self, name):
+        self._name = name
+
+    def __getattr__(self, name):
+        return getattr(import_module(self._name), name)
+
+
+class _LazyObject:
+    def __init__(self, module, name):
+        self._module, self._name = module, name
+
+    def __getattr__(self, name):
+        return getattr(getattr(import_module(self._module), self._name), name)
+
+
+def _lazy_function(module, name):
+    def call(*args, **kwargs):
+        return getattr(import_module(module), name)(*args, **kwargs)
+    call.__name__ = name
+    return call
+
+
+class Indexer:
+    """Compatibility facade; construct the real indexer only on demand."""
+    def __new__(cls, *args, **kwargs):
+        return import_module("indexer").Indexer(*args, **kwargs)
+
+
+def load_catalog_cached():
+    return import_module("indexer").load_catalog_cached()
+
+
+def catalog_path_for(img_id):
+    return catalog_db.image_path(IMAGE_CATALOG_PATH, img_id)
 
 # id is a content hash, so a given id's bytes never change → cache forever.
 _IMMUTABLE_CACHE = {"Cache-Control": "private, max-age=31536000, immutable"}
-from search import search_images, get_available_filter_values, SearchUnavailableError
-from vision import (
-    list_lm_studio_models,
-    list_lm_studio_models_v0,
-    classify_lm_studio_model,
-    list_gemini_vision_models,
-    list_9router_vision_models,
-    validate_vision_output,
-    gemini_cooldowns,
-    ninerouter_cooldowns,
-)
-from embeddings import (
-    get_registry,
-    get_active_model,
-    set_active_model,
-    collection_name_for,
-    list_gemini_embed_models,
-    list_9router_embed_models,
-    ninerouter_embed_cooldowns,
-)
-from tagger import (
-    add_person_reference,
-    add_person_embedding,
-    get_all_persons,
-    rename_person,
-    delete_person,
-    set_relation,
-    get_people_detailed,
-)
+search_images = _lazy_function("search", "search_images")
+get_available_filter_values = _lazy_function("search", "get_available_filter_values")
+list_lm_studio_models = _lazy_function("vision", "list_lm_studio_models")
+list_lm_studio_models_v0 = _lazy_function("vision", "list_lm_studio_models_v0")
+classify_lm_studio_model = _lazy_function("vision", "classify_lm_studio_model")
+list_gemini_vision_models = _lazy_function("vision", "list_gemini_vision_models")
+list_9router_vision_models = _lazy_function("vision", "list_9router_vision_models")
+validate_vision_output = _lazy_function("vision", "validate_vision_output")
+gemini_cooldowns = _lazy_function("vision", "gemini_cooldowns")
+ninerouter_cooldowns = _lazy_function("vision", "ninerouter_cooldowns")
+get_registry = _lazy_function("embeddings", "get_registry")
+get_active_model = _lazy_function("embeddings", "get_active_model")
+set_active_model = _lazy_function("embeddings", "set_active_model")
+collection_name_for = _lazy_function("embeddings", "collection_name_for")
+list_gemini_embed_models = _lazy_function("embeddings", "list_gemini_embed_models")
+list_9router_embed_models = _lazy_function("embeddings", "list_9router_embed_models")
+ninerouter_embed_cooldowns = _lazy_function("embeddings", "ninerouter_embed_cooldowns")
+add_person_reference = _lazy_function("tagger", "add_person_reference")
+add_person_embedding = _lazy_function("tagger", "add_person_embedding")
+get_all_persons = _lazy_function("tagger", "get_all_persons")
+rename_person = _lazy_function("tagger", "rename_person")
+delete_person = _lazy_function("tagger", "delete_person")
+set_relation = _lazy_function("tagger", "set_relation")
+get_people_detailed = _lazy_function("tagger", "get_people_detailed")
 import dupes as dupes_mod
 import trash as trash_mod
-from faces import load_face_data, face_index_count, rebuild_face_index
-from validator import service_status
-from jobs import manager, JOB_TYPES
-import clustering
-from clustering import ClusterMembersStaleError
+load_face_data = _lazy_function("faces", "load_face_data")
+face_index_count = _lazy_function("faces", "face_index_count")
+rebuild_face_index = _lazy_function("faces", "rebuild_face_index")
+service_status = _lazy_function("validator", "service_status")
+manager = _LazyObject("jobs", "manager")
+JOB_TYPES = ("vision", "embed", "full", "reanalyze", "faces", "thumbs", "dhash",
+             "scan", "ingest", "dedupe", "backup", "video_vision", "video_faces")
+clustering = _LazyModule("clustering")
+db = _LazyModule("db")
 import albums as albums_mgr
 import folders as folder_mgr
 import ratelimit
 import settings as settings_mgr
+
 
 os.makedirs(THUMB_DIR, exist_ok=True)
 
@@ -358,11 +393,17 @@ def status():
     # Embed counts
     eligible_ids = idx.get_embed_eligible_ids(csm)
     eligible = len(eligible_ids)
-    if em:
-        embed_done = stage.get("models", {}).get(em, {}).get("indexed_count", 0)
+    selected_embed_model = em or stage.get("active_model")
+    if selected_embed_model:
+        # Raw collection count can include vectors from an older caption or
+        # metadata fingerprint. Use the same validity check as the Embed job
+        # so stale rows remain actionable in Settings → Index.
+        model_embed_pending = idx.get_embed_pending_for_model(selected_embed_model, csm)
+        embed_pending = len(model_embed_pending)
+        embed_done = max(0, eligible - embed_pending)
     else:
+        embed_pending = legacy_embed_pending
         embed_done = stage.get("active_model_embedded", 0)
-    embed_pending = max(0, eligible - embed_done)
 
     faces = idx.get_faces_stats()
     video_faces = idx.get_video_faces_stats()
@@ -385,7 +426,7 @@ def status():
                 "model_summary": idx.get_vision_model_summary(),
             },
             "embed": {
-                "selected_model": em or stage.get("active_model"),
+                "selected_model": selected_embed_model,
                 "caption_source": csm,
                 "eligible": eligible,
                 "done": embed_done,
@@ -443,12 +484,18 @@ def put_settings(req: SettingsReq):
         v = backup_mod.validate_dest(patch["backup_dest"])
         if not v["ok"]:
             raise HTTPException(422, v["reason"])
-    updated = settings_mgr.update(patch)
+    if "backup_dest" in patch:
+        with _activity_lock:
+            if "backup" in manager.active_types():
+                raise HTTPException(409, "backup destination cannot change while a backup job is running")
+            updated = settings_mgr.update(patch)
+    else:
+        updated = settings_mgr.update(patch)
     # Changing the face accelerator must drop the cached FaceAnalysis session so
     # the next faces run rebuilds on the newly chosen device (it's keyed by
     # choice, but reset eagerly so a later same-process read can't serve stale).
     if "face_provider" in patch:
-        import faces
+        faces = import_module("faces")
         faces.reset_face_app()
     return updated
 
@@ -460,7 +507,7 @@ def face_providers():
     only what will actually run. `selected` is the saved setting; `active` is
     what that choice resolves to after CPU-fallback (an unavailable pick shows
     CPU)."""
-    import faces
+    faces = import_module("faces")
     s = settings_mgr.load()
     selected = s.get("face_provider", "auto")
     return {
@@ -749,19 +796,21 @@ def index_start(req: IndexReq):
         if not bs["available"]:
             raise HTTPException(422, f"backup drive not connected ({bs['dest']})")
     try:
-        return manager.start(
-            req.type,
-            vision_provider=req.vision_provider,
-            max_fail=req.max_fail,
-            vision_model=req.vision_model,
-            embed_provider=req.embed_provider,
-            embed_model=req.embed_model,
-            caption_source_model=req.caption_source_model,
-            vision_model_label=vml,
-            source_path=req.source_path,
-            ingest_media=req.ingest_media,
-            ingest_video_dest=req.ingest_video_dest,
-        )
+        with _activity_lock:
+            return manager.start(
+                req.type,
+                vision_provider=req.vision_provider,
+                max_fail=req.max_fail,
+                vision_model=req.vision_model,
+                embed_provider=req.embed_provider,
+                embed_model=req.embed_model,
+                caption_source_model=req.caption_source_model,
+                vision_model_label=vml,
+                source_path=req.source_path,
+                ingest_media=req.ingest_media,
+                ingest_video_dest=req.ingest_video_dest,
+                background_prepare=True,
+            )
     except RuntimeError as e:
         raise HTTPException(409, str(e))
     except ValueError as e:
@@ -889,6 +938,64 @@ def filters():
     return get_available_filter_values()
 
 
+@app.get("/api/library/summary")
+def library_summary():
+    """Fast, model-independent counts for the initial gallery shell."""
+    return catalog_db.library_summary(IMAGE_CATALOG_PATH)
+
+
+@app.get("/api/library")
+def library(
+    q: str = Query("", max_length=500),
+    media_type: str | None = Query(None, pattern="^(image|video)$"),
+    year: str | None = Query(None, max_length=7),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(60, ge=1, le=500),
+    text_scope: str = Query("all", pattern="^(all|filename|caption|details|text|place|camera)$"),
+    date_from: str | None = Query(None, max_length=10),
+    date_to: str | None = Query(None, max_length=10),
+    month: int | None = Query(None, ge=1, le=12),
+    day: int | None = Query(None, ge=1, le=31),
+    photo_type: str | None = Query(None, max_length=200),
+    scene: str | None = Query(None, max_length=200),
+    weather: str | None = Query(None, max_length=200),
+    occasion: str | None = Query(None, max_length=200),
+    time_of_day: str | None = Query(None, max_length=200),
+    camera: str | None = Query(None, max_length=200),
+    has_text: str | None = Query(None, pattern="^(yes|no)$"),
+    has_location: str | None = Query(None, pattern="^(yes|no)$"),
+    has_caption: str | None = Query(None, pattern="^(yes|no)$"),
+    sort: str = Query("newest", pattern="^(newest|oldest|added|filename)$"),
+):
+    """Paged local browse and metadata search; independent of AI/provider paths."""
+    try:
+        page = catalog_db.library_page(
+            IMAGE_CATALOG_PATH, q=q, media_type=media_type, year=year,
+            offset=offset, limit=limit, text_scope=text_scope,
+            date_from=date_from, date_to=date_to, month=month, day=day,
+            photo_type=photo_type, scene=scene, weather=weather,
+            occasion=occasion, time_of_day=time_of_day, camera=camera,
+            has_text=has_text, has_location=has_location,
+            has_caption=has_caption, sort=sort,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    cards = [{
+        **row,
+        # Catalog browse is optimistic. Checking every path can block on
+        # disconnected removable drives; orphan cleanup remains authoritative.
+        "exists": True,
+    } for row in page["results"]]
+    return {"results": cards, "total": page["total"], "offset": offset,
+            "limit": limit, "has_more": offset + len(cards) < page["total"]}
+
+
+@app.get("/api/library/facets")
+def library_facets():
+    """Bounded, data-driven global filter options for the Browse UI."""
+    return catalog_db.library_facets(IMAGE_CATALOG_PATH, limit=100)
+
+
 # Shared upper bound for any "how many results" query param — generous for a
 # personal-library-scale app while keeping a single malicious/typo'd value
 # from forcing a huge chroma fetch.
@@ -930,7 +1037,9 @@ def search(
     # browse path (all their photos), which coercing q to "photo" would disable.
     try:
         res = search_images(q, top_k=top_k, filters=filters_in, person=person or None)
-    except SearchUnavailableError as e:
+    except Exception as e:
+        if not isinstance(e, import_module("search").SearchUnavailableError):
+            raise
         raise HTTPException(503, f"search is temporarily unavailable: {e}")
     return _search_response(res)
 
@@ -951,7 +1060,9 @@ def search_post(body: SearchReq):
     }
     try:
         res = search_images(q, top_k=body.top_k, filters=filters_in, person=person)
-    except SearchUnavailableError as e:
+    except Exception as e:
+        if not isinstance(e, import_module("search").SearchUnavailableError):
+            raise
         raise HTTPException(503, f"search is temporarily unavailable: {e}")
     return _search_response(res)
 
@@ -1120,45 +1231,13 @@ def recent(limit: int = Query(60, ge=1, le=_MAX_RESULT_LIMIT)):
 @app.get("/api/map")
 def map_photos():
     """Geotagged photos (from EXIF GPS) for the Map tab."""
-    catalog = load_catalog_cached().get("images", {})
-    points = []
-    for img_id, data in list(catalog.items()):
-        meta = data.get("metadata", {})
-        lat, lon = meta.get("gps_lat"), meta.get("gps_lon")
-        if lat is not None and lon is not None:
-            points.append(
-                {
-                    "id": img_id,
-                    "lat": lat,
-                    "lon": lon,
-                    "filename": data.get("filename", ""),
-                    "exists": os.path.exists(data.get("path", "")),
-                }
-            )
-    return {"points": points}
-
-
-def _resolve_photo_date(data: dict) -> str:
-    """EXIF date -> a date parsed from the filename -> file/import timestamp.
-    Single source of truth shared with the embed payload (indexer), so the
-    Timeline and the Search 'Year' filter place a photo under the same year."""
-    return indexer_resolve_photo_date(data)
+    return {"points": catalog_db.map_points(IMAGE_CATALOG_PATH)}
 
 
 @app.get("/api/timeline/summary")
 def timeline_summary():
-    """Cheap year -> month -> count map for quick-jump navigation. No
-    per-photo os.path.exists check (that's what makes /api/timeline itself
-    expensive at scale) — just a date tally, safe to call eagerly."""
-    catalog = load_catalog_cached().get("images", {})
-    summary: dict[str, dict[str, int]] = {}
-    for data in catalog.values():
-        date = _resolve_photo_date(data)
-        y = date[:4] if date and len(date) >= 4 else "Unknown"
-        m = date[5:7] if y != "Unknown" and len(date) >= 7 else "00"
-        year_bucket = summary.setdefault(y, {})
-        year_bucket[m] = year_bucket.get(m, 0) + 1
-    return {"summary": summary}
+    """Year -> month -> count map from indexed catalog fields."""
+    return {"summary": catalog_db.timeline_month_counts(IMAGE_CATALOG_PATH)}
 
 
 @app.get("/api/timeline")
@@ -1166,8 +1245,8 @@ def timeline(year: str | None = None, offset: int = 0, limit: int = 60):
     """
     Paged timeline. Without `year`: every year with its count and the first
     `limit` photos (newest first). With `year`: one page of that year's photos.
-    Returning the whole catalog in one response was 2.4 MB / 4.4 s at 25k
-    photos (an os.path.exists per photo) — pages keep both bounded.
+    SQL queries return only each bounded page and avoid per-photo filesystem
+    stats so unplugged drives do not stall browsing.
     """
     if year is None and offset:
         # The all-years response is grouped per year (each capped at `limit`
@@ -1177,47 +1256,26 @@ def timeline(year: str | None = None, offset: int = 0, limit: int = 60):
         # to make a caller believe pagination was honored when it wasn't.
         raise HTTPException(400, "offset requires year to be specified")
 
-    catalog = load_catalog_cached().get("images", {})
-    by_year: dict[str, list] = {}
-    for img_id, data in list(catalog.items()):
-        date = _resolve_photo_date(data)
-        y = date[:4] if date and len(date) >= 4 else "Unknown"
-        by_year.setdefault(y, []).append((date, img_id, data))
-
-    def _tcard(img_id, data, date):
-        return {
-            "id": img_id,
-            "filename": data.get("filename", ""),
-            "date": date,  # "YYYY:MM:DD hh:mm:ss" — the UI groups by month
-            "exists": os.path.exists(data.get("path", "")),
-            # Catalog-driven, so videos show in the timeline right after Scan —
-            # no embedding needed for the browse-and-play surface.
-            "media_type": data.get("media_type", "image"),
-            "duration_s": data.get("duration_s", 0),
-        }
-
     limit = max(1, min(limit, 500))
     if year is not None:
-        rows = sorted(by_year.get(year, []), key=lambda t: t[0], reverse=True)
-        page = rows[max(0, offset) : max(0, offset) + limit]
+        page = catalog_db.timeline_year_page(
+            IMAGE_CATALOG_PATH, year, offset=max(0, offset), limit=limit
+        )
         return {
             "year": year,
-            "count": len(rows),
-            "photos": [_tcard(i, d, dt) for dt, i, d in page],
+            "count": page["count"],
+            "photos": [{**photo, "exists": True} for photo in page["photos"]],
         }
 
-    # Newest year first; "Unknown" (sorts above digits) belongs at the end.
-    year_order = sorted((y for y in by_year if y != "Unknown"), reverse=True)
-    if "Unknown" in by_year:
-        year_order.append("Unknown")
     years_out = []
-    for y in year_order:
-        rows = sorted(by_year[y], key=lambda t: t[0], reverse=True)
+    for year_count in catalog_db.timeline_year_counts(IMAGE_CATALOG_PATH):
+        y = year_count["year"]
+        page = catalog_db.timeline_year_page(IMAGE_CATALOG_PATH, y, limit=limit)
         years_out.append(
             {
                 "year": y,
-                "count": len(rows),
-                "photos": [_tcard(i, d, dt) for dt, i, d in rows[:limit]],
+                "count": year_count["count"],
+                "photos": [{**photo, "exists": True} for photo in page["photos"]],
             }
         )
     return {"years": years_out}
@@ -1368,7 +1426,9 @@ def faces_name(req: NameClusterReq):
         raise HTTPException(400, "name required")
     try:
         emb = clustering.cluster_mean_embedding(req.cluster_id)
-    except ClusterMembersStaleError:
+    except Exception as e:
+        if not isinstance(e, import_module("clustering").ClusterMembersStaleError):
+            raise
         raise HTTPException(
             409,
             "this cluster's photos have changed since it was grouped (re-detect "
@@ -1458,7 +1518,7 @@ def _resolve_indexed_path(img_id: str) -> str | None:
     arbitrary-file-read (e.g. id=C:\\Windows\\win.ini). Returns a confined,
     canonical path to an existing file, or None.
     """
-    path = _chroma_meta(img_id).get("path") or catalog_path_for(img_id)
+    path = catalog_path_for(img_id) or _chroma_meta(img_id).get("path")
     if not path:
         return None
     return security.is_safe_real_path(path)
@@ -1656,14 +1716,30 @@ def similar(id: str = Query(...), top_k: int = Query(24, ge=1, le=_MAX_RESULT_LI
 
 @app.get("/api/meta")
 def meta(id: str = Query(...)):
-    m = _chroma_meta(id)
-    cat = load_catalog_cached().get("images", {}).get(id)
+    cat = catalog_db.get_image(IMAGE_CATALOG_PATH, id)
+    m = {} if cat else _chroma_meta(id)
     if not m and not cat:
         raise HTTPException(404, "no metadata (not indexed)")
     # Merge in catalog media info so a video that hasn't been captioned/embedded
     # yet still reports its type, duration and dimensions (P0 browse surface).
     m = dict(m or {})
     if cat:
+        # Catalog-only details cover the normal lightbox path without opening
+        # the vector store. Captions remain model-labelled in caption history.
+        try:
+            caption = json.loads(cat.get("caption_json") or "{}")
+            if isinstance(caption, dict):
+                m.update(caption)
+        except (TypeError, ValueError):
+            pass
+        m.update(cat.get("metadata") or {})
+        resolved_date = resolve_photo_date(cat)
+        if len(resolved_date) >= 4:
+            m.setdefault("year", resolved_date[:4])
+        if len(resolved_date) >= 7:
+            m.setdefault("month", resolved_date[5:7])
+        if cat.get("caption_model"):
+            m.setdefault("caption_model", cat["caption_model"])
         m.setdefault("path", cat.get("path", ""))
         m.setdefault("filename", cat.get("filename", ""))
         m["media_type"] = m.get("media_type") or cat.get("media_type", "image")

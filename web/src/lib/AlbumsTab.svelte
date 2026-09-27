@@ -84,7 +84,7 @@
   {#if loading}
     <p class="muted">Loading…</p>
   {:else if albums.length === 0}
-    <p class="muted">No albums yet. Create one above, or select photos in Search and “Add to album”.</p>
+    <p class="muted">No albums yet. Create one above, or select photos in Library and “Add to album”.</p>
   {:else}
     <div class="albumgrid">
       {#each albums as a (a.id)}

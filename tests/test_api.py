@@ -272,6 +272,41 @@ def test_status_empty_catalog(client):
     assert body["faces_pending"] == 0
 
 
+def test_status_explicit_model_counts_stale_embedding_fingerprint_as_pending(client):
+    """A raw indexed_count can include a vector stale for the selected caption."""
+    fake = MagicMock()
+    fake.get_stage_stats.return_value = {
+        "total_scanned": 1, "photo_total": 1, "vision_done": 1,
+        "active_model": "model-a", "active_model_embedded": 1,
+        "models": {"model-a": {"indexed_count": 1}},
+    }
+    fake.get_vision_pending.return_value = []
+    fake.get_embed_pending.return_value = []
+    fake.get_embed_eligible_ids.return_value = {"photo-a"}
+    fake.get_embed_pending_for_model.return_value = [("photo-a", {})]
+    fake.get_missing_attributes.return_value = []
+    fake.get_missing.return_value = []
+    fake.get_missing_files.return_value = []
+    fake.get_vision_model_summary.return_value = {}
+    fake.get_faces_stats.return_value = {"total": 0, "detected": 0, "pending": 0}
+    fake.get_video_faces_stats.return_value = {"total": 0, "detected": 0, "pending": 0}
+
+    with (
+        patch("api.Indexer", return_value=fake),
+        patch("api.settings_mgr.load", return_value={"embed_model": "model-a", "caption_source_model": "vision-a"}),
+        patch("api.settings_mgr.vision_model_label", return_value=None),
+    ):
+        response = client.get("/api/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["embed_pending"] == 1
+    assert body["model_status"]["embed"]["eligible"] == 1
+    assert body["model_status"]["embed"]["done"] == 0
+    assert body["model_status"]["embed"]["pending"] == 1
+    fake.get_embed_pending_for_model.assert_called_once_with("model-a", "vision-a")
+
+
 def test_provider_models(client):
     # Mock all provider listings so the test is hermetic (no live Gemini call).
     with (
@@ -322,6 +357,19 @@ def test_index_start_passes_model_config(client):
     assert captured["jtype"] == "vision"
     assert captured["vision_provider"] == "gemini"
     assert captured["vision_model"] == "gemini-2.0-flash"
+    assert captured["background_prepare"] is True
+
+
+def test_put_settings_rejects_backup_destination_change_during_backup(client):
+    with (
+        patch("api.manager.active_types", return_value={"backup"}),
+        patch("backup.validate_dest", return_value={"ok": True}),
+        patch("api.settings_mgr.update") as update,
+    ):
+        response = client.put("/api/settings", json={"backup_dest": "D:/new-backup"})
+    assert response.status_code == 409
+    assert "backup destination" in response.json()["detail"]
+    update.assert_not_called()
 
 
 def test_faces_cluster_runs(client):
@@ -402,35 +450,50 @@ def test_albums_get_returns_cards(client):
     assert body["photos"][0]["id"] == "x"
 
 
-def test_map_returns_only_geotagged(client):
-    catalog = {
-        "images": {
-            "a": {
-                "filename": "a.jpg",
-                "path": "/a.jpg",
-                "metadata": {"gps_lat": 37.7, "gps_lon": -122.4},
-            },
-            "b": {
-                "filename": "b.jpg",
-                "path": "/b.jpg",
-                "metadata": {"date": "2024:01:01"},
-            },  # no GPS
-            "c": {
-                "filename": "c.jpg",
-                "path": "/c.jpg",
-                "metadata": {"gps_lat": 51.5, "gps_lon": -0.1},
-            },
-        }
-    }
+def test_map_returns_only_geotagged(client, tmp_path, monkeypatch):
+    import api
+    import catalog_db
+
+    path = str(tmp_path / "catalog.db")
+    catalog_db.save_all(path, {
+        "a": {"filename": "a.jpg", "path": "/a.jpg", "metadata": {"gps_lat": 37.7, "gps_lon": -122.4}},
+        "b": {"filename": "b.jpg", "path": "/b.jpg", "metadata": {"date": "2024:01:01"}},
+        "c": {"filename": "c.jpg", "path": "/c.jpg", "metadata": {"gps_lat": 51.5, "gps_lon": -0.1}},
+    }, {})
+    monkeypatch.setattr(api, "IMAGE_CATALOG_PATH", path)
     with (
-        patch("api.load_catalog_cached", return_value=catalog),
-        patch("api.os.path.exists", return_value=True),
+        patch("api.os.path.exists", side_effect=AssertionError("map must not stat media")),
+        patch("api.load_catalog_cached", side_effect=AssertionError("map must not hydrate catalog")),
     ):
         r = client.get("/api/map")
     assert r.status_code == 200
     pts = r.json()["points"]
     assert {p["id"] for p in pts} == {"a", "c"}
     assert all("lat" in p and "lon" in p for p in pts)
+
+
+def test_meta_catalog_first_includes_date_and_caption_model(client, tmp_path, monkeypatch):
+    import api
+    import catalog_db
+
+    path = str(tmp_path / "catalog.db")
+    catalog_db.save_all(path, {
+        "photo": {
+            "filename": "photo.jpg", "path": "/photos/photo.jpg",
+            "caption_json": '{"caption":"A quiet beach","weather":"sunny"}',
+            "caption_model": "lm_studio:test-vision",
+            "metadata": {"date": "2024:07:11 09:30:00", "camera_make": "Example"},
+        },
+    }, {})
+    monkeypatch.setattr(api, "IMAGE_CATALOG_PATH", path)
+    with patch("api._chroma_meta", side_effect=AssertionError("catalog lightbox must not query Chroma")):
+        response = client.get("/api/meta", params={"id": "photo"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["year"] == "2024" and body["month"] == "07"
+    assert body["caption"] == "A quiet beach"
+    assert body["caption_model"] == "lm_studio:test-vision"
+    assert body["camera_make"] == "Example"
 
 
 def test_faces_reindex(client):
@@ -729,24 +792,55 @@ def test_trash_purge_is_now_a_post(client):
 
 
 def test_timeline_offset_without_year_is_rejected(client):
-    with patch("api.load_catalog_cached", return_value={"images": {}}):
-        r = client.get("/api/timeline", params={"offset": 10})
+    r = client.get("/api/timeline", params={"offset": 10})
     assert r.status_code == 400
 
 
-def test_timeline_offset_with_year_still_works(client):
-    catalog = {
-        "images": {
-            "a": {"filename": "a.jpg", "path": "/a.jpg", "metadata": {"date": "2024:01:01"}},
-        }
-    }
-    with (
-        patch("api.load_catalog_cached", return_value=catalog),
-        patch("api.os.path.exists", return_value=True),
-    ):
-        r = client.get("/api/timeline", params={"year": "2024", "offset": 0})
+def test_timeline_offset_with_year_still_works(client, tmp_path, monkeypatch):
+    import api
+    import catalog_db
+
+    path = str(tmp_path / "catalog.db")
+    catalog_db.save_all(path, {
+        "a": {"filename": "a.jpg", "path": "/a.jpg", "metadata": {"date": "2024:01:01"}},
+    }, {})
+    monkeypatch.setattr(api, "IMAGE_CATALOG_PATH", path)
+    r = client.get("/api/timeline", params={"year": "2024", "offset": 0})
     assert r.status_code == 200
     assert r.json()["year"] == "2024"
+
+
+def test_timeline_sql_summary_and_pages_keep_date_contract(client, tmp_path, monkeypatch):
+    import api
+    import catalog_db
+
+    path = str(tmp_path / "catalog.db")
+    catalog_db.save_all(path, {
+        "a": {"filename": "a.jpg", "path": "/missing/a.jpg", "metadata": {"date": "2025:04:02 10:00:00"}},
+        "b": {"filename": "IMG-20250301-b.jpg", "path": "/missing/b.jpg", "metadata": {}},
+        "c": {"filename": "c.jpg", "path": "/missing/c.jpg", "metadata": {"date": "2024:01:05 10:00:00"}},
+        "unknown": {"filename": "untimed.jpg", "path": "/missing/untimed.jpg", "metadata": {}},
+    }, {})
+    monkeypatch.setattr(api, "IMAGE_CATALOG_PATH", path)
+
+    with (
+        patch("api.os.path.exists", side_effect=AssertionError("timeline must not stat media")),
+        patch("api.load_catalog_cached", side_effect=AssertionError("timeline must not hydrate catalog")),
+    ):
+        summary = client.get("/api/timeline/summary")
+        all_years = client.get("/api/timeline", params={"limit": 1})
+        second_2025 = client.get("/api/timeline", params={"year": "2025", "offset": 1, "limit": 1})
+
+    assert summary.json()["summary"] == {
+        "2025": {"04": 1, "03": 1}, "2024": {"01": 1}, "Unknown": {"00": 1},
+    }
+    years = all_years.json()["years"]
+    assert [row["year"] for row in years] == ["2025", "2024", "Unknown"]
+    assert [row["count"] for row in years] == [2, 1, 1]
+    assert len(years[0]["photos"]) == 1
+    assert years[0]["photos"][0]["date"].startswith("2025:04:02")
+    assert years[0]["photos"][0]["exists"] is True
+    assert second_2025.json()["photos"][0]["id"] == "b"
 
 
 # ── audit fix: face-crop applies EXIF transpose before cropping by bbox ───────
@@ -936,17 +1030,21 @@ def test_video_404_when_not_indexed(client):
     assert r.status_code == 404
 
 
-def test_timeline_card_carries_media_type(client):
-    catalog = {"images": {
+def test_timeline_card_carries_media_type(client, tmp_path, monkeypatch):
+    import api
+    import catalog_db
+
+    path = str(tmp_path / "catalog.db")
+    catalog_db.save_all(path, {
         "vid1": {"path": "/x/movie.mp4", "filename": "movie.mp4",
                  "media_type": "video", "duration_s": 12.5,
                  "metadata": {"date": "2023:06:01 10:00:00"}, "created_at": 1},
         "pic1": {"path": "/x/photo.jpg", "filename": "photo.jpg",
                  "media_type": "image", "metadata": {"date": "2023:06:02 10:00:00"},
                  "created_at": 2},
-    }}
-    with patch("api.load_catalog_cached", return_value=catalog):
-        r = client.get("/api/timeline?year=2023")
+    }, {})
+    monkeypatch.setattr(api, "IMAGE_CATALOG_PATH", path)
+    r = client.get("/api/timeline?year=2023")
     assert r.status_code == 200
     cards = {c["id"]: c for c in r.json()["photos"]}
     assert cards["vid1"]["media_type"] == "video"

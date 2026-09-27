@@ -1,20 +1,21 @@
 import os
-import re
 import json
 import hashlib
 import time
-from datetime import datetime
 from pathlib import Path
 import db
 import geocode
 import catalog_db
 from vision import get_image_caption, parse_vision_attributes, validate_vision_output, build_embedding_text
-from embeddings import get_embedding, collection_name_for, get_active_model, get_registry
+from embeddings import get_embedding, get_active_model, get_registry
 from faces import detect_and_embed_faces, save_face_data, index_faces, delete_faces_for_image
 from scanner import scan_directory
 from constants import IMAGE_CATALOG_PATH, FACE_DIR, THUMB_DIR
+from photo_date import resolve_photo_date, _date_from_filename
 
 RICH_ATTRIBUTES = ["weather", "occasion", "location_type", "scene", "mood"]
+EMBED_PAYLOAD_SCHEMA = "photo-vault-embed-v1"
+EMBED_FINGERPRINT_KEY = "embed_fingerprint"
 
 _VIDEO_EXTS = {'.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm',
                '.3gp', '.mts', '.m2ts', '.wmv'}
@@ -367,11 +368,10 @@ class Indexer:
         older/foreign caller) — still correct, just O(collection size)."""
         catalog = self.image_catalog.get("images", {})
         reg = get_registry()
-        client = db.client()
         fixed = 0
-        for model_name in reg.get("models", {}):
+        for model_name, model_info in reg.get("models", {}).items():
             try:
-                col = client.get_or_create_collection(name=collection_name_for(model_name))
+                col = db.collection(model_name, model_info=model_info)
                 if moved_ids:
                     res = col.get(ids=moved_ids, include=["metadatas"])
                 else:
@@ -608,42 +608,67 @@ class Indexer:
         caption_source_model="X" → only images with a caption_history entry from model X.
         """
         catalog = self.image_catalog.get("images", {})
-        if not caption_source_model:
-            return {img_id for img_id, d in catalog.items() if d.get("caption_json")}
-        return {
-            img_id for img_id, d in catalog.items()
-            if any(h.get("model") == caption_source_model for h in d.get("caption_history", []))
-        }
+        eligible = set()
+        for img_id, data in catalog.items():
+            try:
+                caption_json = resolve_caption_json(data, caption_source_model)
+                parsed = json.loads(caption_json)
+                # Keep old schema-light captions that omit this field, but do
+                # not send an explicit blank caption to an embedding provider.
+                if "caption" in parsed and not str(parsed.get("caption") or "").strip():
+                    continue
+                eligible.add(img_id)
+            except (RuntimeError, TypeError, ValueError):
+                continue
+        return eligible
 
     def get_embed_pending(self) -> list[tuple]:
-        """Images with a non-empty caption but not yet in the active embedding
-        collection. Blank-caption records are skipped — there's nothing
-        meaningful to embed until vision fills them in (see has_caption)."""
-        existing_ids = set(self._collection().get(include=[])["ids"])
-        return [
-            (img_id, img_data)
-            for img_id, img_data in self.image_catalog["images"].items()
-            if has_caption(img_data) and img_id not in existing_ids
-        ]
+        """Rows whose active-model embedding is absent or out of date."""
+        try:
+            collection = self._collection(get_active_model())
+            embedded = _collection_fingerprints(collection)
+        except Exception:
+            embedded = {}
+        pending = []
+        for img_id, img_data in self.image_catalog.get("images", {}).items():
+            try:
+                caption_json = resolve_caption_json(img_data)
+                parsed = json.loads(caption_json)
+                if "caption" in parsed and not str(parsed.get("caption") or "").strip():
+                    continue
+                expected = build_embed_fingerprint(img_data, caption_json)
+            except (RuntimeError, TypeError, ValueError):
+                continue
+            if embedded.get(img_id) != expected:
+                pending.append((img_id, img_data))
+        return pending
 
     def get_embed_pending_for_model(self, embed_model_name: str,
                                     caption_source_model: str = None) -> list[tuple]:
-        """
-        Images eligible for embedding with embed_model_name that haven't been
-        embedded yet. Eligibility is gated on caption_source_model.
-        """
+        """Rows missing a current fingerprint in the selected model collection."""
         eligible = self.get_embed_eligible_ids(caption_source_model)
         try:
-            col = self._collection(embed_model_name)
-            embedded = set(col.get()["ids"])
+            collection = self._collection(embed_model_name)
+            embedded = _collection_fingerprints(collection)
         except Exception:
-            embedded = set()
+            embedded = {}
         catalog = self.image_catalog.get("images", {})
-        return [
-            (img_id, catalog[img_id])
-            for img_id in eligible
-            if img_id not in embedded and img_id in catalog
-        ]
+        pending = []
+        for img_id in eligible:
+            data = catalog.get(img_id)
+            if data is None:
+                continue
+            try:
+                caption_json = resolve_caption_json(data, caption_source_model)
+                expected = build_embed_fingerprint(
+                    data, caption_json,
+                    caption_source_model=caption_source_model or data.get("caption_model"),
+                )
+            except (RuntimeError, TypeError, ValueError):
+                continue
+            if embedded.get(img_id) != expected:
+                pending.append((img_id, data))
+        return pending
 
     def get_vision_model_summary(self) -> dict[str, int]:
         """
@@ -675,16 +700,18 @@ class Indexer:
         active_model = reg.get("active_model")
         active_embedded = 0
         model_stats = {}
-        client = db.client()
         for model_name, info in reg.get("models", {}).items():
             try:
-                col = client.get_or_create_collection(name=collection_name_for(model_name))
+                col = db.collection(model_name, model_info=info)
                 count = col.count()
             except Exception:
                 count = 0
             model_stats[model_name] = {**info, "indexed_count": count}
             if model_name == active_model:
                 active_embedded = count
+        # ID counts hide stale vectors after a caption or relevant catalog
+        # metadata change. Use the same fingerprint selector as the embed job.
+        embed_pending = len(self.get_embed_pending_for_model(active_model))
 
         total = len(catalog)
         return {
@@ -697,7 +724,7 @@ class Indexer:
             "video_vision_pending": video_total - video_captioned,
             "active_model": active_model,
             "active_model_embedded": active_embedded,
-            "embed_pending": max(0, captioned - active_embedded),
+            "embed_pending": embed_pending,
             "models": model_stats,
         }
 
@@ -926,9 +953,9 @@ class Indexer:
         # Batch-delete from all ChromaDB collections
         reg = get_registry()
         client = db.client()
-        for model_name in reg.get("models", {}):
+        for model_name, model_info in reg.get("models", {}).items():
             try:
-                col = client.get_or_create_collection(name=collection_name_for(model_name))
+                col = db.collection(model_name, model_info=model_info)
                 col.delete(ids=to_remove)
             except Exception as e:
                 print(f"[indexer] purge ChromaDB ({model_name}) warning: {e}")
@@ -952,9 +979,9 @@ class Indexer:
     def _drop_from_collections(self, img_id: str):
         reg = get_registry()
         client = db.client()
-        for model_name in reg.get("models", {}):
+        for model_name, model_info in reg.get("models", {}).items():
             try:
-                col = client.get_or_create_collection(name=collection_name_for(model_name))
+                col = db.collection(model_name, model_info=model_info)
                 col.delete(ids=[img_id])
             except Exception as e:
                 print(f"[indexer] ChromaDB delete ({model_name}) warning: {e}")
@@ -1063,62 +1090,56 @@ def resolve_caption_json(img_data: dict, caption_source_model: str = None) -> st
         parsed = json.loads(caption_json)
     except json.JSONDecodeError:
         raise RuntimeError("Stored caption is not valid JSON — cannot build an embedding from it")
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Stored caption must be a JSON object — cannot build an embedding from it")
     if parsed.get("error", ""):
         raise RuntimeError(f"vision error: {parsed['error']}")
+    if "caption" in parsed and not str(parsed.get("caption") or "").strip():
+        raise RuntimeError("Stored caption is blank — run vision analysis again before embedding")
     return caption_json
 
 
-# A real date embedded in a phone filename: WhatsApp "IMG-20170511-WA0039",
-# camera "IMG_20170208_093403", "2018-03-14-...", "Screenshot_20200101", etc.
-# Bounded to plausible years so a random digit run isn't misread as a date.
-_FN_DATE_RE = re.compile(r"(20[0-2]\d)[-_]?(0[1-9]|1[0-2])[-_]?(0[1-9]|[12]\d|3[01])")
-# 13-digit epoch-millisecond names (WhatsApp/FB "1559543971742.jpg", "FB_IMG_155…").
-_FN_EPOCH_RE = re.compile(r"(?<!\d)(1[0-9]{12})(?!\d)")
+def build_embed_fingerprint(img_data: dict, caption_json: str,
+                             caption_source_model: str = None,
+                             embedding_text: str = None) -> str:
+    """Hash the exact semantic input, its source, and catalog fields exposed
+    alongside the vector. No geocoding/provider work is performed here."""
+    if embedding_text is None:
+        embedding_text = build_embedding_text(parse_vision_attributes(caption_json))
+    meta = img_data.get("metadata", {}) or {}
+    source = caption_source_model
+    if source is None:
+        source = img_data.get("caption_model") or ""
+    material = {
+        "schema": EMBED_PAYLOAD_SCHEMA,
+        "embedding_text": embedding_text,
+        "caption_source_model": source,
+        "catalog": {
+            "metadata": meta,
+            "resolved_date": resolve_photo_date(img_data),
+            "filename": img_data.get("filename", ""),
+            "media_type": "video" if is_video(img_data) else "image",
+            "duration_s": float(img_data.get("duration_s") or 0),
+        },
+    }
+    canonical = json.dumps(material, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _date_from_filename(name: str) -> str:
-    """Recover an EXIF-style 'YYYY:MM:DD HH:MM:SS' date encoded in a filename,
-    or '' if none. ~65% of a typical phone library (WhatsApp/screenshots) has no
-    EXIF but carries the real date right in the name."""
-    if not name:
-        return ""
-    m = _FN_DATE_RE.search(name)
-    if m:
-        return f"{m.group(1)}:{m.group(2)}:{m.group(3)} 00:00:00"
-    m = _FN_EPOCH_RE.search(name)
-    if m:
-        try:
-            dt = datetime.fromtimestamp(int(m.group(1)) / 1000)
-            if 2005 <= dt.year <= datetime.now().year:
-                return dt.strftime("%Y:%m:%d %H:%M:%S")
-        except (OSError, OverflowError, ValueError):
-            pass
-    return ""
-
-
-def resolve_photo_date(img_data: dict) -> str:
-    """Best-known capture date, in EXIF 'YYYY:MM:DD HH:MM:SS' form. Priority:
-    real EXIF date -> a date parsed from the filename -> the file/import
-    timestamp as a last resort. Single source of truth so the Timeline and the
-    Search 'Year' filter place a photo under the SAME year (they used to
-    disagree: Timeline fell back to import time, Search stored 'unknown')."""
-    date = (img_data.get("metadata", {}) or {}).get("date", "") or ""
-    if date and len(date) >= 4:
-        return date
-    fn = _date_from_filename(img_data.get("filename", "") or "")
-    if fn:
-        return fn
-    ts = img_data.get("created_at")
-    if ts:
-        try:
-            return datetime.fromtimestamp(ts).strftime("%Y:%m:%d %H:%M:%S")
-        except (OSError, OverflowError, ValueError):
-            pass
-    return ""
+def _collection_fingerprints(collection) -> dict[str, str | None]:
+    """Read ids and stored fingerprints; absent legacy hashes mean stale."""
+    result = collection.get(include=["metadatas"])
+    return {
+        img_id: (metadata or {}).get(EMBED_FINGERPRINT_KEY)
+        for img_id, metadata in zip(result.get("ids", []), result.get("metadatas", []))
+    }
 
 
 def build_embed_payload(img_data: dict, caption_json: str,
-                        embed_source: str, model_name: str) -> dict:
+                        embed_source: str, model_name: str,
+                        caption_source_model: str = None,
+                        embedding_text: str = None) -> dict:
     """ChromaDB metadata payload for one embedded image."""
     attrs = parse_vision_attributes(caption_json)
     meta = img_data.get("metadata", {})
@@ -1158,6 +1179,11 @@ def build_embed_payload(img_data: dict, caption_json: str,
         "metadata_json": json.dumps(meta),
         "embedding_source": embed_source,
         "embedding_model": model_name,
+        EMBED_FINGERPRINT_KEY: build_embed_fingerprint(
+            img_data, caption_json,
+            caption_source_model=caption_source_model,
+            embedding_text=embedding_text,
+        ),
         # Carried into search/recent cards so the grid badges videos and the
         # lightbox knows to use the <video> player. duration_s is 0 for images.
         "media_type": "video" if is_video(img_data) else "image",
@@ -1186,8 +1212,8 @@ def _embed_one(img_id: str, img_data: dict, upsert: bool = False,
             f"embedding failed — {last_embed_error() or 'all embedding providers unavailable'}"
         )
 
-    client = db.client()
-    collection = client.get_or_create_collection(name=collection_name_for(model_name))
+    model_info = get_registry().get("models", {}).get(model_name)
+    collection = db.collection(model_name, model_info=model_info)
 
     if detect_faces:
         # Mirrors _run_embed_batched in jobs.py: a corrupt/unreadable image
@@ -1199,7 +1225,11 @@ def _embed_one(img_id: str, img_data: dict, upsert: bool = False,
         except Exception as e:
             print(f"[indexer] face detection failed for {img_id}: {e}")
 
-    payload = build_embed_payload(img_data, caption_json, embed_source, model_name)
+    payload = build_embed_payload(
+        img_data, caption_json, embed_source, model_name,
+        caption_source_model=caption_source_model,
+        embedding_text=embedding_text,
+    )
 
     if upsert:
         collection.upsert(ids=[img_id], embeddings=[embedding], metadatas=[payload])

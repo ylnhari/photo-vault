@@ -1,11 +1,17 @@
 # Photo Vault
 
-Local Google Photos — index your photos, search by face, occasion, weather, year, and more.
-Everything runs on your machine. No cloud subscription. No data leaves your device.
+Browse, organize, and search a personal photo and video library on your machine.
+The Library opens from the local catalog without waiting for an AI model. LM Studio
+and InsightFace run locally; optional Gemini fallback sends inference inputs to
+Google. Leave `GEMINI_API_KEY` blank and select LM Studio for fully local inference.
 
 ## What it does
 
-- **Search**: "birthday party 2023", "mom in red saree", "beach sunset" → instant results
+- **Library**: Browse immediately after scanning. Search filenames, current
+  captions, recognized text, objects and activities, places, or camera details.
+  Combine date, media, and metadata filters without an AI service.
+- **Smart search**: Search descriptions such as "birthday party" or "beach sunset"
+  using the selected embedding model, with attribute and person filters.
 - **Timeline**: Browse all photos organized by year
 - **People**: Register faces, search all photos of a specific person
 - **Smart attributes**: Every photo gets tagged with scene, weather, occasion, group size,
@@ -15,6 +21,32 @@ Everything runs on your machine. No cloud subscription. No data leaves your devi
 - **Videos too**: Videos are first-class — browsed in the timeline with a ▶/duration badge,
   played inline (seekable), and made searchable by captioning a few sampled keyframes.
   Photos and videos can live in one folder or separate folders — your choice, never forced.
+
+### Finding photos
+
+Use **Browse** for exact words in the local catalog. All words must match;
+double quotes keep a phrase together, and a minus excludes a word or phrase.
+For example, `"birthday cake" -screenshot` finds that phrase while excluding
+items with the word screenshot. Matches use complete words, ignore case, and
+retain punctuation. Choose a search field to narrow where words can match;
+cards show which fields matched. Older caption versions are not searched.
+
+The filters include an inclusive date range, month/day across years, photo
+type, scene, weather, occasion, time of day, camera, and presence of recognized
+text, GPS location, or a caption. Dates use capture metadata, then a filename
+date, then the date added. Missing data means nothing has been stored for that
+field; it does not prove the photo lacks that content. The quick shortcuts
+include screenshots, recognized text, missing GPS/captions, and **On this day**.
+
+Save a named Browse search to reuse its query, filters, and sort. Up to 12 saved
+searches live in this browser only and can be removed individually. Searches
+are saved only when you ask; clearing browser storage removes them.
+
+Use **Smart search** for descriptions and semantic similarity, or select a
+registered person's name in its person field. It uses the active embedding
+index. Browse filters and exact-word syntax are separate from Smart search.
+New search fields use existing metadata; they do not run fresh text recognition
+or visual analysis. See [search verification notes](docs/SEARCH-IMPROVEMENTS.md).
 
 ## Before you start — choose your services
 
@@ -39,18 +71,20 @@ You can have **both** — LM Studio is used first, Gemini is the fallback.
 (e.g. `text-embedding-nomic-embed-text-v1.5`, `all-minilm-l6-v2`, or any model tagged "embedding").
 The app auto-detects which model is loaded.
 
-**Gemini** (fallback): Same `GEMINI_API_KEY` used above — `text-embedding-004` is called automatically
-when LM Studio is offline.
+**Gemini** (optional fallback): Uses the same `GEMINI_API_KEY`. The default text
+embedding model is `gemini-embedding-001`; availability and free-tier quotas depend
+on the configured project. The retired `text-embedding-004` is no longer the
+automatic fallback. Existing stored indexes retain their original model identity.
 
 > **Important**: Each embedding model gets its own search index. If you switch models mid-library,
 > existing photos stay findable under the old model. Use the **Active model** selector in
-> Index & Manage to choose which index Search uses.
+> Manage to choose which index Search uses.
 
 ### Face recognition
 
 InsightFace runs on the **CPU by default** — no setup needed, works on every machine. For big
 libraries you can offload it to a GPU/NPU; see **GPU/NPU acceleration** below. Either way,
-**Index & Manage → Face detection → "Face detection runs on"** shows exactly which accelerators
+**Manage → Face detection → "Face detection runs on"** shows exactly which accelerators
 your install exposes and lets you pick one (the list is auto-detected, never hardcoded).
 
 ## GPU/NPU acceleration (optional)
@@ -78,13 +112,50 @@ Then restart the server and pick the device in **Settings → "Face detection ru
 
 ## Architecture
 
-FastAPI backend (Python) + Svelte single-page app (Vite). The backend modules do all the work —
-indexing, vision, embeddings, faces, search — and expose a JSON API. The SPA is the only UI.
+FastAPI backend (Python) + Svelte single-page app (Vite). The SPA is the only user
+interface. An indexed SQLite read projection serves Library pages and counts.
+An optional FTS5 index narrows text-search candidates while exact field and
+phrase predicates determine the final matches. No embedding call is needed for Browse.
+Catalog JSON remains the durable source. Projection updates share the catalog's
+transactions and are rebuilt once for older catalogs. Thumbnail path lookups read
+one record instead of loading the full catalog. AI libraries and secondary screens
+load on demand.
+
 Indexing runs as a **background job**: progress streams to the UI, a Stop button works mid-run,
 and the page never freezes. **Independent jobs run concurrently** — e.g. GPU/NPU face detection
 alongside LM-Studio embedding — while jobs that would collide (two that write the same catalog
-records, or two that drive the same model) are automatically serialized. Everything is local;
-your photos and index never leave your machine.
+records, or two that drive the same model) are automatically serialized. Backups run
+exclusively against writers and record completion only after the entire job succeeds.
+Stop takes effect at safe boundaries; an in-flight provider call or file copy may
+need to finish first.
+
+Embedding records include a deterministic content fingerprint. Re-captioned items
+become pending for embedding again. New model registrations use collision-resistant
+collection names and explicit retrieval profiles; existing profiles keep their old
+preprocessing so query vectors cannot silently drift away from stored vectors.
+The revamp does not erase or automatically re-index a personal library.
+
+### Development verification
+
+Run backend checks with `uv run --no-sync python -m pytest tests/ -q`, and build the
+frontend with `cd web` then `npm run build`. The test suite uses temporary data
+stores and disables the personal `.env`. A reproducible 25,000-record synthetic
+benchmark is available through `uv run --no-sync python tests/benchmark_revamp.py`;
+measurements and limitations are recorded in [the revamp notes](docs/REVAMP.md).
+
+For an isolated preview, set `PHOTO_VAULT_DATA_DIR` to a separate absolute data
+directory and `PHOTO_VAULT_ENV_FILE=-` in the process environment before starting
+the normal server. These overrides must be set outside `.env` because they decide
+which environment file and data directory are loaded. The Vite development proxy
+follows `PHOTO_VAULT_PORT`, the optional workspace registry, then the documented
+fallback port, matching the backend's normal routing.
+
+Provider defaults were checked on 2026-09-26 against Google's
+[model lifecycle](https://ai.google.dev/gemini-api/docs/deprecations),
+[embedding guide](https://ai.google.dev/gemini-api/docs/embeddings), and
+[pricing](https://ai.google.dev/gemini-api/docs/pricing). Vision fallback tries
+Flash-Lite models before Flash. No paid inference or automatic model download is
+needed to browse the Library.
 
 ## Platform support
 
@@ -144,7 +215,7 @@ make web       # terminal 2 — Vite dev server on :5173 (proxies /api → :8768
 
 2. **Open** http://127.0.0.1:8768
 
-3. Go to **Index & Manage** tab → **Services** — confirm LM Studio and/or Gemini show online
+3. Go to **Manage** tab → **Services** — confirm LM Studio and/or Gemini show online
 
 4. **A — Scan**: add your Photos folder (Browse opens a visual folder picker) → **Scan folders**
 
@@ -159,7 +230,7 @@ Videos are catalogued alongside photos and need no separate setup:
 
 - **Browse & play**: they appear in the Timeline and grids by capture date with a ▶ badge and
   duration pill; the lightbox plays them inline via a range-streaming endpoint (seekable).
-- **Searchable**: **Index & Manage → Video analysis** understands each video the production way:
+- **Searchable**: **Manage → Video analysis** understands each video the production way:
   **shot-based keyframes** (adaptive scene detection, not blind uniform sampling) are sent
   **together, in one multimodal call** to your chosen Vision provider so the model reasons across
   the clip temporally (motion, how the scene evolves) — not per-frame. Faces are detected across
@@ -178,7 +249,7 @@ Videos are catalogued alongside photos and need no separate setup:
 
 ## Import & consolidate
 
-**Index & Manage → Import** merges any staging folder — Google Takeout extract, pen-drive
+**Manage → Import** merges any staging folder — Google Takeout extract, pen-drive
 dump, SD card, phone download — into your library. Every file is identified by SHA-1 of its
 bytes, so content the library has *ever* seen is skipped no matter how many times it was
 copied or renamed; only genuinely new files are copied in, organized `YYYY/MM/` by EXIF date.
@@ -193,7 +264,7 @@ anything that can't proceed:
 
 ## Backup
 
-**Index & Manage → Backup** mirrors every scanned folder plus photo-vault's own `data/`
+**Manage → Backup** mirrors every scanned folder plus photo-vault's own `data/`
 (captions, faces, embeddings, settings) to any connected destination — external drive,
 SD card, USB stick, another internal disk, a mounted network share. A restore therefore
 brings back your *index*, not just pixels.
@@ -205,16 +276,16 @@ brings back your *index*, not just pixels.
 - **Safe by rule**: the destination may not overlap the scanned library in either direction
   (inside it → the mirror would back itself up recursively; containing it → the next scan
   would index your own backup and double every photo). The UI explains any refusal.
-- **Videos are left alone**: photo-root mirroring ignores video files entirely, and never
-  deletes anything extra it finds at the destination. Only the `photo-vault-data` folder is
-  a strict mirror.
+- **Original media is additive**: photo and video roots are copied without deleting
+  extra destination files. Only `photo-vault-data` is a strict mirror. Backup jobs freeze
+  their source/destination map; incomplete runs never receive a success timestamp.
 
 ## Fallback table
 
 | LM Studio | GEMINI_API_KEY | Vision | Embeddings |
 |-----------|----------------|--------|------------|
 | ✓ running | any            | LM Studio | LM Studio embed model |
-| ✗ offline | set            | Gemini (free) | Gemini text-embedding-004 |
+| ✗ offline | set            | Gemini (free) | Gemini gemini-embedding-001 |
 | ✗ offline | not set        | ✗ fails | ✗ fails |
 
 Both LM Studio and Gemini can be active simultaneously — LM Studio is always tried first.
@@ -225,11 +296,12 @@ Both LM Studio and Gemini can be active simultaneously — LM Studio is always t
 make test                            # or: uv run python -m pytest tests/ -q
 ```
 
-500+ tests covering: embeddings, vision, video (ffmpeg mocked), faces + execution-provider
+The backend suite covers: embeddings, vision, video (ffmpeg mocked), faces + execution-provider
 selection, search, indexer, validator, tagger, ingest, backup, rate limiting, the
 cross-platform filesystem layer, the concurrent background job manager, and the FastAPI
-endpoints. All external calls mocked — no services (and no real
-ffmpeg) needed to run tests, and the full OS matrix (Windows/macOS/Linux behavior) is
+endpoints. Tests use temporary data roots, disabled dotenv loading, an empty inherited
+Gemini key, and a network-denial fixture. Provider calls must be mocked; no services
+(and no real ffmpeg) are needed to run tests, and the full OS matrix (Windows/macOS/Linux behavior) is
 exercised on whatever OS runs them.
 
 ## File structure
@@ -248,13 +320,13 @@ src/
                     (CPU / OpenVINO GPU+NPU / CUDA / DirectML), user-selectable in Settings
   tagger.py       ← person registration from reference images
   clustering.py   ← DBSCAN face clustering
-  scanner.py / metadata.py ← recursive image discovery + EXIF
+  scanner.py       ← recursive image discovery + EXIF
   validator.py    ← LM Studio / Gemini health checks
   constants.py    ← paths + endpoints + SERVER_PORT + .env loader
 web/              ← Svelte SPA (Vite). src/lib: api.js, PhotoGrid, Lightbox, *Tab.svelte
                      dist/ is the built UI served by FastAPI (gitignored)
-tests/            ← pytest suite (137 tests, no external services needed)
-data/             ← gitignored: images.json, chroma_db/, faces/, thumbs/, person_map.json,
+tests/            ← isolated pytest suite plus synthetic performance harness
+data/             ← gitignored: catalog.db, chroma_db/, faces/, thumbs/, person_map.json,
                      embedding_registry.json
 ```
 

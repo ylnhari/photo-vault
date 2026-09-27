@@ -117,6 +117,23 @@ def test_scan_aborts_without_wiping_catalog_on_load_failure(tmp_path, monkeypatc
     assert data["images"]["existing-uid"]["path"] == "/somewhere/old.jpg"
 
 
+def test_scan_surfaces_catalog_save_failure(tmp_path, monkeypatch):
+    """Persistence failure must be visible to the scan job, not logged as done."""
+    import catalog_db
+    from scanner import scan_directory
+
+    root = tmp_path / "photos"
+    root.mkdir()
+    (root / "a.jpg").write_bytes(b"synthetic-photo")
+    monkeypatch.setattr(
+        catalog_db, "save_all",
+        lambda *args: (_ for _ in ()).throw(OSError("synthetic catalog write failure")),
+    )
+
+    with pytest.raises(OSError, match="synthetic catalog write failure"):
+        scan_directory(str(root), str(tmp_path / "catalog.db"))
+
+
 def test_scan_handles_symlink_cycle_without_hanging(tmp_path):
     """os.walk(followlinks=True) would traverse a self-referential directory
     symlink/junction forever without cycle detection — the scan must

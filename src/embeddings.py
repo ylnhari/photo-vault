@@ -1,9 +1,12 @@
 import json
+import hashlib
+import math
 import os
 import re
 import threading
 import urllib.request
 import urllib.error
+from collections.abc import Sequence
 from datetime import datetime
 from constants import (
     LM_STUDIO_URL,
@@ -15,7 +18,10 @@ from constants import (
 from vision import list_lm_studio_models_v0, _EMBED_NAME_PATTERNS
 import ratelimit
 
-_GEMINI_EMBED_MODEL = "text-embedding-004"
+_GEMINI_EMBED_MODEL = "gemini-embedding-001"
+_PROFILE_SCHEMA_VERSION = 1
+_EMBEDDING_TEXT_SCHEMA = "caption-attributes-v1"
+_VECTOR_METRIC = "cosine"
 import time as _time
 
 _gemini_embed_cache: tuple[float, list[str]] | None = None
@@ -43,17 +49,92 @@ def list_gemini_embed_models(fallback: bool = True) -> list[str]:
         _gemini_embed_cache = (_time.time(), result)
         return result
     except Exception as e:
-        print(f"[embeddings] Gemini model list failed: {e}")
+        # Avoid echoing request URLs or query-string credentials from urllib
+        # exceptions into logs.
+        status = f"HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else type(e).__name__
+        print(f"[embeddings] Gemini model list failed ({status})")
         return [_GEMINI_EMBED_MODEL] if fallback else []
 
 
 # ── Collection naming ─────────────────────────────────────────────────────────
 
 
-def collection_name_for(model_name: str) -> str:
-    """Stable, ChromaDB-safe collection name for a given embedding model."""
+def _legacy_collection_name(model_name: str) -> str:
     safe = re.sub(r"[^a-z0-9]", "_", model_name.lower()).strip("_")
     return f"img_{safe}"[:63]
+
+
+def _canonical_json(data: dict) -> str:
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _profile_for(source: str, model_name: str) -> dict:
+    """Return the immutable retrieval recipe for an unregistered model.
+
+    Existing registry entries without ``profile`` are legacy raw-text profiles;
+    callers must preserve their old preprocessing and collection.
+    """
+    if source == "gemini" and model_name == "gemini-embedding-2":
+        strategy = "gemini-embedding-2-query-document-prefix-v1"
+    elif source == "gemini" and model_name == "gemini-embedding-001":
+        strategy = "gemini-embedding-001-retrieval-task-v1"
+    elif source == "lm_studio" and "nomic-embed-text" in model_name.lower():
+        strategy = "nomic-search-prefix-v1"
+    else:
+        strategy = "symmetric-raw-v1"
+    return {
+        "schema_version": _PROFILE_SCHEMA_VERSION,
+        "provider": source,
+        "model": model_name,
+        "input_schema": _EMBEDDING_TEXT_SCHEMA,
+        "task_strategy": strategy,
+        "metric": _VECTOR_METRIC,
+    }
+
+
+def _profile_for_registered(source: str, model_name: str) -> tuple[dict, bool]:
+    """Return (profile, is_legacy) and reject provider identity drift."""
+    entry = _load_registry().get("models", {}).get(model_name)
+    if entry:
+        old_source = entry.get("source")
+        if old_source and old_source != source:
+            raise RuntimeError(
+                f"Embedding model '{model_name}' is registered for provider "
+                f"'{old_source}', not '{source}'; choose a distinct model id "
+                "to keep vector spaces separate."
+            )
+        if not entry.get("profile"):
+            return {
+                "schema_version": 0,
+                "provider": source,
+                "model": model_name,
+                "input_schema": "legacy-raw-text",
+                "task_strategy": "legacy-raw-v0",
+                "metric": "legacy-unspecified",
+            }, True
+        return entry["profile"], False
+    return _profile_for(source, model_name), False
+
+
+def _profile_id(profile: dict, dimension: int) -> str:
+    complete = {**profile, "dimension": int(dimension)}
+    return hashlib.sha256(_canonical_json(complete).encode("utf-8")).hexdigest()[:20]
+
+
+def _profile_collection_name(model_name: str, profile: dict, dimension: int) -> str:
+    safe = re.sub(r"[^a-z0-9]", "_", model_name.lower()).strip("_")[:28].strip("_") or "model"
+    digest = _profile_id(profile, dimension)
+    return f"img_{safe}_{digest}"[:63]
+
+
+def collection_name_for(model_name: str) -> str:
+    """Return the recorded collection, preserving legacy names exactly."""
+    entry = _load_registry().get("models", {}).get(model_name)
+    if entry:
+        return entry.get("collection") or _legacy_collection_name(model_name)
+    # This fallback is for old read-only callers before a model has been
+    # registered. Successful new embeddings register their hashed profile first.
+    return _legacy_collection_name(model_name)
 
 
 # ── Registry (persists all models ever used + active selection) ───────────────
@@ -67,9 +148,15 @@ def _load_registry() -> dict:
     if os.path.exists(EMBEDDING_REGISTRY_PATH):
         try:
             with open(EMBEDDING_REGISTRY_PATH) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"[embeddings] registry read failed ({e}); starting from an empty registry")
+                registry = json.load(f)
+            if (not isinstance(registry, dict)
+                    or not isinstance(registry.get("models", {}), dict)
+                    or registry.get("active_model") is not None
+                    and not isinstance(registry.get("active_model"), str)):
+                raise ValueError("registry has an invalid structure")
+            return registry
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            raise RuntimeError(f"embedding registry is unreadable: {e}") from e
     return _default_registry()
 
 
@@ -113,12 +200,13 @@ def _save_registry(reg: dict):
 _registry_lock = threading.Lock()
 
 
-def register_model(source: str, model_name: str, dimension: int):
-    """Record a model in the registry. Sets it as active if first model."""
+def register_model(source: str, model_name: str, dimension: int, profile: dict = None):
+    """Record or validate a model profile. Sets it active only when first used."""
     with _registry_lock:
         reg = _load_registry()
         existing = reg["models"].get(model_name)
         now_iso = datetime.now().isoformat(timespec="seconds")
+        dimension = int(dimension)
         # Only persist to disk when something worth persisting actually changed.
         # register_model runs on EVERY embed, and a per-image rewrite just to
         # advance a seconds-resolution last_used is pure churn — 24k disk writes
@@ -127,16 +215,27 @@ def register_model(source: str, model_name: str, dimension: int):
         # last_used at day granularity only.
         changed = False
         if existing is None:
+            profile = profile or _profile_for(source, model_name)
+            complete_profile = {**profile, "dimension": dimension}
+            profile_id = _profile_id(profile, dimension)
             reg["models"][model_name] = {
                 "source": source,
                 "dimension": dimension,
-                "collection": collection_name_for(model_name),
+                "profile": complete_profile,
+                "profile_id": profile_id,
+                "collection": _profile_collection_name(model_name, profile, dimension),
                 "first_used": now_iso,
                 "last_used": now_iso,
             }
             changed = True
             print(
                 f"[embeddings] Registered new model: {model_name} ({source}, {dimension}d)"
+            )
+        elif existing.get("source") != source:
+            raise RuntimeError(
+                f"Embedding model '{model_name}' is already registered for "
+                f"provider '{existing.get('source')}', not '{source}'; refusing "
+                "to mix provider vector spaces under one model id."
             )
         elif existing.get("dimension") != dimension:
             # Different dimension under the same model name would silently
@@ -154,6 +253,14 @@ def register_model(source: str, model_name: str, dimension: int):
                 "re-index required (use a fresh model name/collection)."
             )
         else:
+            if existing.get("profile"):
+                expected = profile or _profile_for(source, model_name)
+                expected_id = _profile_id(expected, dimension)
+                if existing.get("profile_id") != expected_id:
+                    raise RuntimeError(
+                        f"Embedding profile changed for '{model_name}'; refusing "
+                        "to mix vectors. Select a new profile and rebuild its collection."
+                    )
             # Existing, same-dimension model: bump last_used only when the
             # calendar day advanced, not on every image.
             prev = existing.get("last_used", "")
@@ -241,7 +348,86 @@ def _lm_v1_embed_fallback_id(models: list[dict]) -> str | None:
     return None
 
 
-def _lm_studio_embed(text: str, model: str = None) -> tuple[list, str]:
+def _check_served_model(requested: str, served: str | None, provider: str,
+                        *, allow_prefixless: bool = False):
+    if not served:
+        return
+    served = str(served)
+    accepted = {requested}
+    if allow_prefixless and "/" in requested:
+        accepted.add(requested.rsplit("/", 1)[1])
+    if served not in accepted:
+        raise RuntimeError(
+            f"{provider} substituted embedding model ({requested} -> {served}); "
+            "the response was rejected to protect vector-space integrity."
+        )
+
+
+def _ordered_rows(rows: list, expected: int, provider: str) -> list:
+    if not isinstance(rows, list) or len(rows) != expected:
+        actual = len(rows) if isinstance(rows, list) else "non-list"
+        raise RuntimeError(f"{provider} returned {actual} rows for {expected} inputs")
+    indexed = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("index"), int):
+            raise RuntimeError(f"{provider} batch response has a missing/invalid row index")
+        index = row["index"]
+        if index < 0 or index >= expected or index in seen:
+            raise RuntimeError(f"{provider} batch response has duplicate/out-of-range index {index}")
+        seen.add(index)
+        indexed.append((index, row))
+    if seen != set(range(expected)):
+        raise RuntimeError(f"{provider} batch response indexes are incomplete")
+    return [row for _, row in sorted(indexed)]
+
+
+def _validate_vector(vector, provider: str) -> list[float]:
+    if not isinstance(vector, Sequence) or isinstance(vector, (str, bytes)) or not vector:
+        raise RuntimeError(f"{provider} returned an empty or invalid embedding vector")
+    try:
+        result = [float(value) for value in vector]
+    except (TypeError, ValueError, OverflowError) as e:
+        raise RuntimeError(f"{provider} returned a non-numeric embedding vector") from e
+    if not all(math.isfinite(value) for value in result):
+        raise RuntimeError(f"{provider} returned a non-finite embedding vector")
+    if not any(value != 0.0 for value in result):
+        raise RuntimeError(f"{provider} returned an all-zero embedding vector")
+    return result
+
+
+def _validate_vectors(vectors, expected: int, provider: str,
+                      *, allow_partial: bool = False) -> list[list[float] | None]:
+    if not isinstance(vectors, list) or len(vectors) != expected:
+        actual = len(vectors) if isinstance(vectors, list) else "non-list"
+        raise RuntimeError(f"{provider} returned {actual} vectors for {expected} inputs")
+    validated = []
+    dims = set()
+    for vector in vectors:
+        if vector is None and allow_partial:
+            validated.append(None)
+            continue
+        normalized = _validate_vector(vector, provider)
+        dims.add(len(normalized))
+        validated.append(normalized)
+    if len(dims) > 1:
+        raise RuntimeError(f"{provider} returned vectors with inconsistent dimensions")
+    return validated
+
+
+def _profile_text(text: str, source: str, model_name: str, purpose: str) -> tuple[str, str | None]:
+    profile, _legacy = _profile_for_registered(source, model_name)
+    strategy = profile.get("task_strategy")
+    if strategy == "nomic-search-prefix-v1":
+        return f"search_{'query' if purpose == 'query' else 'document'}: {text}", None
+    if strategy == "gemini-embedding-2-query-document-prefix-v1":
+        return f"search_{'query' if purpose == 'query' else 'document'}: {text}", None
+    if strategy == "gemini-embedding-001-retrieval-task-v1":
+        return text, "RETRIEVAL_QUERY" if purpose == "query" else "RETRIEVAL_DOCUMENT"
+    return text, None
+
+
+def _lm_studio_embed(text: str, model: str = None, purpose: str = "document") -> tuple[list, str]:
     """Embed via LM Studio /v1/embeddings. Uses `model` if given, else prefers
     the v0-API-reported loaded embeddings model, else the /v1/models heuristic."""
     model_name = model or _lm_embed_model_id()
@@ -256,6 +442,7 @@ def _lm_studio_embed(text: str, model: str = None) -> tuple[list, str]:
             pass
 
     ratelimit.acquire("lm_studio")
+    text, _ = _profile_text(text, "lm_studio", model_name, purpose)
     payload = json.dumps({"model": model_name, "input": text}).encode("utf-8")
     req = urllib.request.Request(
         f"{LM_STUDIO_URL}/embeddings",
@@ -264,10 +451,15 @@ def _lm_studio_embed(text: str, model: str = None) -> tuple[list, str]:
     )
     with urllib.request.urlopen(req, timeout=15) as r:
         result = json.loads(r.read())
-    return result["data"][0]["embedding"], model_name
+    _check_served_model(model_name, result.get("model"), "LM Studio")
+    rows = result.get("data")
+    if not isinstance(rows, list) or len(rows) != 1:
+        raise RuntimeError("LM Studio returned an unexpected single-embedding response")
+    return rows[0]["embedding"], model_name
 
 
-def _lm_studio_embed_batch(texts: list[str], model: str = None) -> tuple[list, str]:
+def _lm_studio_embed_batch(texts: list[str], model: str = None,
+                           purpose: str = "document") -> tuple[list, str]:
     """Embed many texts in ONE /v1/embeddings call (the API takes a list).
     Returns (vectors in input order, model_name)."""
     model_name = model or _lm_embed_model_id()
@@ -284,6 +476,7 @@ def _lm_studio_embed_batch(texts: list[str], model: str = None) -> tuple[list, s
     # One batch POST is ONE request against the provider's quota — acquire a
     # single slot for the whole chunk, matching how providers count.
     ratelimit.acquire("lm_studio")
+    texts = [_profile_text(t, "lm_studio", model_name, purpose)[0] for t in texts]
     payload = json.dumps({"model": model_name, "input": texts}).encode("utf-8")
     req = urllib.request.Request(
         f"{LM_STUDIO_URL}/embeddings",
@@ -292,7 +485,8 @@ def _lm_studio_embed_batch(texts: list[str], model: str = None) -> tuple[list, s
     )
     with urllib.request.urlopen(req, timeout=120) as r:
         result = json.loads(r.read())
-    rows = sorted(result["data"], key=lambda d: d.get("index", 0))
+    _check_served_model(model_name, result.get("model"), "LM Studio")
+    rows = _ordered_rows(result.get("data"), len(texts), "LM Studio")
     return [row["embedding"] for row in rows], model_name
 
 
@@ -323,7 +517,8 @@ def gemini_embed_cooldowns() -> dict[str, float]:
     }
 
 
-def _gemini_embed(text: str, model: str = None) -> tuple[list, str]:
+def _gemini_embed(text: str, model: str = None,
+                  purpose: str = "document") -> tuple[list, str]:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY not set")
     model_name = model or _GEMINI_EMBED_MODEL
@@ -333,18 +528,21 @@ def _gemini_embed(text: str, model: str = None) -> tuple[list, str]:
         )
     ratelimit.acquire("gemini")
     url = f"{GEMINI_BASE}/models/{model_name}:embedContent?key={GEMINI_API_KEY}"
-    payload = json.dumps(
-        {
-            "model": f"models/{model_name}",
-            "content": {"parts": [{"text": text}]},
-        }
-    ).encode("utf-8")
+    text, task_type = _profile_text(text, "gemini", model_name, purpose)
+    request_body = {
+        "model": f"models/{model_name}",
+        "content": {"parts": [{"text": text}]},
+    }
+    if task_type:
+        request_body["embedContentConfig"] = {"taskType": task_type}
+    payload = json.dumps(request_body).encode("utf-8")
     req = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"}
     )
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             result = json.loads(r.read())
+        _check_served_model(model_name, result.get("model"), "Gemini")
         return result["embedding"]["values"], model_name
     except urllib.error.HTTPError as e:
         body = e.read()  # readable only once — capture before using twice
@@ -352,6 +550,53 @@ def _gemini_embed(text: str, model: str = None) -> tuple[list, str]:
             _mark_embed_rate_limited(model_name, e.headers.get("Retry-After") if e.headers else None)
             ratelimit.learn_from_gemini_429(model_name, body)
         raise RuntimeError(f"Gemini embed {e.code}: {body[:200]}")
+
+
+def _gemini_embed_batch(texts: list[str], model: str = None,
+                        purpose: str = "document") -> tuple[list, str]:
+    """Synchronous Gemini batchEmbedContents call; responses are input-ordered."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not set")
+    model_name = model or _GEMINI_EMBED_MODEL
+    if _gemini_embed_cooldown.get(model_name, 0) > _time.time():
+        raise RuntimeError(
+            f"Gemini embed model {model_name} in post-429 cooldown — skipping retry"
+        )
+    requests = []
+    for text in texts:
+        prepared, task_type = _profile_text(text, "gemini", model_name, purpose)
+        row = {
+            "model": f"models/{model_name}",
+            "content": {"parts": [{"text": prepared}]},
+        }
+        if task_type:
+            row["embedContentConfig"] = {"taskType": task_type}
+        requests.append(row)
+    ratelimit.acquire("gemini")
+    url = f"{GEMINI_BASE}/models/{model_name}:batchEmbedContents?key={GEMINI_API_KEY}"
+    req = urllib.request.Request(
+        url, data=json.dumps({"requests": requests}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            result = json.loads(r.read())
+        _check_served_model(model_name, result.get("model"), "Gemini")
+        rows = result.get("embeddings")
+        if not isinstance(rows, list) or len(rows) != len(texts):
+            actual = len(rows) if isinstance(rows, list) else "non-list"
+            raise RuntimeError(
+                f"Gemini batch returned {actual} vectors for {len(texts)} inputs"
+            )
+        return [row["values"] for row in rows], model_name
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        if e.code == 429:
+            _mark_embed_rate_limited(
+                model_name, e.headers.get("Retry-After") if e.headers else None
+            )
+            ratelimit.learn_from_gemini_429(model_name, body)
+        raise RuntimeError(f"Gemini batch embed {e.code}: {body[:200]}")
 
 
 # ── 9Router (local multi-provider gateway) ────────────────────────────────────
@@ -422,25 +667,27 @@ def _9router_embed_request(payload_input, model: str, timeout: int) -> list:
     # requested "gemini/gemini-embedding-001" → model "gemini-embedding-001",
     # prefix stripped), so containment == same model.
     served = result.get("model")
-    if served and served not in model:
-        global _last_substitution
-        _last_substitution = {"requested": model, "served": served}
-        raise RuntimeError(
-            f"9Router substituted embedding model ({model} → {served}) — "
-            "rejected to keep one vector space per collection"
-        )
-    return result["data"]
+    if served:
+        try:
+            _check_served_model(model, served, "9Router", allow_prefixless=True)
+        except RuntimeError:
+            global _last_substitution
+            _last_substitution = {"requested": model, "served": served}
+            raise
+    return result.get("data")
 
 
 def _9router_embed(text: str, model: str) -> tuple[list, str]:
     rows = _9router_embed_request(text, model, timeout=30)
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        raise RuntimeError("9Router returned an unexpected single-embedding response")
     return rows[0]["embedding"], model
 
 
 def _9router_embed_batch(texts: list[str], model: str) -> tuple[list, str]:
     """Batch embed through 9Router in ONE request (verified live: list input
     returns index-tagged rows, same contract as LM Studio's endpoint)."""
-    rows = sorted(_9router_embed_request(texts, model, timeout=120), key=lambda d: d.get("index", 0))
+    rows = _ordered_rows(_9router_embed_request(texts, model, timeout=120), len(texts), "9Router")
     return [row["embedding"] for row in rows], model
 
 
@@ -448,7 +695,8 @@ def _9router_embed_batch(texts: list[str], model: str) -> tuple[list, str]:
 
 
 def get_embedding(
-    text: str, force_provider: str = "auto", model: str = None
+    text: str, force_provider: str = "auto", model: str = None,
+    purpose: str = "document",
 ) -> tuple[list | None, str, str]:
     """Returns (vector, model_name, source).
     force_provider: "auto" (LM Studio → Gemini), "lm_studio", "gemini", or
@@ -459,20 +707,25 @@ def get_embedding(
     global _last_error, _last_substitution
     _last_error = None
     _last_substitution = None
-    lm = ("lm_studio", lambda t: _lm_studio_embed(t, model))
-    gem = ("gemini", lambda t: _gemini_embed(t, model if force_provider == "gemini" else None))
+    lm = ("lm_studio", lambda t: _lm_studio_embed(t, model, purpose))
+    gem = ("gemini", lambda t: _gemini_embed(
+        t, model if force_provider == "gemini" else None, purpose
+    ))
     if force_provider == "lm_studio":
         chain = [lm]
     elif force_provider == "gemini":
         chain = [gem]
     elif force_provider == "9router":
-        chain = [("9router", lambda t: _9router_embed(t, model))]
+        chain = [("9router", lambda t: _9router_embed(
+            _profile_text(t, "9router", model, purpose)[0], model
+        ))]
     else:
         chain = [lm, gem]
 
     for source, fn in chain:
         try:
             vector, model_name = fn(text)
+            vector = _validate_vector(vector, source)
             register_model(source, model_name, len(vector))
             return vector, model_name, source
         except ratelimit.Cancelled:
@@ -524,59 +777,42 @@ def resolve_9router_embed_id(served: str, requested: str) -> str:
 
 
 def get_embeddings_batch(
-    texts: list[str], force_provider: str = "auto", model: str = None
+    texts: list[str], force_provider: str = "auto", model: str = None,
+    purpose: str = "document",
 ) -> tuple[list | None, str, str]:
     """Batch variant of get_embedding: returns (vectors in input order,
     model_name, source), or (None, '', 'error') on full failure.
-    LM Studio embeds the whole list in ONE request — a failure there fails the
-    whole chunk since there's no partial result to salvage from a single HTTP
-    call. Gemini has no batch endpoint on the free tier, so it loops one
-    request per text; a per-item failure there does NOT discard the rest of
-    the chunk — that slot in the returned list is None while every other text
-    still gets embedded, so callers must check for (and handle) None entries
-    whenever the overall result isn't None."""
+    Provider batch responses must have exact cardinality and order. Malformed
+    or partial responses fail the chunk instead of risking vector/id misalignment."""
     global _last_error, _last_substitution
     _last_error = None
     _last_substitution = None
     if not texts:
         return [], "", ""
 
-    def _gem_batch(ts):
-        m = model if force_provider == "gemini" else None
-        vecs, name = [], None
-        for t in ts:
-            try:
-                v, name = _gemini_embed(t, m)
-                vecs.append(v)
-            except ratelimit.Cancelled:
-                raise
-            except Exception as e:
-                print(f"[embeddings] gemini batch item error: {e}")
-                vecs.append(None)
-        return vecs, name
-
-    lm = ("lm_studio", lambda ts: _lm_studio_embed_batch(ts, model))
-    gem = ("gemini", _gem_batch)
+    lm = ("lm_studio", lambda ts: _lm_studio_embed_batch(ts, model, purpose))
+    gem = ("gemini", lambda ts: _gemini_embed_batch(
+        ts, model if force_provider == "gemini" else None, purpose
+    ))
     if force_provider == "lm_studio":
         chain = [lm]
     elif force_provider == "gemini":
         chain = [gem]
     elif force_provider == "9router":
-        chain = [("9router", lambda ts: _9router_embed_batch(ts, model))]
+        chain = [("9router", lambda ts: _9router_embed_batch(
+            [_profile_text(t, "9router", model, purpose)[0] for t in ts], model
+        ))]
     else:
         chain = [lm, gem]
 
     for source, fn in chain:
         try:
             vectors, model_name = fn(texts)
-            if len(vectors) != len(texts):
-                raise RuntimeError(
-                    f"{source} returned {len(vectors)} vectors for {len(texts)} inputs"
-                )
-            dims = [len(v) for v in vectors if v is not None]
-            if not dims:
-                raise RuntimeError(f"{source} failed to embed every item in the batch")
-            register_model(source, model_name, dims[0])
+            vectors = _validate_vectors(vectors, len(texts), source)
+            dims = {len(v) for v in vectors}
+            if len(dims) != 1:
+                raise RuntimeError(f"{source} batch returned no consistent vector dimension")
+            register_model(source, model_name, dims.pop())
             return vectors, model_name, source
         except ratelimit.Cancelled:
             raise

@@ -444,11 +444,8 @@ def test_blank_caption_is_not_counted_as_captioned(tmp_path):
     assert stats["vision_done"] == 1 and stats["vision_pending"] == 1
 
 
-def test_get_stage_stats_embed_pending_never_negative(tmp_path):
-    """Regression: if the active collection has MORE embedded ids than the
-    catalog has captions for (e.g. stale entries after a failed/partial Chroma
-    delete), embed_pending must clamp to 0, not go negative — mirrors the
-    max(0, ...) pattern count_thumbs_missing already uses."""
+def test_get_stage_stats_counts_fingerprint_stale_embeddings(tmp_path):
+    """An existing Chroma id without a matching fingerprint is still pending."""
     from indexer import Indexer
     catalog = {"images": {
         "a": {"path": "/a.jpg", "filename": "a.jpg", "metadata": {}, "caption_json": '{"c":"x"}'},
@@ -466,7 +463,7 @@ def test_get_stage_stats_embed_pending_never_negative(tmp_path):
 
     assert stats["vision_done"] == 1
     assert stats["active_model_embedded"] == 3
-    assert stats["embed_pending"] == 0
+    assert stats["embed_pending"] == 1
 
 
 # ── caption history / model tracking ───────────────────────────────────────────
@@ -846,3 +843,83 @@ def test_get_vision_pending_excludes_videos_but_video_selector_includes_them():
     video_pending = {i for i, _ in idx.get_video_vision_pending()}
     assert photo_pending == {"p1"}          # v1 not in the photo queue
     assert video_pending == {"v1"}          # v1 is in the video queue
+
+
+# ── deterministic embedding freshness ────────────────────────────────────────
+
+def test_recaptions_become_pending_then_clear_after_embedding():
+    from indexer import _record_caption_history, build_embed_fingerprint, _embed_one
+
+    image = {
+        "path": "/synthetic/a.jpg", "filename": "a.jpg", "metadata": {"date": "2024:01:02"},
+        "caption_model": "vision-a",
+        "caption_history": [{"model": "vision-a", "caption_json": '{"caption":"old beach"}'}],
+        "caption_json": '{"caption":"old beach"}',
+    }
+    old_fingerprint = build_embed_fingerprint(image, image["caption_json"], "vision-a")
+    stored = {"ids": ["a"], "metadatas": [{"embed_fingerprint": old_fingerprint}]}
+
+    class Collection:
+        def get(self, include=None):
+            return stored
+
+        def upsert(self, ids, embeddings, metadatas):
+            stored["ids"] = ids
+            stored["metadatas"] = metadatas
+
+    collection = Collection()
+    idx = _idx_with({"a": image})
+    _record_caption_history(image, "vision-a", '{"caption":"new mountain"}')
+
+    with patch("indexer.db.collection", return_value=collection), \
+         patch("indexer.get_active_model", return_value="embed-a"), \
+         patch("indexer.get_embedding", return_value=([0.1], "embed-a", "lm_studio")):
+        assert {img_id for img_id, _ in idx.get_embed_pending_for_model(
+            "embed-a", "vision-a"
+        )} == {"a"}
+        note = _embed_one(
+            "a", image, upsert=True, caption_source_model="vision-a", detect_faces=False
+        )
+        assert note == "embed:lm_studio"
+        assert idx.get_embed_pending_for_model("embed-a", "vision-a") == []
+
+    assert stored["metadatas"][0]["embed_fingerprint"] == build_embed_fingerprint(
+        image, image["caption_json"], "vision-a"
+    )
+
+
+def test_pending_respects_caption_source_and_skips_blank_or_invalid():
+    idx = _idx_with({
+        "a": {
+            "path": "/a.jpg", "filename": "a.jpg", "metadata": {},
+            "caption_model": "vision-b", "caption_json": '{"caption":"latest B"}',
+            "caption_history": [
+                {"model": "vision-a", "caption_json": '{"caption":"older A"}'},
+                {"model": "vision-b", "caption_json": '{"caption":"latest B"}'},
+            ],
+        },
+        "blank": {"caption_json": '{"caption":" "}'},
+        "invalid": {"caption_json": "not json"},
+    })
+    empty_collection = MagicMock()
+    empty_collection.get.return_value = {"ids": [], "metadatas": []}
+    with patch("indexer.db.collection", return_value=empty_collection):
+        assert idx.get_embed_eligible_ids("vision-a") == {"a"}
+        assert {img_id for img_id, _ in idx.get_embed_pending_for_model(
+            "embed-a", "vision-a"
+        )} == {"a"}
+        assert {img_id for img_id, _ in idx.get_embed_pending()} == {"a"}
+
+
+def test_fingerprint_is_deterministic_and_tracks_catalog_metadata():
+    from indexer import build_embed_fingerprint
+    a = {"path": "/a.jpg", "filename": "a.jpg", "metadata": {"gps_lat": 1, "gps_lon": 2}}
+    b = {"filename": "a.jpg", "path": "/a.jpg", "metadata": {"gps_lon": 2, "gps_lat": 1}}
+    caption = '{"caption":"a tree"}'
+    assert build_embed_fingerprint(a, caption, "vision-a") == build_embed_fingerprint(
+        b, caption, "vision-a"
+    )
+    b["metadata"]["gps_lat"] = 3
+    assert build_embed_fingerprint(a, caption, "vision-a") != build_embed_fingerprint(
+        b, caption, "vision-a"
+    )

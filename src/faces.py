@@ -1,29 +1,30 @@
-import insightface
-import onnxruntime as ort
+import threading
 import numpy as np
-import cv2
 import os
 import json
 from PIL import Image, ImageOps
 
-import db
 import catalog_db
+from runtime_import import import_module
 import settings as settings_mod
 from constants import FACE_DIR, SIMILARITY_THRESHOLD, IMAGE_CATALOG_PATH, DATA_DIR
 
 os.makedirs(FACE_DIR, exist_ok=True)
 
-# Optional Intel GPU/NPU acceleration: if the OpenVINO runtime is installed
-# (`openvino` package, an opt-in extra — see README), importing it HERE, before
-# any onnxruntime InferenceSession is built, registers its DLL directory so
-# onnxruntime's OpenVINO execution-provider bridge can load openvino.dll. It's a
-# harmless no-op when OpenVINO isn't installed (the CPU-only default). This must
-# run before _get_app(); onnxruntime resolves the provider DLL's dependencies at
-# session-creation time, not import time.
-try:
-    import openvino as _openvino  # noqa: F401
-except Exception:
-    _openvino = None
+
+class _LazyModule:
+    """Face metadata and search do not need to load a detector or image decoder."""
+    def __init__(self, module):
+        self._module = module
+
+    def __getattr__(self, name):
+        return getattr(import_module(self._module), name)
+
+
+insightface = _LazyModule("insightface")
+ort = _LazyModule("onnxruntime")
+cv2 = _LazyModule("cv2")
+db = _LazyModule("db")
 
 # OpenVINO compiles each model for the target device on first use (tens of
 # seconds for GPU/NPU); a persistent cache turns that into a one-time cost.
@@ -59,7 +60,7 @@ def _openvino_devices():
     """Physical OpenVINO devices (e.g. ['CPU','GPU','NPU']). [] when OpenVINO
     isn't installed or can't enumerate — callers treat that as 'no OpenVINO'."""
     try:
-        import openvino as ov  # only present with onnxruntime-openvino / openvino
+        ov = import_module("openvino")  # present with onnxruntime-openvino / openvino
         return list(ov.Core().available_devices)
     except Exception:
         return []
@@ -177,21 +178,36 @@ def resolved_provider_label(choice=None):
 # next call instead of serving a stale session on the old device.
 _face_app = None
 _face_app_choice = None
+_face_app_lock = threading.Lock()
 
 
 def reset_face_app():
     """Drop the cached model so the next _get_app() rebuilds (e.g. after the
     accelerator setting changed)."""
     global _face_app, _face_app_choice
-    _face_app = None
-    _face_app_choice = None
+    with _face_app_lock:
+        _face_app = None
+        _face_app_choice = None
 
 
 def _get_app():
+    # Reference registration and a face job can arrive together. Model loading
+    # is expensive; build one instance instead of competing for accelerator RAM.
+    with _face_app_lock:
+        return _build_app()
+
+
+def _build_app():
     global _face_app, _face_app_choice
     desired = settings_mod.load().get("face_provider", "auto")
     if _face_app is not None and _face_app_choice == desired:
         return _face_app
+    # Register optional OpenVINO DLL paths before creating an inference session,
+    # but only when someone actually requests face detection.
+    try:
+        import_module("openvino")  # noqa: F401
+    except Exception:
+        pass
     providers, provider_options = _resolve_providers(desired)
     app = insightface.app.FaceAnalysis(
         name='buffalo_l',
@@ -215,9 +231,9 @@ def _get_app():
 # orientation, mirroring what PIL.ImageOps.exif_transpose()/cv2.imread already
 # do for the other two decode paths below.
 _EXIF_ROTATE_FOR_ORIENTATION = {
-    3: cv2.ROTATE_180,
-    6: cv2.ROTATE_90_CLOCKWISE,
-    8: cv2.ROTATE_90_COUNTERCLOCKWISE,
+    3: "ROTATE_180",
+    6: "ROTATE_90_CLOCKWISE",
+    8: "ROTATE_90_COUNTERCLOCKWISE",
 }
 
 
@@ -235,7 +251,7 @@ def _apply_exif_rotation_cv2(img, image_path):
         orientation = None
     rotate_code = _EXIF_ROTATE_FOR_ORIENTATION.get(orientation)
     if rotate_code is not None:
-        img = cv2.rotate(img, rotate_code)
+        img = cv2.rotate(img, getattr(cv2, rotate_code))
     return img
 
 

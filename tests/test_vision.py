@@ -377,6 +377,35 @@ def test_parse_valid_json():
     assert attrs["person_count"] == 2
 
 
+def test_validate_vision_output_rejects_empty_or_wrong_type_caption():
+    from vision import validate_vision_output
+    for caption in ("", "   ", ["a", "b"], {"text": "caption"}, None):
+        payload = {"caption": caption, "scene": "outdoor", "occasion": "vacation",
+                   "weather": "sunny", "group_size": "couple"}
+        result = validate_vision_output(json.dumps(payload))
+        assert result["valid"] is False
+        assert "caption" in result["warning"].lower()
+
+
+def test_validate_vision_output_rejects_malformed_attribute_types():
+    from vision import validate_vision_output
+    payload = {"caption": "A family outdoors", "scene": "outdoor", "occasion": "family",
+               "weather": "sunny", "group_size": "small_group", "person_count": True}
+    assert validate_vision_output(json.dumps(payload))["valid"] is False
+    payload["person_count"] = 3
+    payload["objects"] = {"umbrella": True}
+    assert validate_vision_output(json.dumps(payload))["valid"] is False
+
+
+def test_validate_vision_output_rejects_out_of_vocabulary_filters():
+    from vision import validate_vision_output
+    payload = {"caption": "A family outdoors", "scene": "outside", "occasion": "family",
+               "weather": "sunny", "group_size": "small_group"}
+    result = validate_vision_output(json.dumps(payload))
+    assert result["valid"] is False
+    assert "scene" in result["warning"]
+
+
 def test_parse_person_count_defaults_to_zero_when_missing():
     from vision import parse_vision_attributes
     attrs = parse_vision_attributes(json.dumps({"caption": "hello"}))

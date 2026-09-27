@@ -18,6 +18,7 @@ the 2-second tolerance matches FAT/exFAT timestamp granularity, robocopy's
 /FFT, so an NTFS/ext4→exFAT mirror doesn't re-copy the world every run).
 """
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -89,19 +90,63 @@ def _load_state() -> dict:
     return {}
 
 
-def record_success():
+def _path_key(path: str | None) -> str | None:
+    if not path:
+        return None
+    # Use os.path helpers instead of Path.resolve(): tests and callers may
+    # override os.name to exercise a mirror backend on another OS.
+    return os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+
+
+def _normalized_roots(roots: list[tuple[str, str]]) -> list[tuple[str | None, str | None]]:
+    return [(_path_key(src), _path_key(dst)) for src, dst in roots]
+
+
+def _roots_fingerprint(roots: list[tuple[str, str]]) -> str:
+    payload = json.dumps(_normalized_roots(roots), separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def targets_match_current(snapshot_roots: list[tuple[str, str]] | None) -> bool:
+    """Whether the frozen source/destination map still matches settings."""
+    if snapshot_roots is None:
+        return False
+
+    try:
+        return _normalized_roots(snapshot_roots) == _normalized_roots(backup_roots())
+    except Exception:
+        return False
+
+
+def record_success(snapshot_roots: list[tuple[str, str]] | None = None) -> bool:
+    """Record a complete backup against the exact root map that was copied."""
+    roots = backup_roots() if snapshot_roots is None else list(snapshot_roots)
+    if not targets_match_current(roots):
+        return False
+    data_dest = next((dst for src, dst in roots if _path_key(src) == _path_key(DATA_DIR)), None)
     os.makedirs(DATA_DIR, exist_ok=True)
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"last_backup_at": time.time()}, f)
+        json.dump({
+            "last_backup_at": time.time(),
+            "backup_dest": _path_key(os.path.dirname(data_dest)) if data_dest else None,
+            "roots_fingerprint": _roots_fingerprint(roots),
+        }, f)
     os.replace(tmp, STATE_PATH)
+    return True
 
 
 def status() -> dict:
     """For the Backup card: is a destination configured, is its drive
     currently plugged in, and how stale is the last successful run."""
     dest = get_dest()
-    last = _load_state().get("last_backup_at")
+    roots = backup_roots()
+    saved = _load_state()
+    # A timestamp is fresh only for the exact source/destination map that was
+    # copied. This also catches source-root edits and target changes racing the
+    # success-state write.
+    last = (saved.get("last_backup_at")
+            if saved.get("roots_fingerprint") == _roots_fingerprint(roots) else None)
     days = round((time.time() - last) / 86400, 1) if last else None
     return {
         "configured": bool(dest),
@@ -109,7 +154,7 @@ def status() -> dict:
         "available": _drive_available(dest) if dest else False,
         "last_backup_at": last,
         "days_since": days,
-        "roots": [src for src, _ in backup_roots()],
+        "roots": [src for src, _ in roots],
     }
 
 
@@ -153,7 +198,7 @@ def validate_dest(dest: str) -> dict:
     return {"ok": True, "reason": None}
 
 
-def backup_one(src: str) -> str:
+def backup_one(src: str, dest: str = None) -> str:
     """Mirror one source root to its destination. Returns a job-log note.
     Raises on copy failure so the job counts it as a fail.
 
@@ -167,19 +212,18 @@ def backup_one(src: str) -> str:
       - photo-vault's own data/: strict mirror (purge extras) — stale ChromaDB
         segment files from older runs must never mix into a restore.
     """
-    dest_map = dict(backup_roots())
-    dst = dest_map.get(src)
+    dest_map = dict(backup_roots()) if dest is None else None
+    dst = dest if dest is not None else (dest_map or {}).get(src)
     if not dst:
         raise RuntimeError(f"no backup destination mapped for {src}")
     if not os.path.isdir(src):
-        return "skipped (source folder missing)"
+        raise FileNotFoundError(f"backup source folder is missing: {src}")
     os.makedirs(dst, exist_ok=True)
     purge = src == DATA_DIR
     if os.name == "nt":
         note = _mirror_robocopy(src, dst, purge)
     else:
         note = _mirror_python(src, dst, purge)
-    record_success()
     return note
 
 

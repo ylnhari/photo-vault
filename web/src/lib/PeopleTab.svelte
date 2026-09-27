@@ -167,7 +167,7 @@
       {#if fstatus}
         <span class="hint" style="font-size:12px">
           {fstatus.detected}/{fstatus.total} photos scanned for faces
-          {#if fstatus.pending > 0}· {fstatus.pending} pending (run “Face detection” in Index &amp; Manage){/if}
+          {#if fstatus.pending > 0}· {fstatus.pending} pending (run “Face detection” in Manage){/if}
           {#if fstatus.detected > 0 && fstatus.ann_index_count === 0}· ⚠ face index not built{/if}
         </span>
       {/if}
@@ -187,7 +187,7 @@
   {#if loadingClusters}
     <p class="muted">Loading groups…</p>
   {:else if clusters.length === 0}
-    <p class="muted">No face groups yet. Detect faces first (Index &amp; Manage → Face detection), then click “Find face groups”.</p>
+    <p class="muted">No face groups yet. Detect faces first (Manage → Face detection), then click “Find face groups”.</p>
   {:else}
     <div class="clusters">
       {#each clusters as c (c.cluster_id)}

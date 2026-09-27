@@ -7,7 +7,6 @@
   import "leaflet.markercluster/dist/MarkerCluster.css";
   import "leaflet.markercluster/dist/MarkerCluster.Default.css";
 
-  export let indexedCount = 0;
   const dispatch = createEventDispatcher();
 
   let mapEl;
@@ -58,9 +57,7 @@
   onDestroy(() => { if (map) { map.remove(); map = null; } });
 </script>
 
-{#if indexedCount === 0}
-  <div class="card"><p>No photos indexed yet. Scan and index photos first.</p></div>
-{:else if loading}
+{#if loading}
   <p class="muted">Loading map…</p>
 {:else if err}
   <p style="color:var(--danger)">{err}</p>
@@ -69,7 +66,7 @@
     <p><b>No geotagged photos found.</b></p>
     <p class="muted" style="font-size:13px">
       Photos must contain GPS EXIF data, and the folder must be re-scanned after the EXIF
-      upgrade so coordinates are extracted (Index &amp; Manage → Scan).
+      upgrade so coordinates are extracted (Manage → Scan).
     </p>
   </div>
 {/if}
@@ -86,7 +83,7 @@
     border-radius: 12px; padding: 16px; }
   .muted { color: var(--muted); }
   /* Leaflet popups/controls inherit dark-ish app colors poorly; keep tiles bright. */
-  :global(.leaflet-container) { background: #1a1d23; font: inherit; }
+  :global(.leaflet-container) { background: #f1f4ef; font: inherit; }
   :global(.pv-pin) {
     background: #5b8def; border: 2px solid #fff; border-radius: 50%;
     box-shadow: 0 0 0 1px rgba(0,0,0,.3);

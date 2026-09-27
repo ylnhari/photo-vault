@@ -1,65 +1,67 @@
 :root {
-  --bg: #0f1117;
-  --surface: #1a1d27;
-  --surface2: #2a2d3e;
-  --border: #2a2d3e;
-  --text: #e2e8f0;
-  --muted: #64748b;
-  --accent: #6366f1;
-  --accent-2: #8b5cf6;
-  --danger: #ef4444;
-  --success: #22c55e;
-  --warn: #f59e0b;
+  color-scheme: light;
+  --bg: #f7f8f4;
+  --surface: #ffffff;
+  --surface2: #f0f3ef;
+  --border: #e3e8e2;
+  --text: #34403b;
+  --ink: #25332e;
+  --muted: #66756d;
+  --accent: #2f766c;
+  --accent-2: #397f74;
+  --danger: #a94440;
+  --success: #2d774f;
+  --warn: #855712;
   --radius-lg: 14px;
-  --shadow-1: 0 1px 2px rgba(0,0,0,.24);
-  --shadow-2: 0 8px 24px -8px rgba(0,0,0,.45);
-  --shadow-accent: 0 4px 16px -4px color-mix(in srgb, var(--accent) 55%, transparent);
+  --shadow-1: 0 1px 3px rgba(31,48,41,.045);
+  --shadow-2: 0 8px 24px -8px rgba(31,48,41,.16);
+  --shadow-accent: 0 4px 16px -4px rgba(62,141,130,.32);
 }
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { background: var(--bg); color: var(--text);
-  font-family: system-ui, -apple-system, sans-serif; }
-button {
-  font: inherit; cursor: pointer; border: 1px solid var(--border);
-  background: var(--surface2); color: var(--text);
-  border-radius: 10px; padding: 9px 16px; font-weight: 500;
-  transition: filter .15s, transform .15s, box-shadow .15s;
-}
-button:hover:not(:disabled) { filter: brightness(1.2); transform: translateY(-1px); }
+html { min-width: 320px; scroll-behavior: smooth; background: var(--bg); }
+body { min-width: 320px; min-height: 100vh; background: var(--bg); color: var(--text);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px; text-rendering: optimizeLegibility; }
+button { font: inherit; cursor: pointer; border: 1px solid var(--border); background: var(--surface2);
+  color: var(--text); border-radius: 10px; padding: 9px 16px; font-weight: 560;
+  transition: filter .15s, transform .15s, box-shadow .15s; }
+button:hover:not(:disabled) { filter: brightness(.98); transform: translateY(-1px); }
 button:active:not(:disabled) { transform: translateY(0); }
-button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
-button.primary {
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  border-color: transparent; color: #fff; box-shadow: var(--shadow-accent);
+button:disabled { opacity: .52; cursor: not-allowed; transform: none; }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--accent) 44%, white); outline-offset: 2px;
 }
-button.primary:hover:not(:disabled) { filter: brightness(1.12); box-shadow: 0 6px 20px -4px color-mix(in srgb, var(--accent) 65%, transparent); }
+button.primary { background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  border-color: transparent; color: #fff; box-shadow: var(--shadow-accent); }
+button.primary:hover:not(:disabled) { filter: brightness(1.04); box-shadow: 0 6px 20px -4px rgba(62,141,130,.4); }
 button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
 button.ghost { background: transparent; box-shadow: none; }
-input, select, textarea {
-  font: inherit; background: var(--surface); color: var(--text);
-  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; width: 100%;
-}
-a { color: var(--accent); }
+input, select, textarea { font: inherit; background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; width: 100%; }
+input::placeholder, textarea::placeholder { color: #707d75; }
+a { color: #347a71; }
 .muted { color: var(--muted); }
 .row { display: flex; gap: 10px; align-items: center; }
 .col { display: flex; flex-direction: column; gap: 10px; }
-.card { background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius-lg); padding: 18px; box-shadow: var(--shadow-1);
-  transition: border-color .2s, box-shadow .2s; }
-.section-label { color: var(--muted); font-size: 12px; font-weight: 600;
-  letter-spacing: .08em; text-transform: uppercase; margin: 4px 0; }
-.pill { font-size: 11px; padding: 2px 8px; border-radius: 99px;
-  background: var(--surface2); color: var(--muted); }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  padding: 18px; box-shadow: var(--shadow-1); transition: border-color .2s, box-shadow .2s; }
+.section-label { color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em;
+  text-transform: uppercase; margin: 4px 0; }
+.pill { font-size: 11px; padding: 2px 8px; border-radius: 99px; background: var(--surface2); color: var(--muted); }
 .bar { height: 8px; border-radius: 99px; background: var(--surface2); overflow: hidden; }
 .bar > span { display: block; height: 100%; background: var(--accent); transition: width .2s; }
-
-/* Section icon badge — small colored glyph tile used to give each pipeline
-   stage (scan/vision/embed/faces/...) a distinct visual identity instead of
-   an undifferentiated stack of grey cards. Color set inline per section via
-   --tile (falls back to accent). */
-.tile {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 34px; height: 34px; border-radius: 10px; font-size: 16px; flex-shrink: 0;
-  background: color-mix(in srgb, var(--tile, var(--accent)) 18%, transparent);
-  color: var(--tile, var(--accent));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--tile, var(--accent)) 35%, transparent);
+.tile { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px;
+  border-radius: 10px; font-size: 16px; flex-shrink: 0; background: color-mix(in srgb, var(--tile, var(--accent)) 12%, white);
+  color: var(--tile, var(--accent)); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--tile, var(--accent)) 25%, white); }
+.view-panel { min-height: 100vh; padding: 24px clamp(18px, 2.7vw, 38px); }
+.view-panel.library { padding: 0; }
+.warn { background: #fff7e9; color: #86601b; border: 1px solid #efd9ad; padding: 10px 16px; margin: 12px 22px; border-radius: 8px; }
+code { background: var(--surface2); padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+@media (max-width: 760px) {
+  .view-panel { min-height: calc(100vh - 132px); padding: 15px; }
+  .view-panel.library { padding: 0; }
 }

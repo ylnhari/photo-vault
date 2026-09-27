@@ -60,7 +60,9 @@ def main():
         )
 
     print(f"Photo Vault -> http://127.0.0.1:{port}   (Ctrl+C to stop)")
-    uvicorn.run("api:app", host=host, port=port, reload=False)
+    # Media URLs carry a bearer token in their query string. Keep them out of
+    # access logs; application errors remain available through normal logging.
+    uvicorn.run("api:app", host=host, port=port, reload=False, access_log=False)
 
 
 if __name__ == "__main__":

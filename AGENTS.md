@@ -14,8 +14,11 @@ label with the caption; reject embedding substitution because each vector space 
 collection. Keep gateway endpoints, accounts, keys, and sibling-machine documentation out of this
 repository.
 GEMINI_API_KEY loaded from `.env` via `constants._load_env()` — never hardcoded.
-Multi-model embeddings: each embedding model gets its own ChromaDB collection; active model
-selected by user in UI; registry stored in `data/embedding_registry.json`.
+Multi-model embeddings: each model/profile gets its own ChromaDB collection; active model
+selected by user in UI; registry stored in `data/embedding_registry.json`. Legacy entries
+retain stored collection names and raw preprocessing. New entries record a versioned
+retrieval profile, dimension, source, hashed collection identity, and cosine metric.
+Route collection access through `db.collection()` so profile checks always apply.
 When a local `ports.json` registry is present, resolve this app's port through it via
 `constants.SERVER_PORT`; a clone may configure an explicit local port or use the documented
 fallback. Never silently hunt for a free port or hardcode a user-specific port in documentation.
@@ -25,7 +28,10 @@ Backend (Python, UI-agnostic) + frontend (Svelte SPA). The backend modules are t
 the SPA is the only UI. (The old Streamlit `app.py` was removed in the FastAPI migration.)
 ```
 src/
-  api.py          ← FastAPI: JSON endpoints + serves web/dist SPA same-origin
+  api.py          ← FastAPI: JSON endpoints + serves web/dist SPA same-origin;
+                    Library/timeline/map/media lookup stay independent of AI imports
+  catalog_db.py   ← SQLite JSON catalog + transactional, versioned indexed browse projection
+  photo_date.py   ← lightweight canonical EXIF/filename/import capture-date resolver
   serve.py        ← launcher; reads SERVER_PORT, runs uvicorn
   jobs.py         ← background indexing job manager (worker thread, RLock, stop flag,
                     consecutive-failure abort); API polls status(), calls stop()
@@ -37,17 +43,18 @@ src/
                     photo vision/faces selectors exclude them and the video_vision/video_faces
                     jobs caption/face them from sampled keyframes (aggregated to one caption/
                     one vector per video). Nothing else may shell out to ffmpeg.
-  embeddings.py   ← LM Studio /v1/embeddings first → Gemini text-embedding-004 fallback;
-                    multi-model registry; one ChromaDB collection per model
+  embeddings.py   ← LM Studio first → Gemini gemini-embedding-001 fallback;
+                    batch inference, strict vector validation, immutable retrieval profiles
   indexer.py      ← scan + vision + embed + ChromaDB; caption_json + caption_model +
                     caption_history per image; single-item ops (vision_one/embed_one/
-                    index_one_full) for the job manager; get_missing_files() for health check
+                    index_one_full) for the job manager; content fingerprints make stale
+                    caption/metadata embeddings pending again; get_missing_files() for health
   search.py       ← semantic search + attribute filters + person face filter;
                     get_available_filter_values() drives data-driven UI filters
   faces.py        ← InsightFace face detection/embedding (CPU + CUDA auto-fallback)
   tagger.py       ← register person from reference images → person_map.json
   clustering.py   ← DBSCAN face clustering
-  scanner.py / metadata.py ← recursive image discovery + EXIF
+  scanner.py       ← recursive image discovery + EXIF
   ingest.py       ← import & consolidate: staging folder → library (content-hash
                     dedupe incl. videos via media_hashes.json, YYYY/MM layout).
                     media filter ("both"/"photos"/"videos") + videos route to a
@@ -56,7 +63,7 @@ src/
                     folder + "both" also works. Audio/other files are ignored.
   backup.py       ← opportunistic incremental mirror of scan folders + data/ to
                     backup_dest (robocopy on Windows, stdlib mirror elsewhere;
-                    photo roots additive+video-invisible, data/ strict mirror);
+                    photo/video roots additive, data/ strict mirror);
                     status() = availability + staleness
   platformfs.py   ← ALL OS-specific filesystem behavior: picker roots (drives vs
                     mounts), system-dir skip list, dest availability, OS trash
@@ -68,15 +75,17 @@ src/
                     inference call; sliding in-memory windows; Stop-aware (Cancelled)
   constants.py    ← paths + endpoints + GEMINI_VISION_MODELS + SERVER_PORT + _load_env()
 web/
-  src/App.svelte  ← tabs: Search, Timeline, People, Index & Manage
+  src/App.svelte  ← lazy screens: Library, Timeline, Map, Albums, People, Manage
   src/lib/        ← api.js (fetch wrapper), PhotoGrid, Lightbox, *Tab.svelte
   dist/           ← built SPA (gitignored), served by FastAPI
-data/             ← gitignored: images.json, chroma_db/, faces/, thumbs/, person_map.json
-tests/            ← pytest; all external calls mocked; test_jobs + test_api included
+data/             ← gitignored: catalog.db, chroma_db/, faces/, thumbs/, person_map.json
+tests/            ← pytest; temporary isolated data and mocked providers; benchmark_revamp.py
+                    is a development-only synthetic performance harness
 ```
 
 ## API endpoints (all under /api)
-health, status, scan, index/start|stop|progress|reset, search (GET+POST), recent, filters,
+library, library/summary, library/facets, health, status, scan, index/start|stop|progress|reset,
+search (GET+POST), recent, filters,
 timeline, people (GET+POST), models (+models/active), image (GET thumb/full, DELETE),
 video (GET, HTTP-range → seekable playback), meta, cleanup-missing. Indexing runs as a
 background job — never blocks a request. Job types include video_vision + video_faces.
@@ -98,7 +107,7 @@ make test         # uv run python -m pytest tests/ -q
 
 ## Gemini fallback
 - Vision: tries `GEMINI_VISION_MODELS` in order (lite → heavier); skips 429/404/503
-- Embeddings: `text-embedding-004` (single model, no fallback chain within Gemini)
+- Embeddings: `gemini-embedding-001` (single default, no automatic model-space switching)
 - Both fall back on connection errors AND non-connection errors — always tries next provider
 - `embedding_source` ("lm_studio" or "gemini") + `embedding_model` stored in ChromaDB per image
 - Different models produce different vector spaces — each gets its own collection, no mixing
@@ -118,3 +127,11 @@ occasion, group_size, clothing_style, mood, objects, people_description
    jobs._lock is an RLock (start() calls status() while holding it).
 8. Backend functions return failed-id lists / raise per-image; callers surface, never crash a pass.
 9. After editing web/src, rebuild (`make build`) or use `make web` — FastAPI serves web/dist.
+10. Keep startup and ordinary browsing independent of AI libraries, provider probes,
+    Chroma scans, and per-file filesystem checks. Paginate catalog reads in SQL.
+11. Tests must use temporary storage and mocked providers. Set process-level
+    `PHOTO_VAULT_DATA_DIR` and `PHOTO_VAULT_ENV_FILE=-` for isolated previews;
+    never seed synthetic fixtures into the personal data directory.
+12. Embedding content changes require freshness fingerprints; query and document
+    preprocessing must match the collection's recorded profile. Do not silently
+    change a legacy vector space or select a partially rebuilt replacement index.

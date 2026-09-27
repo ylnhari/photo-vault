@@ -7,9 +7,10 @@ import threading
 import time
 
 import chromadb
+from chromadb.config import Settings
 
 from constants import CHROMA_DB_PATH
-from embeddings import collection_name_for, get_active_model
+from embeddings import collection_name_for, get_active_model, get_registry
 
 _client = None
 _client_lock = threading.Lock()
@@ -35,11 +36,15 @@ def client():
             # racing on first call don't each construct a separate
             # PersistentClient against the same on-disk path.
             if _client is None:
-                _client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+                _client = chromadb.PersistentClient(
+                    path=CHROMA_DB_PATH,
+                    settings=Settings(anonymized_telemetry=False),
+                )
     return _client
 
 
-def collection(model_name: str | None = None, *, allow_default: bool = False):
+def collection(model_name: str | None = None, *, allow_default: bool = False,
+               model_info: dict | None = None):
     """Get-or-create the collection for a model (active model when
     model_name is None).
 
@@ -58,7 +63,26 @@ def collection(model_name: str | None = None, *, allow_default: bool = False):
             raise ValueError(
                 "no active embedding model configured — set one before embedding"
             )
-    name = collection_name_for(model_name)
+    if model_info is None:
+        model_info = get_registry().get("models", {}).get(model_name)
+    name = (model_info or {}).get("collection") or collection_name_for(model_name)
+    profile = (model_info or {}).get("profile")
+    if profile:
+        profile_id = (model_info or {}).get("profile_id")
+        if not profile_id:
+            raise ValueError(f"embedding profile for {model_name!r} has no profile id")
+        col = client().get_or_create_collection(
+            name=name,
+            metadata={"hnsw:space": profile.get("metric", "cosine"),
+                      "embedding_profile_id": profile_id},
+        )
+        metadata = col.metadata or {}
+        if metadata.get("embedding_profile_id") != profile_id:
+            raise ValueError(f"collection {name!r} belongs to a different embedding profile")
+        if metadata.get("hnsw:space") != profile.get("metric", "cosine"):
+            raise ValueError(f"collection {name!r} uses a different distance metric")
+        return col
+    # Legacy collections retain their existing name and Chroma distance metric.
     return client().get_or_create_collection(name=name)
 
 

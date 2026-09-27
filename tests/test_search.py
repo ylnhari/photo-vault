@@ -3,6 +3,16 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 
+@pytest.fixture(autouse=True)
+def _active_test_embedding_profile():
+    """Search text tests use a synthetic active profile unless a test overrides it."""
+    profile = {"active_model": "test-model", "models": {
+        "test-model": {"source": "lm_studio", "dimension": 1, "profile_id": "test-profile"}
+    }}
+    with patch("search.get_registry", return_value=profile):
+        yield
+
+
 # ── build_where_clause ────────────────────────────────────────────────────────
 
 def test_where_empty_dict_returns_none():
@@ -98,6 +108,18 @@ def test_search_empty_collection():
     mock_col.query.assert_not_called()
 
 
+def test_blank_unfiltered_browse_does_not_call_embedding_provider():
+    from search import search_images
+    mock_col = _mock_collection(count=3)
+    mock_col.get.return_value = {"ids": ["a", "b"], "metadatas": [{}, {}]}
+    with patch("search.db.collection", return_value=mock_col), \
+         patch("search.get_embedding") as embed:
+        result = search_images("")
+    assert result["ids"] == [["a", "b"]]
+    embed.assert_not_called()
+    mock_col.query.assert_not_called()
+
+
 def test_search_returns_none_when_embedding_fails():
     from search import search_images
     mock_col = _mock_collection(count=5)
@@ -184,7 +206,7 @@ def test_search_filters_by_person():
     from search import search_images
     ids = ["img1", "img2"]
     metas = [{"path": "/img1.jpg"}, {"path": "/img2.jpg"}]
-    mock_col = _mock_collection(count=2, query_result={"ids": [ids], "metadatas": [metas]})
+    mock_col = _mock_collection(count=2, query_result={"ids": [["img1"]], "metadatas": [[metas[0]] ]})
 
     with patch("search.db.collection", return_value=mock_col), \
          patch("search.get_active_model", return_value="test-model"), \
@@ -195,6 +217,7 @@ def test_search_filters_by_person():
 
     assert result["ids"][0] == ["img1"]
     assert len(result["metadatas"][0]) == 1
+    assert mock_col.query.call_args.kwargs["ids"] == ["img1"]
 
 
 def test_search_person_only_returns_all_matches():
@@ -213,6 +236,20 @@ def test_search_person_only_returns_all_matches():
     mock_col.get.assert_called_once()
 
 
+def test_filter_only_person_browse_constrains_get_before_browse_limit():
+    from search import search_images
+    mock_col = _mock_collection(count=10001)
+    mock_col.get.return_value = {"ids": ["person-match"], "metadatas": [{"weather": "sunny"}]}
+    with patch("search.db.collection", return_value=mock_col), \
+         patch("search.get_person_embedding", return_value=[1.0, 0.0]), \
+         patch("search.query_person_faces", return_value={"person-match", "another-match"}):
+        result = search_images("", filters={"weather": "sunny"}, person="A")
+    kwargs = mock_col.get.call_args.kwargs
+    assert kwargs["ids"] == ["another-match", "person-match"]
+    assert kwargs["limit"] == 10000
+    assert result["ids"][0] == ["person-match"]
+
+
 def test_search_uses_active_model_collection():
     from search import search_images
     mock_col = _mock_collection(count=3, query_result={"ids": [["id1"]], "metadatas": [[{"path": "/a.jpg"}]]})
@@ -222,7 +259,9 @@ def test_search_uses_active_model_collection():
     # Let the real db.collection() run so the model→collection-name derivation
     # is exercised; only the underlying client is mocked.
     with patch("db.client", return_value=mock_client), \
-         patch("db.get_active_model", return_value="my-embed-model"), \
+         patch("search.get_registry", return_value={"active_model": "my-embed-model", "models": {
+             "my-embed-model": {"source": "lm_studio", "dimension": 1}
+         }}), \
          patch("search.get_embedding", return_value=([0.1], "my-embed-model", "lm_studio")):
         search_images("test")
 
@@ -260,8 +299,8 @@ def test_search_filter_only_with_person_intersects(tmp_path=None):
     from search import search_images
     mock_col = _mock_collection(count=10)
     mock_col.get.return_value = {
-        "ids": ["img1", "img2", "img3"],
-        "metadatas": [{"path": "/1"}, {"path": "/2"}, {"path": "/3"}],
+        "ids": ["img1", "img3"],
+        "metadatas": [{"path": "/1"}, {"path": "/3"}],
     }
 
     with patch("search.db.collection", return_value=mock_col), \
@@ -272,6 +311,7 @@ def test_search_filter_only_with_person_intersects(tmp_path=None):
 
     mock_col.query.assert_not_called()
     assert set(result["ids"][0]) == {"img1", "img3"}
+    assert mock_col.get.call_args.kwargs["ids"] == ["img1", "img3"]
 
 
 def test_search_person_not_found_flag_for_unregistered_name():
@@ -325,8 +365,40 @@ def test_query_embedded_with_active_model():
     from search import search_images
     mock_col = _mock_collection(count=2, query_result={"ids": [["a"]], "metadatas": [[{"path": "/a"}]]})
     reg = {"active_model": "my-embed", "models": {"my-embed": {"source": "lm_studio"}}}
+    import search
+    search._query_vector_cache.clear()
     with patch("search.db.collection", return_value=mock_col), \
          patch("search.get_registry", return_value=reg), \
          patch("search.get_embedding", return_value=([0.1], "my-embed", "lm_studio")) as ge:
         search_images("beach")
-    ge.assert_called_once_with("beach", force_provider="lm_studio", model="my-embed")
+    ge.assert_called_once_with("beach", force_provider="lm_studio", model="my-embed", purpose="query")
+
+
+def test_query_vector_cache_is_bounded_and_profile_keyed():
+    import search
+    from search import _embed_query
+    search._query_vector_cache.clear()
+    info = {"source": "lm_studio", "profile_id": "p1", "dimension": 2}
+    with patch("search.get_embedding", return_value=([0.1, 0.2], "m", "lm_studio")) as embed:
+        assert _embed_query("  beach   day ", "m", info) == [0.1, 0.2]
+        assert _embed_query("beach day", "m", info) == [0.1, 0.2]
+        assert _embed_query("beach day", "m", {**info, "profile_id": "p2"}) == [0.1, 0.2]
+    assert embed.call_count == 2
+    assert len(search._query_vector_cache) == 2
+    search._query_vector_cache.clear()
+
+
+def test_query_person_ids_constrain_chroma_before_top_k():
+    from search import search_images
+    mock_col = _mock_collection(count=100, query_result={"ids": [["valid"]], "metadatas": [[{}]]})
+    with patch("search.db.collection", return_value=mock_col), \
+         patch("search.get_registry", return_value={"active_model": "test-model", "models": {
+             "test-model": {"source": "lm_studio", "dimension": 1, "profile_id": "p"}
+         }}), \
+         patch("search.get_embedding", return_value=([0.1], "test-model", "lm_studio")), \
+         patch("search.get_person_embedding", return_value=[1.0]), \
+         patch("search.query_person_faces", return_value={"valid", "other"}):
+        search_images("beach", top_k=1, person="A")
+    kwargs = mock_col.query.call_args.kwargs
+    assert set(kwargs["ids"]) == {"valid", "other"}
+    assert kwargs["n_results"] == 1
